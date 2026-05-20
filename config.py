@@ -17,7 +17,6 @@ class Config:
     # data
     zarr_path: str | None = None
     channel: int = 0
-    pyramid_level: int = 1
     crop_size: int = 128
     z_thickness: int = 10
     n_views: int = 2

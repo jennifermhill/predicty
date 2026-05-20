@@ -2,6 +2,8 @@
 /annotations
 plans/
 *.txt
+training_data_index.xlsx
+CLAUDE.md
 
 # Python
 __pycache__/

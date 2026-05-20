@@ -10,14 +10,12 @@ the zarr is reopened in each worker so dask handles stay process-local.
 
 from __future__ import annotations
 
-import os
 import random
 from typing import Any, Iterator
 
 import dask.array as da
 import numpy as np
 import torch
-import torch.nn.functional as F 
 from torch.utils.data import IterableDataset, get_worker_info
 
 from config import Config
@@ -40,17 +38,8 @@ class ZarrCellDataset(IterableDataset):
         self._augment = build_augmentations(cfg)
 
     def _open_zarr(self) -> None:
-        cfg = self.cfg
-        root = cfg.zarr_path
-        candidate = f"{root}/0/{cfg.pyramid_level}"
-        if _path_exists(candidate):
-            self.arr = da.from_zarr(candidate)
-            self.runtime_downsample = 1
-            self.effective_level = cfg.pyramid_level
-        else:
-            self.arr = da.from_zarr(f"{root}/0/0")
-            self.runtime_downsample = 2 ** cfg.pyramid_level
-            self.effective_level = 0
+        # cells are already low resolution, so always read the native pyramid level.
+        self.arr = da.from_zarr(f"{self.cfg.zarr_path}/0/0")
 
         # shape varies across datasets.
         # expected layout is (t, c, z, y, x).
@@ -127,8 +116,7 @@ class ZarrCellDataset(IterableDataset):
     def _log_open(self) -> None:
         print(
             f"[ZarrCellDataset] opened {self.cfg.zarr_path} "
-            f"shape={tuple(self.arr.shape)} chunks={self.arr.chunks} "
-            f"level={self.effective_level} runtime_downsample={self.runtime_downsample}"
+            f"shape={tuple(self.arr.shape)} chunks={self.arr.chunks}"
         )
         print(
             f"[ZarrCellDataset] T={self.T}; delta_t resolved to "
@@ -155,16 +143,11 @@ class ZarrCellDataset(IterableDataset):
 
     def _sample_pair(self, rng: random.Random) -> dict[str, Any]:
         cfg = self.cfg
-        H = W = cfg.crop_size
+        crop_h = crop_w = cfg.crop_size
 
-        # crop at array scale, then downsample y/x if needed.
-        slice_h = H * self.runtime_downsample
-        slice_w = W * self.runtime_downsample
-        if slice_h > self.Y or slice_w > self.X:
+        if crop_h > self.Y or crop_w > self.X:
             raise ValueError(
-                f"crop_size={cfg.crop_size} with runtime_downsample="
-                f"{self.runtime_downsample} requires {slice_h}x{slice_w} pixels, "
-                f"but frame is only {self.Y}x{self.X}"
+                f"crop_size={cfg.crop_size} exceeds frame size {self.Y}x{self.X}"
             )
 
         # sample one z stack and reuse it for both views.
@@ -181,11 +164,11 @@ class ZarrCellDataset(IterableDataset):
             t2 = int(np.clip(t1 - sign * delta, 0, self.T - 1))
 
         # sample one spatial crop and reuse it for both views.
-        y_off = rng.randrange(0, self.Y - slice_h + 1)
-        x_off = rng.randrange(0, self.X - slice_w + 1)
+        y_off = rng.randrange(0, self.Y - crop_h + 1)
+        x_off = rng.randrange(0, self.X - crop_w + 1)
 
-        view1 = self._load_crop(t1, z, y_off, x_off, slice_h, slice_w)
-        view2 = self._load_crop(t2, z, y_off, x_off, slice_h, slice_w)
+        view1 = self._load_crop(t1, z, y_off, x_off, crop_h, crop_w)
+        view2 = self._load_crop(t2, z, y_off, x_off, crop_h, crop_w)
 
         view1 = self._augment(view1)
         view2 = self._augment(view2)
@@ -209,8 +192,8 @@ class ZarrCellDataset(IterableDataset):
         z: int,
         y_off: int,
         x_off: int,
-        slice_h: int,
-        slice_w: int,
+        crop_h: int,
+        crop_w: int,
     ) -> torch.Tensor:
         cfg = self.cfg
         # index the smallest useful dask slice.
@@ -218,31 +201,16 @@ class ZarrCellDataset(IterableDataset):
             t,
             cfg.channel,
             z : z + cfg.z_thickness,
-            y_off : y_off + slice_h,
-            x_off : x_off + slice_w,
+            y_off : y_off + crop_h,
+            x_off : x_off + crop_w,
         ]
         np_arr = np.asarray(sub.compute(), dtype=np.float32)
 
-        # rescale before augmentations.
+        # rescale to [0, 1] before augmentations.
         np_arr = np.clip(np_arr, 0.0, cfg.max_intensity) / cfg.max_intensity
 
         # shape is [1, z, h, w].
-        crop = torch.from_numpy(np_arr).unsqueeze(0)
-
-        if self.runtime_downsample > 1:
-            # downsample y/x while keeping z thickness unchanged.
-            crop = F.interpolate(
-                crop.unsqueeze(0),
-                scale_factor=(
-                    1.0,
-                    1.0 / self.runtime_downsample,
-                    1.0 / self.runtime_downsample,
-                ),
-                mode="trilinear",
-                align_corners=False,
-            ).squeeze(0)
-
-        return crop
+        return torch.from_numpy(np_arr).unsqueeze(0)
 
 
 def worker_init_fn(worker_id: int) -> None:
@@ -256,8 +224,3 @@ def worker_init_fn(worker_id: int) -> None:
     seed = ds.cfg.seed + worker_id
     np.random.seed(seed)
     torch.manual_seed(seed)
-
-
-def _path_exists(path: str) -> bool:
-    # this project uses filesystem-backed zarr stores.
-    return os.path.isdir(path)
