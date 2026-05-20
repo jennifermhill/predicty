@@ -17,7 +17,7 @@ from typing import Any, Iterator
 import dask.array as da
 import numpy as np
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as F 
 from torch.utils.data import IterableDataset, get_worker_info
 
 from config import Config
@@ -45,7 +45,7 @@ class ZarrCellDataset(IterableDataset):
         candidate = f"{root}/0/{cfg.pyramid_level}"
         if _path_exists(candidate):
             self.arr = da.from_zarr(candidate)
-            self.runtime_downsample = cfg.fallback_downsample
+            self.runtime_downsample = 1
             self.effective_level = cfg.pyramid_level
         else:
             self.arr = da.from_zarr(f"{root}/0/0")
