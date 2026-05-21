@@ -13,6 +13,7 @@ mixin_test41, mixin-test-41, ...) and normalize to the compact form.
 from __future__ import annotations
 
 import re
+import xml.etree.ElementTree as et
 from functools import lru_cache
 from pathlib import Path
 
@@ -70,3 +71,21 @@ def _interval_for_mixin(mixin_id: str, index_path: str) -> float:
             f"inconsistent interval_minutes for {mixin_id!r}: {intervals}"
         )
     return float(intervals[0])
+
+def get_voxel_dims(zarr_path, res_lvl=0):
+    xml_file = Path(zarr_path) / "OME" / "METADATA.ome.xml"
+    XML_tree = et.parse(xml_file)
+    XML_root = XML_tree.getroot()
+
+    namespaces = {'ome': 'http://www.openmicroscopy.org/Schemas/OME/2016-06'}
+
+    images = XML_root.findall('ome:Image', namespaces)
+    if res_lvl >= len(images):
+        res_lvl = 0
+
+    pixels = images[res_lvl].find('ome:Pixels', namespaces)
+
+    pixel_size_x = float(pixels.get('PhysicalSizeX'))
+    pixel_size_y = float(pixels.get('PhysicalSizeY'))
+    pixel_size_z = float(pixels.get('PhysicalSizeZ'))
+    return pixel_size_x, pixel_size_y, pixel_size_z
