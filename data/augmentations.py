@@ -20,7 +20,7 @@ from typing import Callable
 import torch
 from torch import Tensor
 
-from config import AugCfg, Config
+from configs.config import AugCfg, Config
 
 
 _EPS = 1e-6

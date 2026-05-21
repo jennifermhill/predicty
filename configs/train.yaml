@@ -1,0 +1,123 @@
+# starter training config. unspecified keys keep their python defaults.
+# leave zarr_path null so the file picker (or --zarr-path) chooses it at runtime.
+
+# ---------------------------------------------------------------------------
+# data
+# ---------------------------------------------------------------------------
+# pick exactly one of `zarr_path` or `zarr_paths`.
+#   - zarr_path: single-zarr training. leave null to fall back to the file
+#     picker (or --zarr-path on the cli).
+#   - zarr_paths: multi-zarr training. every batch mixes pairs from each
+#     listed zarr, weighted by usable t1 range. pairs themselves never cross
+#     experiment boundaries. interval_minutes is looked up per-zarr from
+#     `training_data_index_path`, so heterogeneous frame rates handle
+#     themselves. if both are set, zarr_paths wins.
+zarr_path: null
+# example multi-zarr setup:
+zarr_paths:
+- /path/to/cryolite_mixin_test41_2024-01-09/Field_B2.zarr
+- /path/to/cryolite_mixin_test48_2024-02-08.zarr
+- /path/to/cryolite_mixin_test65_2024-04-16/NC28.1_overnight_day1.zarr
+
+channel: 0              # which channel to read from the (t, c, z, y, x) array.
+crop_size: 128          # spatial crop size in pixels; same for height and width.
+z_thickness: 10         # number of z slices per crop (depth of the 3d sub-volume).
+
+# ---------------------------------------------------------------------------
+# metadata lookup
+# ---------------------------------------------------------------------------
+# spreadsheet that maps mixin id -> interval_minutes.
+training_data_index_path: training_data_index.xlsx
+
+# ---------------------------------------------------------------------------
+# temporal sampling
+# ---------------------------------------------------------------------------
+# desired wall-clock spacing between t1 and t2, in minutes.
+# the dataset rounds this to a whole frame_gap using interval_minutes.
+target_gap_minutes: 10.0
+
+# "forward"  -> t2 = t1 + frame_gap
+# "backward" -> t2 = t1 - frame_gap
+temporal_direction: forward
+
+# ---------------------------------------------------------------------------
+# z window
+# ---------------------------------------------------------------------------
+# fraction of the z axis to sample anchors from. 0..1 covers the full stack.
+z_frac_min: 0.0
+z_frac_max: 1.0
+
+# absolute z bounds override the fractional window when both are set.
+# leave null to use z_frac_min / z_frac_max.
+z_abs_min: null
+z_abs_max: null
+
+# ---------------------------------------------------------------------------
+# t1 window
+# ---------------------------------------------------------------------------
+# fraction of the time axis to sample t1 anchors from. the dataset further
+# trims this so t2 = t1 +/- frame_gap is always in bounds.
+t1_frac_min: 0.0
+t1_frac_max: 1.0
+
+# absolute t1 bounds override the fractional window when both are set.
+t1_abs_min: null
+t1_abs_max: null
+
+# ---------------------------------------------------------------------------
+# preprocessing
+# ---------------------------------------------------------------------------
+# raw intensities are clipped to [0, max_intensity] then divided by it so
+# crops land in [0, 1] before augmentations.
+max_intensity: 10000.0
+
+# ---------------------------------------------------------------------------
+# augmentations
+# ---------------------------------------------------------------------------
+# each block applies with probability `p` to a [1, z, h, w] float tensor.
+# set `enabled: false` to disable a block without removing it.
+
+# random global brightness/contrast shift; `strength` controls magnitude.
+aug_intensity:
+  enabled: true
+  p: 0.8
+  strength: 0.4
+
+# random gamma correction sampled uniformly from gamma_range.
+aug_gamma:
+  enabled: true
+  p: 0.8
+  gamma_range: [0.5, 2.0]
+
+# additive gaussian noise with sigma sampled uniformly from sigma_range.
+aug_noise:
+  enabled: true
+  p: 0.5
+  sigma_range: [0.0, 0.05]
+
+# gaussian blur with sigma sampled uniformly from sigma_range.
+aug_blur:
+  enabled: true
+  p: 0.5
+  sigma_range: [0.1, 2.0]
+  kernel_size: 5
+
+# per-crop z-score normalization. applied last so each crop has zero mean,
+# unit variance regardless of upstream brightness shifts.
+aug_percrop_norm:
+  enabled: true
+  p: 1.0
+
+# ---------------------------------------------------------------------------
+# runtime
+# ---------------------------------------------------------------------------
+# num_workers: number of background processes the pytorch DataLoader spawns
+# to fetch crops in parallel. each worker reopens its own zarr handle and
+# pulls samples independently, then hands batches back to the main process.
+# 0 means "load in the main process" (slower but easier to debug).
+num_workers: 4
+
+# seed: base integer used to make sampling reproducible. each worker derives
+# its own rng from (seed + worker_id), and numpy/torch are seeded the same way.
+# change this to get a different stream of crops without touching anything else.
+seed: 0
