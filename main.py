@@ -1,21 +1,45 @@
 from __future__ import annotations
 
+import argparse
 import time
 from statistics import median
 
 from torch.utils.data import DataLoader
 
-from config import Config
-from data.dataset import ZarrCellDataset, worker_init_fn
+from configs.config import Config
+from data.dataset import MultiZarrDataset, ZarrCellDataset, worker_init_fn
 from data.picker import pick_zarr_path
 
 
-def main() -> None:
-    cfg = Config()
-    if cfg.zarr_path is None:
-        cfg.zarr_path = pick_zarr_path()
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="optional path to a yaml config (e.g. configs/train.yaml).",
+    )
+    # peek only at --config; picker.py reads --zarr-path itself.
+    args, _ = parser.parse_known_args()
+    return args
 
-    ds = ZarrCellDataset(cfg)
+
+def main() -> None:
+    args = _parse_args()
+    cfg = Config.from_yaml(args.config) if args.config else Config()
+
+    # multi-zarr training takes precedence; single-zarr falls back to the picker.
+    if cfg.zarr_paths:
+        if cfg.zarr_path is not None:
+            print(
+                "[main] cfg.zarr_paths is set; ignoring cfg.zarr_path "
+                f"({cfg.zarr_path!r})."
+            )
+        ds: ZarrCellDataset | MultiZarrDataset = MultiZarrDataset(cfg)
+    else:
+        if cfg.zarr_path is None:
+            cfg.zarr_path = pick_zarr_path()
+        ds = ZarrCellDataset(cfg)
     loader = DataLoader(
         ds,
         batch_size=4,
@@ -37,10 +61,13 @@ def main() -> None:
         dt = (time.time() - t0) * 1000.0
         # 4 pairs means 8 crops per batch.
         per_crop_ms.append(dt / 8.0)
+        # dataset_idx is only present when running on a multi-zarr dataset.
+        ds_idx = meta["dataset_idx"].tolist() if "dataset_idx" in meta else None
         print(
             f"[main] batch {i:02d} view1={tuple(v1.shape)} view2={tuple(v2.shape)} "
             f"t1={meta['t1'].tolist()} t2={meta['t2'].tolist()} "
             f"z={meta['z'].tolist()} z_end={meta['z_end'].tolist()}"
+            + (f" dataset_idx={ds_idx}" if ds_idx is not None else "")
         )
 
     total = time.time() - t_loop
