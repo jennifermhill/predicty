@@ -11,9 +11,9 @@ gap and the experiment's interval_minutes (looked up via data/metadata.py).
 the z range and t1 range are fractions of each dataset by default. all crops
 in a sample share the same z slab.
 
-global crops are intensity-gated against the t1 frame mean to avoid mostly
-empty backgrounds; the frame mean is computed once per t1 and cached per
-worker process.
+global crops are intensity-gated against the mean of the active z slab at t1
+(not the full z window) so that the threshold and crop means live in the same
+units. the slab mean is computed once per (t1, z) and cached per worker process.
 
 two dataset shapes are exposed:
 - `ZarrCellDataset` samples from a single zarr.
@@ -58,10 +58,10 @@ class ZarrCellDataset(IterableDataset):
         # augmentations are stateless across workers.
         self._augment = build_augmentations(cfg)
 
-        # per-frame mean cache for intensity gating. populated lazily and
-        # local to each worker process. the data is immutable so cross-worker
-        # duplication is wasted memory but never wrong.
-        self._frame_mean_cache: dict[int, float] = {}
+        # per-(t, z_slab) mean cache for intensity gating. keyed by the actual
+        # z slab the crops will compare against, not the full z window, so the
+        # threshold lives in the same units as the crop means.
+        self._frame_mean_cache: dict[tuple[int, int], float] = {}
 
     def _open_zarr(self) -> None:
         # cells are already low resolution, so always read the native pyramid level.
@@ -246,8 +246,9 @@ class ZarrCellDataset(IterableDataset):
         sign = 1 if cfg.temporal_direction == "forward" else -1
         t2 = t1 + sign * self.frame_gap
 
-        # gate global crops against the per-frame baseline at t1.
-        threshold = cfg.intensity_min_frac * self._get_frame_mean(t1)
+        # gate global crops against the per-(t1, z_slab) baseline so the
+        # threshold and the crop means are computed over the same z range.
+        threshold = cfg.intensity_min_frac * self._get_frame_mean(t1, z)
 
         global_offsets: list[tuple[int, int]] = []
         globals_t1: list[torch.Tensor] = []
@@ -306,22 +307,29 @@ class ZarrCellDataset(IterableDataset):
             sample["meta"]["local_x"] = torch.tensor([x for _, x in local_offsets])
         return sample
 
-    def _get_frame_mean(self, t: int) -> float:
-        """mean intensity over the configured z window at frame t.
+    def _get_frame_mean(self, t: int, z: int) -> float:
+        """mean intensity over the active z slab [z, z+z_thickness) at frame t.
 
-        cached per worker. one entry per distinct t1 seen by this process.
+        cached per worker, keyed by (t, z) so identical anchors reuse the read.
+        averaging over the slab that crops are drawn from (rather than the full
+        z window) keeps the gate threshold in the same units as crop means.
         """
-        cached = self._frame_mean_cache.get(t)
+        key = (t, z)
+        cached = self._frame_mean_cache.get(key)
         if cached is not None:
             return cached
-        # restrict to z_min:z_max so the baseline matches the region crops
-        # actually come from.
         frame = np.asarray(
-            self.arr[t, self.cfg.channel, self.z_min : self.z_max, :, :].compute(),
+            self.arr[
+                t,
+                self.cfg.channel,
+                z : z + self.cfg.z_thickness,
+                :,
+                :,
+            ].compute(),
             dtype=np.float32,
         )
         mean = float(frame.mean())
-        self._frame_mean_cache[t] = mean
+        self._frame_mean_cache[key] = mean
         return mean
 
     def _load_crop_raw(

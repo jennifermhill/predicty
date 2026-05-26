@@ -25,17 +25,17 @@ z_thickness: 10         # number of z slices per crop (depth of the 3d sub-volum
 # ---------------------------------------------------------------------------
 # multi-crop architecture
 # ---------------------------------------------------------------------------
-# WS-DINO multi-crop: n_global_crops large views (paired across t1/t2) and
-# n_local_crops smaller views (single-time, at t1) spatially nested inside a
-# randomly chosen global crop. all crops share the same z slab.
-n_global_crops: 2
+# WS-DINO multi-crop: one global view (paired across t1/t2) and n_local_crops
+# smaller views (single-time, at t1) spatially nested inside the global. all
+# crops share the same z slab.
+n_global_crops: 1
 n_local_crops: 6
 global_crop_size: 256
 local_crop_size: 128
 
-# minimum crop intensity, as a fraction of the t1 frame mean. a global crop
-# is accepted only if its mean is at least intensity_min_frac * frame_mean.
-# the frame mean is computed once per t1 and cached per worker.
+# minimum crop intensity, as a fraction of the mean intensity over the active
+# z slab at t1. a global crop is accepted only if its mean is at least
+# intensity_min_frac * slab_mean. cached per worker, keyed by (t1, z).
 intensity_min_frac: 0.5
 
 # ---------------------------------------------------------------------------

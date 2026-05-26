@@ -30,16 +30,16 @@ class Config:
     channel: int = 0
     z_thickness: int = 10
 
-    # multi-crop architecture: 2 globals + n locals, where each local is
-    # spatially nested inside one of the globals. only globals carry a
-    # (t1, t2) pair; locals are single-time at t1.
-    n_global_crops: int = 2
+    # multi-crop architecture: one global + n locals, where each local is
+    # spatially nested inside the global. only the global carries a (t1, t2)
+    # pair; locals are single-time at t1.
+    n_global_crops: int = 1
     n_local_crops: int = 6
     global_crop_size: int = 256
     local_crop_size: int = 128
 
     # accept a global crop only if its mean is at least this fraction of the
-    # whole-frame mean at t1. lower values are more permissive.
+    # mean intensity over the active z slab at t1. lower values are more permissive.
     intensity_min_frac: float = 0.5
 
     # spreadsheet that maps experiment id -> interval_minutes.
