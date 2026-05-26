@@ -20,8 +20,23 @@ zarr_paths:
 - /Volumes/sgrolab/jennifer/cryolite/cryolite_mixin_test49_2024-02-08/mixin49_wellB2_24hr_ERH Red FarRed.zarr
 
 channel: 0              # which channel to read from the (t, c, z, y, x) array.
-crop_size: 128          # spatial crop size in pixels; same for height and width.
 z_thickness: 10         # number of z slices per crop (depth of the 3d sub-volume).
+
+# ---------------------------------------------------------------------------
+# multi-crop architecture
+# ---------------------------------------------------------------------------
+# WS-DINO multi-crop: one global view (paired across t1/t2) and n_local_crops
+# smaller views (single-time, at t1) spatially nested inside the global. all
+# crops share the same z slab.
+n_global_crops: 1
+n_local_crops: 6
+global_crop_size: 256
+local_crop_size: 128
+
+# minimum crop intensity, as a fraction of the mean intensity over the active
+# z slab at t1. a global crop is accepted only if its mean is at least
+# intensity_min_frac * slab_mean. cached per worker, keyed by (t1, z).
+intensity_min_frac: 0.5
 
 # ---------------------------------------------------------------------------
 # metadata lookup
@@ -33,8 +48,9 @@ training_data_index_path: training_data_index.xlsx
 # temporal sampling
 # ---------------------------------------------------------------------------
 # desired wall-clock spacing between t1 and t2, in minutes.
-# the dataset rounds this to a whole frame_gap using interval_minutes.
-target_gap_minutes: 10.0
+# the dataset rounds this to a whole frame_gap using interval_minutes. 50
+# yields the WS-DINO weak label of 5 frames at a 10-minute interval.
+target_gap_minutes: 50.0
 
 # "forward"  -> t2 = t1 + frame_gap
 # "backward" -> t2 = t1 - frame_gap

@@ -50,21 +50,28 @@ def main() -> None:
 
     per_crop_ms: list[float] = []
     n_batches = 20
-    print(f"[main] pulling {n_batches} batches of 4 pairs ...")
+    batch_size = 4
+    # crops per sample: 2 globals (each with t1+t2 -> 2 crops) + n_locals.
+    crops_per_sample = 2 * cfg.n_global_crops + cfg.n_local_crops
+    print(
+        f"[main] pulling {n_batches} batches of {batch_size} samples "
+        f"({crops_per_sample} crops/sample) ..."
+    )
 
     t_loop = time.time()
     for i, batch in zip(range(n_batches), loader):
         t0 = time.time()
-        v1 = batch["view1"]
-        v2 = batch["view2"]
+        g_t1 = batch["globals_t1"]
+        g_t2 = batch["globals_t2"]
+        locs = batch.get("locals")
         meta = batch["meta"]
         dt = (time.time() - t0) * 1000.0
-        # 4 pairs means 8 crops per batch.
-        per_crop_ms.append(dt / 8.0)
-        # dataset_idx is only present when running on a multi-zarr dataset.
+        per_crop_ms.append(dt / (batch_size * crops_per_sample))
         ds_idx = meta["dataset_idx"].tolist() if "dataset_idx" in meta else None
+        locals_shape = tuple(locs.shape) if locs is not None else None
         print(
-            f"[main] batch {i:02d} view1={tuple(v1.shape)} view2={tuple(v2.shape)} "
+            f"[main] batch {i:02d} globals_t1={tuple(g_t1.shape)} "
+            f"globals_t2={tuple(g_t2.shape)} locals={locals_shape} "
             f"t1={meta['t1'].tolist()} t2={meta['t2'].tolist()} "
             f"z={meta['z'].tolist()} z_end={meta['z_end'].tolist()}"
             + (f" dataset_idx={ds_idx}" if ds_idx is not None else "")
@@ -76,7 +83,7 @@ def main() -> None:
             f"[main] median ms/crop (post-fetch handling only): "
             f"{median(per_crop_ms):.2f}"
         )
-    n_crops = n_batches * 4 * 2
+    n_crops = n_batches * batch_size * crops_per_sample
     print(f"[main] total wall time: {total:.2f}s for {n_crops} crops "
           f"-> {total * 1000.0 / n_crops:.2f} ms/crop end-to-end")
 

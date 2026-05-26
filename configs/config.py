@@ -28,16 +28,27 @@ class Config:
     zarr_paths: list[str] | None = None
 
     channel: int = 0
-    crop_size: int = 128
     z_thickness: int = 10
-    n_views: int = 2
+
+    # multi-crop architecture: one global + n locals, where each local is
+    # spatially nested inside the global. only the global carries a (t1, t2)
+    # pair; locals are single-time at t1.
+    n_global_crops: int = 1
+    n_local_crops: int = 6
+    global_crop_size: int = 256
+    local_crop_size: int = 128
+
+    # accept a global crop only if its mean is at least this fraction of the
+    # mean intensity over the active z slab at t1. lower values are more permissive.
+    intensity_min_frac: float = 0.5
 
     # spreadsheet that maps experiment id -> interval_minutes.
     training_data_index_path: str = "training_data_index.xlsx"
 
     # desired wall-clock gap between paired frames, in minutes.
     # the dataset converts this to a frame_gap using the experiment's interval.
-    target_gap_minutes: float = 10.0
+    # default 50 -> 5 frames at a 10-minute interval, the WS-DINO weak label.
+    target_gap_minutes: float = 50.0
 
     # "forward" -> t2 = t1 + frame_gap; "backward" -> t2 = t1 - frame_gap.
     temporal_direction: str = "forward"

@@ -17,7 +17,6 @@ import xml.etree.ElementTree as et
 from functools import lru_cache
 from pathlib import Path
 
-
 # tolerate any non-digit junk between "mixin" and the digit suffix, so paths
 # like ".../cryolite_mixin_test41_..." resolve to "mixin41".
 _MIXIN_RE = re.compile(r"mixin[^0-9]*?(\d+)", re.IGNORECASE)
