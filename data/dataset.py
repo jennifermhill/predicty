@@ -232,7 +232,9 @@ class ZarrCellDataset(IterableDataset):
         while True:
             yield self._sample_pair(rng)
 
-    def _sample_pair(self, rng: random.Random) -> dict[str, Any]:
+    def _sample_pair(
+        self, rng: random.Random, dataset_idx: int = 0
+    ) -> dict[str, Any]:
         cfg = self.cfg
         g_size = cfg.global_crop_size
         l_size = cfg.local_crop_size
@@ -280,11 +282,19 @@ class ZarrCellDataset(IterableDataset):
         sample: dict[str, Any] = {
             "globals_t1": torch.stack(globals_t1),
             "globals_t2": torch.stack(globals_t2),
+            # WS-DINO weak label: (dataset_idx, frame_gap). dataset_idx is 0 for
+            # a single-zarr dataset; MultiZarrDataset passes the child index it
+            # drew. frame_gap is the per-dataset integer frame spacing.
+            "weak_label": torch.tensor(
+                [dataset_idx, self.frame_gap], dtype=torch.long
+            ),
             "meta": {
                 "t1": t1,
                 "t2": t2,
                 "z": z,
                 "z_end": z + cfg.z_thickness,
+                "dataset_idx": dataset_idx,
+                "frame_gap": self.frame_gap,
                 "global_y": torch.tensor([y for y, _ in global_offsets]),
                 "global_x": torch.tensor([x for _, x in global_offsets]),
             },
@@ -398,10 +408,7 @@ class MultiZarrDataset(IterableDataset):
         indices = list(range(len(self.children)))
         while True:
             idx = rng.choices(indices, weights=self.weights, k=1)[0]
-            sample = self.children[idx]._sample_pair(rng)
-            # tag the sample so downstream code can trace which experiment it came from.
-            sample["meta"]["dataset_idx"] = idx
-            yield sample
+            yield self.children[idx]._sample_pair(rng, dataset_idx=idx)
 
 
 def worker_init_fn(worker_id: int) -> None:
