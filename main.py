@@ -51,8 +51,8 @@ def main() -> None:
     per_crop_ms: list[float] = []
     n_batches = 20
     batch_size = 4
-    # crops per sample: 2 globals (each with t1+t2 -> 2 crops) + n_locals.
-    crops_per_sample = 2 * cfg.n_global_crops + cfg.n_local_crops
+    # crops per sample: 2 globals (one at t1, one at t2) + n_locals.
+    crops_per_sample = 2 + cfg.n_local_crops
     print(
         f"[main] pulling {n_batches} batches of {batch_size} samples "
         f"({crops_per_sample} crops/sample) ..."

@@ -1,19 +1,23 @@
 """WS-DINO multi-crop sampler over one or more ome-multiscale zarrs.
 
 each sample yields a set of crops at one anchor:
-- `n_global_crops` larger views, each paired across (t1, t2). the WS-DINO
-  weak label is the frame gap between t1 and t2.
-- `n_local_crops` smaller views at t1, each spatially nested inside one of
-  the global crops.
+- exactly 2 globals: one at frame t1, one at frame t2. both share the same
+  (y, x) offset and the same `z_thickness`-deep z slab; only the timepoint
+  differs. the WS-DINO weak label is `(dataset_idx, frame_gap)`.
+- `n_local_crops` smaller views, split evenly between the two globals as
+  spatial parents. each local picks its own timepoint uniformly in [t1, t2],
+  a contiguous `local_z_thickness` sub-slab inside the global z window, and
+  spatial (y, x) nested inside its parent global's spatial window.
 
 the time gap is a fixed number of frames derived from the desired wall-clock
 gap and the experiment's interval_minutes (looked up via data/metadata.py).
-the z range and t1 range are fractions of each dataset by default. all crops
-in a sample share the same z slab.
+the z range and t1 range are fractions of each dataset by default.
 
-global crops are intensity-gated against the mean of the active z slab at t1
-(not the full z window) so that the threshold and crop means live in the same
-units. the slab mean is computed once per (t1, z) and cached per worker process.
+globals are intensity-gated against the mean of the active z slab at t1 (not
+the full z window) so the threshold and crop means live in the same units.
+only one (y, x) is sampled per pair (both globals share it), so the gate runs
+once per sample. the slab mean is computed once per (t1, z) and cached per
+worker process.
 
 two dataset shapes are exposed:
 - `ZarrCellDataset` samples from a single zarr.
@@ -89,11 +93,23 @@ class ZarrCellDataset(IterableDataset):
 
         if cfg.z_thickness < 1:
             raise ValueError(f"z_thickness must be >= 1; got {cfg.z_thickness}")
+        if cfg.local_z_thickness < 1:
+            raise ValueError(
+                f"local_z_thickness must be >= 1; got {cfg.local_z_thickness}"
+            )
+        if cfg.local_z_thickness > cfg.z_thickness:
+            raise ValueError(
+                f"local_z_thickness ({cfg.local_z_thickness}) must be <= "
+                f"z_thickness ({cfg.z_thickness}) so locals nest in the global slab"
+            )
 
-        if cfg.n_global_crops < 1:
-            raise ValueError(f"n_global_crops must be >= 1; got {cfg.n_global_crops}")
         if cfg.n_local_crops < 0:
             raise ValueError(f"n_local_crops must be >= 0; got {cfg.n_local_crops}")
+        if cfg.n_local_crops % 2 != 0:
+            raise ValueError(
+                f"n_local_crops must be even (split evenly between the two "
+                f"global parents); got {cfg.n_local_crops}"
+            )
         if cfg.global_crop_size < 1:
             raise ValueError(
                 f"global_crop_size must be >= 1; got {cfg.global_crop_size}"
@@ -238,51 +254,66 @@ class ZarrCellDataset(IterableDataset):
         cfg = self.cfg
         g_size = cfg.global_crop_size
         l_size = cfg.local_crop_size
+        g_z = cfg.z_thickness
+        l_z = cfg.local_z_thickness
 
-        # one z slab is reused across all crops in this sample.
-        z_start_max = self.z_max - cfg.z_thickness
+        # one global z slab shared by both globals and constrained for locals.
+        z_start_max = self.z_max - g_z
         z = rng.randrange(self.z_min, z_start_max + 1)
         t1 = rng.randrange(self.t1_min, self.t1_max)
         sign = 1 if cfg.temporal_direction == "forward" else -1
         t2 = t1 + sign * self.frame_gap
 
-        # gate global crops against the per-(t1, z_slab) baseline so the
-        # threshold and the crop means are computed over the same z range.
+        # gate against the per-(t1, z_slab) baseline. only one (y, x) is drawn
+        # since both globals share the spatial offset; the gate runs once.
         threshold = cfg.intensity_min_frac * self._get_frame_mean(t1, z)
+        while True:
+            y_off = rng.randrange(0, self.Y - g_size + 1)
+            x_off = rng.randrange(0, self.X - g_size + 1)
+            raw_t1 = self._load_crop_raw(t1, z, y_off, x_off, g_size, g_size)
+            if float(raw_t1.mean()) >= threshold:
+                break
+        raw_t2 = self._load_crop_raw(t2, z, y_off, x_off, g_size, g_size)
 
-        global_offsets: list[tuple[int, int]] = []
-        globals_t1: list[torch.Tensor] = []
-        globals_t2: list[torch.Tensor] = []
-        for _ in range(cfg.n_global_crops):
-            # resample (y, x) until the t1 crop clears the intensity gate.
-            while True:
-                y_off = rng.randrange(0, self.Y - g_size + 1)
-                x_off = rng.randrange(0, self.X - g_size + 1)
-                raw_t1 = self._load_crop_raw(t1, z, y_off, x_off, g_size, g_size)
-                if float(raw_t1.mean()) >= threshold:
-                    break
-            raw_t2 = self._load_crop_raw(t2, z, y_off, x_off, g_size, g_size)
-            global_offsets.append((y_off, x_off))
-            globals_t1.append(self._augment(self._to_tensor(raw_t1)))
-            globals_t2.append(self._augment(self._to_tensor(raw_t2)))
+        # global index 0 is at t1, index 1 is at t2.
+        globals_tensor = torch.stack([
+            self._augment(self._to_tensor(raw_t1)),
+            self._augment(self._to_tensor(raw_t2)),
+        ])
 
-        # locals are at t1 only, nested inside a randomly chosen global.
-        local_parents: list[int] = []
+        # locals split evenly between the two global parents. since both
+        # globals share (y, x), spatial nesting collapses to the same window;
+        # the parent index is still recorded so the loss can pair each local
+        # with the correct teacher target. each local picks its own time in
+        # [t1, t2] and its own contiguous l_z-deep sub-slab inside the global
+        # z window.
+        n_local = cfg.n_local_crops
+        n_per = n_local // 2
+        local_parents: list[int] = [0] * n_per + [1] * (n_local - n_per)
+
+        t_lo, t_hi = (t1, t2) if t1 <= t2 else (t2, t1)
+        lz_start_max = z + g_z - l_z  # inclusive upper bound
+
+        local_ts: list[int] = []
+        local_zs: list[int] = []
         local_offsets: list[tuple[int, int]] = []
         locals_: list[torch.Tensor] = []
-        for _ in range(cfg.n_local_crops):
-            parent = rng.randrange(cfg.n_global_crops)
-            gy, gx = global_offsets[parent]
-            ly = rng.randrange(gy, gy + g_size - l_size + 1)
-            lx = rng.randrange(gx, gx + g_size - l_size + 1)
-            raw_l = self._load_crop_raw(t1, z, ly, lx, l_size, l_size)
-            local_parents.append(parent)
+        for _parent in local_parents:
+            t_local = rng.randrange(t_lo, t_hi + 1)
+            lz = rng.randrange(z, lz_start_max + 1)
+            ly = rng.randrange(y_off, y_off + g_size - l_size + 1)
+            lx = rng.randrange(x_off, x_off + g_size - l_size + 1)
+            raw_l = self._load_crop_raw(
+                t_local, lz, ly, lx, l_size, l_size, z_thickness=l_z
+            )
+            local_ts.append(t_local)
+            local_zs.append(lz)
             local_offsets.append((ly, lx))
             locals_.append(self._augment(self._to_tensor(raw_l)))
 
         sample: dict[str, Any] = {
-            "globals_t1": torch.stack(globals_t1),
-            "globals_t2": torch.stack(globals_t2),
+            # (2, 1, z_thickness, g_size, g_size); index 0 is t1, index 1 is t2.
+            "globals": globals_tensor,
             # WS-DINO weak label: (dataset_idx, frame_gap). dataset_idx is 0 for
             # a single-zarr dataset; MultiZarrDataset passes the child index it
             # drew. frame_gap is the per-dataset integer frame spacing.
@@ -293,16 +324,20 @@ class ZarrCellDataset(IterableDataset):
                 "t1": t1,
                 "t2": t2,
                 "z": z,
-                "z_end": z + cfg.z_thickness,
+                "z_end": z + g_z,
                 "dataset_idx": dataset_idx,
                 "frame_gap": self.frame_gap,
-                "global_y": torch.tensor([y for y, _ in global_offsets]),
-                "global_x": torch.tensor([x for _, x in global_offsets]),
+                "global_t": torch.tensor([t1, t2]),
+                "global_y": y_off,
+                "global_x": x_off,
             },
         }
         if locals_:
             sample["locals"] = torch.stack(locals_)
             sample["meta"]["local_parent"] = torch.tensor(local_parents)
+            sample["meta"]["local_t"] = torch.tensor(local_ts)
+            sample["meta"]["local_z"] = torch.tensor(local_zs)
+            sample["meta"]["local_z_end"] = torch.tensor([lz + l_z for lz in local_zs])
             sample["meta"]["local_y"] = torch.tensor([y for y, _ in local_offsets])
             sample["meta"]["local_x"] = torch.tensor([x for _, x in local_offsets])
         return sample
@@ -340,13 +375,17 @@ class ZarrCellDataset(IterableDataset):
         x_off: int,
         crop_h: int,
         crop_w: int,
+        z_thickness: int | None = None,
     ) -> np.ndarray:
         # raw float32 zyx slab. left unnormalized so the intensity gate can
-        # compare crop and frame means in the same units.
+        # compare crop and frame means in the same units. `z_thickness` is
+        # overridable so locals can pull a thinner sub-slab than globals.
+        if z_thickness is None:
+            z_thickness = self.cfg.z_thickness
         sub = self.arr[
             t,
             self.cfg.channel,
-            z : z + self.cfg.z_thickness,
+            z : z + z_thickness,
             y_off : y_off + crop_h,
             x_off : x_off + crop_w,
         ]
