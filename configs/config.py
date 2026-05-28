@@ -30,17 +30,23 @@ class Config:
     channel: int = 0
     z_thickness: int = 10
 
-    # multi-crop architecture: one global + n locals, where each local is
-    # spatially nested inside the global. only the global carries a (t1, t2)
-    # pair; locals are single-time at t1.
-    n_global_crops: int = 1
+    # local crops use a thinner, contiguous z sub-slab drawn from inside the
+    # global z window. must be <= z_thickness.
+    local_z_thickness: int = 5
+
+    # multi-crop architecture: exactly 2 globals (one at t1, one at t2,
+    # sharing the same (y, x) and z slab) and n_local_crops locals. each local
+    # is split evenly between the two globals as spatial parent, samples its
+    # time uniformly from [t1, t2], picks a contiguous local_z_thickness
+    # sub-slab inside the global z window, and is spatially nested inside its
+    # parent global's (y, x) window. n_local_crops must be even.
     n_local_crops: int = 6
     global_crop_size: int = 256
-    local_crop_size: int = 128
+    local_crop_size: int = 96
 
     # accept a global crop only if its mean is at least this fraction of the
     # mean intensity over the active z slab at t1. lower values are more permissive.
-    intensity_min_frac: float = 0.5
+    intensity_min_frac: float = 0.95
 
     # spreadsheet that maps experiment id -> interval_minutes.
     training_data_index_path: str = "training_data_index.xlsx"
