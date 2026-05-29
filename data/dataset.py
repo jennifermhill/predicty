@@ -44,7 +44,7 @@ from torch.utils.data import IterableDataset, get_worker_info
 
 from configs.config import Config
 from data.augmentations import build_augmentations
-from data.metadata import get_interval_minutes
+from data.metadata import get_interval_minutes, get_z_limit
 
 
 class ZarrCellDataset(IterableDataset):
@@ -85,10 +85,8 @@ class ZarrCellDataset(IterableDataset):
         cfg = self.cfg
 
         self._check_fraction("z_frac_min", cfg.z_frac_min)
-        self._check_fraction("z_frac_max", cfg.z_frac_max)
         self._check_fraction("t1_frac_min", cfg.t1_frac_min)
         self._check_fraction("t1_frac_max", cfg.t1_frac_max)
-        self._check_order("z_frac", cfg.z_frac_min, cfg.z_frac_max)
         self._check_order("t1_frac", cfg.t1_frac_min, cfg.t1_frac_max)
 
         if cfg.z_thickness < 1:
@@ -167,13 +165,27 @@ class ZarrCellDataset(IterableDataset):
                 f"no valid (t1, t2) pair exists"
             )
 
-        # absolute z bounds are only for pinning a known dataset.
-        if cfg.z_abs_min is not None and cfg.z_abs_max is not None:
+        # z upper bound is taken from the per-experiment spreadsheet cell.
+        # blank z_limit means the experiment is marked not-for-training; here
+        # in single-zarr construction it's a hard error (MultiZarrDataset
+        # filters these out before reaching this path).
+        z_limit = get_z_limit(cfg.zarr_path, cfg.training_data_index_path)
+        if z_limit is None:
+            raise ValueError(
+                f"{cfg.zarr_path} has a blank z_limit in the training_data_index "
+                f"spreadsheet; this experiment is marked not-for-training"
+            )
+
+        # z_min: absolute override wins, otherwise from z_frac_min.
+        if cfg.z_abs_min is not None:
             self.z_min = cfg.z_abs_min
-            self.z_max = cfg.z_abs_max
         else:
             self.z_min = int(round(self.Z * cfg.z_frac_min))
-            self.z_max = max(self.z_min + 1, int(round(self.Z * cfg.z_frac_max)))
+        # z_max: spreadsheet z_limit is the ceiling; z_abs_max can only narrow.
+        if cfg.z_abs_max is not None:
+            self.z_max = min(cfg.z_abs_max, z_limit)
+        else:
+            self.z_max = z_limit
         self.z_min = max(0, min(self.z_min, self.Z - 1))
         self.z_max = max(self.z_min + 1, min(self.z_max, self.Z))
 
@@ -416,11 +428,34 @@ class MultiZarrDataset(IterableDataset):
             )
         self.cfg = cfg
 
-        # build one fully-initialized child per zarr. each child reads its own
-        # shape, looks up its own interval_minutes, and computes its own
-        # frame_gap from the shared target_gap_minutes.
-        self.children: list[ZarrCellDataset] = []
+        # filter out experiments marked not-for-training (blank z_limit in the
+        # spreadsheet). these are excluded silently from training; we log which
+        # ones got skipped so misconfigured spreadsheet rows are visible.
+        usable_paths: list[str] = []
+        skipped_paths: list[str] = []
         for path in cfg.zarr_paths:
+            if get_z_limit(path, cfg.training_data_index_path) is None:
+                skipped_paths.append(path)
+            else:
+                usable_paths.append(path)
+        if skipped_paths:
+            print(
+                f"[MultiZarrDataset] skipped {len(skipped_paths)} zarr(s) "
+                f"with blank z_limit:"
+            )
+            for p in skipped_paths:
+                print(f"  - {p}")
+        if not usable_paths:
+            raise ValueError(
+                "no usable zarrs after filtering by spreadsheet z_limit; "
+                "every entry in cfg.zarr_paths has a blank z_limit"
+            )
+
+        # build one fully-initialized child per usable zarr. each child reads
+        # its own shape, looks up its own interval_minutes, and computes its
+        # own frame_gap from the shared target_gap_minutes.
+        self.children: list[ZarrCellDataset] = []
+        for path in usable_paths:
             child_cfg = replace(cfg, zarr_path=path, zarr_paths=None)
             self.children.append(ZarrCellDataset(child_cfg))
 

@@ -59,11 +59,13 @@ class Config:
     # "forward" -> t2 = t1 + frame_gap; "backward" -> t2 = t1 - frame_gap.
     temporal_direction: str = "forward"
 
-    # z window as a fraction of each dataset.
+    # z lower bound as a fraction of each dataset. the upper bound is taken
+    # from the per-experiment `z_limit` column in training_data_index.xlsx
+    # (1-indexed inclusive, equivalent to a 0-indexed exclusive cap).
     z_frac_min: float = 0.0
-    z_frac_max: float = 1.0
 
-    # absolute z override for one known dataset.
+    # optional absolute z overrides. z_abs_max is clamped to the spreadsheet
+    # z_limit (it can only narrow the window, never extend past z_limit).
     z_abs_min: int | None = None
     z_abs_max: int | None = None
 

@@ -61,8 +61,10 @@ def main() -> None:
     t_loop = time.time()
     for i, batch in zip(range(n_batches), loader):
         t0 = time.time()
-        g_t1 = batch["globals_t1"]
-        g_t2 = batch["globals_t2"]
+        # globals: (B, 2, 1, Z, H, W); dim 1 indexes (t1, t2).
+        globals_ = batch["globals"]
+        g_t1 = globals_[:, 0]
+        g_t2 = globals_[:, 1]
         locs = batch.get("locals")
         meta = batch["meta"]
         dt = (time.time() - t0) * 1000.0

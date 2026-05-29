@@ -61,12 +61,14 @@ temporal_direction: forward
 # ---------------------------------------------------------------------------
 # z window
 # ---------------------------------------------------------------------------
-# fraction of the z axis to sample anchors from. 0..1 covers the full stack.
+# z lower bound as a fraction of the z axis (0..1). the upper bound is read
+# per-experiment from the `z_limit` column of training_data_index.xlsx
+# (1-indexed inclusive, equivalent to a 0-indexed exclusive cap). a blank
+# z_limit excludes that experiment from training entirely.
 z_frac_min: 0.0
-z_frac_max: 1.0
 
-# absolute z bounds override the fractional window when both are set.
-# leave null to use z_frac_min / z_frac_max.
+# optional absolute overrides. z_abs_max is clamped to the spreadsheet z_limit
+# (it can only narrow the window, never extend past it). leave null to skip.
 z_abs_min: null
 z_abs_max: null
 

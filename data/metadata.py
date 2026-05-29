@@ -38,6 +38,15 @@ def get_interval_minutes(zarr_path: str, index_path: str | Path) -> float:
     return _interval_for_mixin(mixin_id, str(index_path))
 
 
+def get_z_limit(zarr_path: str, index_path: str | Path) -> int | None:
+    """return the per-experiment z cap (1-indexed inclusive max, which equals
+    the 0-indexed exclusive upper bound). a blank cell in the spreadsheet means
+    the experiment is marked not-for-training; in that case this returns None.
+    """
+    mixin_id = extract_mixin_id(zarr_path)
+    return _z_limit_for_mixin(mixin_id, str(index_path))
+
+
 @lru_cache(maxsize=8)
 def _interval_for_mixin(mixin_id: str, index_path: str) -> float:
     """cached lookup keyed by (mixin_id, index_path)."""
@@ -70,6 +79,39 @@ def _interval_for_mixin(mixin_id: str, index_path: str) -> float:
             f"inconsistent interval_minutes for {mixin_id!r}: {intervals}"
         )
     return float(intervals[0])
+
+
+@lru_cache(maxsize=8)
+def _z_limit_for_mixin(mixin_id: str, index_path: str) -> int | None:
+    """cached lookup keyed by (mixin_id, index_path). returns None for blank."""
+    import pandas as pd
+
+    if not Path(index_path).exists():
+        raise FileNotFoundError(
+            f"training_data_index spreadsheet not found at {index_path}"
+        )
+    df = pd.read_excel(index_path)
+    if "expt" not in df.columns or "z_limit" not in df.columns:
+        raise ValueError(
+            f"{index_path} is missing required columns 'expt' and/or 'z_limit'"
+        )
+
+    expt_series = df["expt"].astype(str).str.strip().str.lower()
+    rows = df[expt_series == mixin_id]
+    if rows.empty:
+        raise ValueError(
+            f"no rows in {index_path} for experiment {mixin_id!r}"
+        )
+
+    limits = rows["z_limit"].dropna().unique().tolist()
+    if not limits:
+        # blank cell -> experiment is marked not-for-training
+        return None
+    if len(limits) > 1:
+        raise ValueError(
+            f"inconsistent z_limit for {mixin_id!r}: {limits}"
+        )
+    return int(limits[0])
 
 def get_voxel_dims(zarr_path, res_lvl=0):
     xml_file = Path(zarr_path) / "OME" / "METADATA.ome.xml"
