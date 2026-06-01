@@ -99,6 +99,60 @@ class Config:
     num_workers: int = 4
     seed: int = 0
 
+    # ------------------------------------------------------------------
+    # model
+    # ------------------------------------------------------------------
+    # hybrid encoder: small 3D stem collapses z, then 2D ResNet-50.
+    # stem_channels is the channel count handed to the ResNet's first conv
+    # (ResNet's default 3-channel conv is replaced).
+    stem_channels: int = 64
+    # ResNet-50's pre-classifier output dim, the encoder's representation size.
+    latent_dim: int = 2048
+
+    # projector (DINO head) discarded after training. K is the prototype count
+    # the cross-entropy operates over.
+    projector_hidden: int = 2048
+    projector_bottleneck: int = 256
+    projector_k: int = 4096
+
+    # ------------------------------------------------------------------
+    # DINO
+    # ------------------------------------------------------------------
+    # teacher softmax temperature (sharp). lower -> more confident targets.
+    teacher_temp: float = 0.04
+    # student softmax temperature (softer). asymmetry vs teacher drives learning.
+    student_temp: float = 0.1
+    # EMA momentum schedule for teacher weights. cosine from start to end.
+    ema_momentum_start: float = 0.996
+    ema_momentum_end: float = 1.0
+    # center buffer momentum. prevents one prototype from dominating.
+    center_momentum: float = 0.9
+
+    # ------------------------------------------------------------------
+    # optimizer / schedule
+    # ------------------------------------------------------------------
+    base_lr: float = 5e-4
+    weight_decay: float = 0.04
+    grad_clip_norm: float = 3.0
+    # fraction of total_steps spent in linear warmup. rest is cosine decay.
+    warmup_frac: float = 0.1
+
+    # ------------------------------------------------------------------
+    # training loop
+    # ------------------------------------------------------------------
+    batch_size: int = 64
+    total_steps: int = 100_000
+    log_interval: int = 50
+    ckpt_interval: int = 2000
+    device: str = "cuda"
+    use_amp: bool = True
+
+    # ------------------------------------------------------------------
+    # io
+    # ------------------------------------------------------------------
+    checkpoint_dir: str = "checkpoints"
+    log_dir: str = "logs"
+
     @classmethod
     def from_yaml(cls, path: str | Path) -> "Config":
         """build a Config from a yaml file.

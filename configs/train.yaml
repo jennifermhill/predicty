@@ -141,3 +141,66 @@ num_workers: 4
 # its own rng from (seed + worker_id), and numpy/torch are seeded the same way.
 # change this to get a different stream of crops without touching anything else.
 seed: 0
+
+# ---------------------------------------------------------------------------
+# model (encoder + projector)
+# ---------------------------------------------------------------------------
+# stem_channels: channels handed from the 3D stem into the 2D ResNet-50.
+# latent_dim:    ResNet-50 pre-classifier output (the encoder representation).
+# projector_*:   DINO head sitting on top of the encoder during training.
+#                discarded after training; only the encoder ships.
+stem_channels: 64
+latent_dim: 2048
+projector_hidden: 2048
+projector_bottleneck: 256
+projector_k: 4096
+
+# ---------------------------------------------------------------------------
+# DINO loss + EMA
+# ---------------------------------------------------------------------------
+# teacher_temp:  softmax temperature for the teacher. lower -> sharper target.
+# student_temp:  softmax temperature for the student. asymmetry drives learning.
+# ema_momentum_*: cosine schedule for teacher EMA. starts at 0.996, ends at 1.0.
+# center_momentum: EMA on the centering buffer. prevents prototype collapse.
+teacher_temp: 0.04
+student_temp: 0.1
+ema_momentum_start: 0.996
+ema_momentum_end: 1.0
+center_momentum: 0.9
+
+# ---------------------------------------------------------------------------
+# optimizer / LR schedule
+# ---------------------------------------------------------------------------
+# base_lr:        peak LR after warmup. scale linearly with batch_size if changed.
+# weight_decay:   applied to weight matrices only (biases / norm scales excluded).
+# grad_clip_norm: clip gradient L2 norm to this value before each optimizer step.
+# warmup_frac:    fraction of total_steps spent in linear warmup. cosine after.
+base_lr: 5.0e-4
+weight_decay: 0.04
+grad_clip_norm: 3.0
+warmup_frac: 0.1
+
+# ---------------------------------------------------------------------------
+# training loop
+# ---------------------------------------------------------------------------
+# batch_size:    samples per step (each yields 2 globals + n_local_crops locals).
+# total_steps:   total training steps. 100k is a reasonable starting point.
+# log_interval:  steps between tensorboard scalars + console lines.
+# ckpt_interval: steps between checkpoint saves. each saves to step_NNNNNN.pt
+#                plus a `latest.pt` symlink-style copy.
+# device:        'cuda' for HPC GPU, 'cpu' for local smoke tests.
+# use_amp:       fp16 autocast on cuda. silently disabled on cpu.
+batch_size: 64
+total_steps: 100000
+log_interval: 50
+ckpt_interval: 2000
+device: cuda
+use_amp: true
+
+# ---------------------------------------------------------------------------
+# io
+# ---------------------------------------------------------------------------
+# checkpoint_dir: where checkpoint files land. relative paths resolve from cwd.
+# log_dir:        tensorboard event files. view with `tensorboard --logdir logs`.
+checkpoint_dir: checkpoints
+log_dir: logs
