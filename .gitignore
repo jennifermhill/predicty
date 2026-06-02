@@ -1,7 +1,8 @@
 # Project-specific
 /annotations
 plans/
-*.txt
+notes.txt
+TRAINING_GUIDE.txt
 training_data_index.xlsx
 CLAUDE.md
 

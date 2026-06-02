@@ -1,0 +1,12 @@
+numpy==1.26.4
+dask[array]==2024.12.1
+zarr==2.18.3
+numcodecs<0.13
+torch==2.5.1
+torchvision==0.20.1
+pandas==2.2.3
+openpyxl==3.1.5
+PyYAML==6.0.2
+matplotlib==3.9.4
+notebook==7.3.2
+ipykernel==6.29.5
