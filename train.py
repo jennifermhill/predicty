@@ -167,9 +167,12 @@ def main() -> None:
                 entropy = -(t_probs * t_probs.clamp(min=1e-8).log()).sum(dim=-1).mean()
                 # embedding variance: stashed from the last student forward.
                 # drops near 0 -> all crops mapping to the same point.
+                # cast to fp32 because under autocast last_features is fp16,
+                # and var of small fp16 values can underflow right when we
+                # most need to see collapse coming.
                 feats = model.student.last_features
                 emb_var = (
-                    feats.var(dim=0).mean()
+                    feats.float().var(dim=0).mean()
                     if feats is not None
                     else torch.tensor(0.0)
                 )
