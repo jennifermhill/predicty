@@ -17,8 +17,8 @@
 #BSUB -gpu "num=1"                   # request 1 GPU
 #BSUB -n 8                           # 8 slots = 8 cores + 320 GB ram (slot-implied)
 #BSUB -W 72:00                       # 72 hour walltime
-#BSUB -o logs/lsf/resume.%J.out      # stdout log (%J = LSF job id)
-#BSUB -e logs/lsf/resume.%J.err      # stderr log
+#BSUB -oo logs/lsf/resume.out        # stdout log (overwritten on each submit; -oo not -o)
+#BSUB -eo logs/lsf/resume.err        # stderr log (overwritten on each submit)
 
 # ---------------------------------------------------------------------------
 # script body

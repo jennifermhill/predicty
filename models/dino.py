@@ -30,9 +30,10 @@ import torch.nn.functional as F
 class DINOHead(nn.Module):
     """3-layer MLP -> L2 normalize -> weight-normed prototype layer.
 
-    the prototype layer's magnitude (`weight_g`) is frozen at 1 — the
-    "norm_last_layer" trick from DINO. removes a degree of freedom that
-    otherwise lets the model cheat on softmax confidence by rescaling.
+    the prototype layer's magnitude (`parametrizations.weight.original0`) is
+    frozen at 1 — the "norm_last_layer" trick from DINO. removes a degree of
+    freedom that otherwise lets the model cheat on softmax confidence by
+    rescaling.
     """
 
     def __init__(
@@ -51,16 +52,18 @@ class DINOHead(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, bottleneck_dim),
         )
-        # old `nn.utils.weight_norm` API kept on purpose: emits a deprecation
-        # warning in recent torch but exposes `.weight_g` for the freeze trick.
-        # the newer parametrizations API would require digging into
-        # `.parametrizations.weight.original0` for the same effect.
-        self.last_layer = nn.utils.weight_norm(
+        # use the parametrizations API (not legacy `nn.utils.weight_norm`):
+        # the legacy version registers `weight` as a non-leaf tensor, which
+        # breaks `copy.deepcopy` and therefore the teacher-from-student init
+        # below. with parametrizations the magnitude lives at
+        # `last_layer.parametrizations.weight.original0` and is a real leaf,
+        # so deepcopy works and the freeze trick is still available.
+        self.last_layer = nn.utils.parametrizations.weight_norm(
             nn.Linear(bottleneck_dim, out_dim, bias=False)
         )
-        self.last_layer.weight_g.data.fill_(1)
+        self.last_layer.parametrizations.weight.original0.data.fill_(1)
         if norm_last_layer:
-            self.last_layer.weight_g.requires_grad = False
+            self.last_layer.parametrizations.weight.original0.requires_grad = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         z = self.mlp(x)
