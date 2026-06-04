@@ -53,6 +53,17 @@ if [ ! -f checkpoints/latest.pt ]; then
     exit 1
 fi
 
+# spin up a background nvidia-smi sampler. polls every 30s and writes CSV
+# rows to logs/lsf/gpu.out so we can confirm the GPU is actually doing work.
+# the EXIT trap kills it whenever this shell exits (normal end, error, bkill).
+nvidia-smi \
+    --query-gpu=timestamp,index,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw \
+    --format=csv \
+    --loop=30 \
+    > logs/lsf/gpu.out 2>&1 &
+GPU_SAMPLER_PID=$!
+trap 'kill ${GPU_SAMPLER_PID} 2>/dev/null || true' EXIT
+
 # resume from the most recent checkpoint. train.py loads student + teacher
 # + optimizer + scaler + center + step counter, then continues from
 # saved_step + 1 until cfg.total_steps.

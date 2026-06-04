@@ -66,6 +66,17 @@ def main() -> None:
     use_amp = cfg.use_amp and device.type == "cuda"
 
     print(f"[train] device={device}  use_amp={use_amp}")
+    if device.type == "cuda":
+        # confirms we actually got the gpu we asked the cluster for.
+        idx = device.index if device.index is not None else 0
+        total_gb = torch.cuda.get_device_properties(idx).total_memory / 1024**3
+        print(
+            f"[train] cuda gpu name : {torch.cuda.get_device_name(idx)} "
+            f"({total_gb:.1f} GB)"
+        )
+        print(f"[train] cuda device count: {torch.cuda.device_count()}")
+    else:
+        print("[train] WARNING: running on cpu — training will be impractically slow")
     print(f"[train] batch_size={cfg.batch_size}  total_steps={cfg.total_steps}")
     print(f"[train] base_lr={cfg.base_lr}  weight_decay={cfg.weight_decay}")
 
@@ -84,6 +95,10 @@ def main() -> None:
     model = DINOWrapper(cfg).to(device)
     n_params = sum(p.numel() for p in model.student.parameters())
     print(f"[train] student params: {n_params:,}")
+    # confirms .to(device) actually moved the model. if this prints 'cpu'
+    # while device says 'cuda', training will silently run on cpu.
+    print(f"[train] student params live on: {next(model.student.parameters()).device}")
+    print(f"[train] teacher params live on: {next(model.teacher.parameters()).device}")
 
     # ---- optimizer + amp ----
     optimizer = AdamW(
@@ -119,6 +134,14 @@ def main() -> None:
             batch = next(loader_iter)
 
         batch = batch_to_device(batch, device)
+
+        # on the first iteration only, confirm the batch actually landed on
+        # the gpu. catches the "model is cuda but batches stay on cpu" bug
+        # that silently triggers an implicit transfer per op.
+        if step == start_step:
+            print(f"[train] first batch globals device: {batch['globals'].device}")
+            if "locals" in batch:
+                print(f"[train] first batch locals  device: {batch['locals'].device}")
 
         # set LR per-step from the schedule.
         lr = lr_schedule(step, cfg.total_steps, cfg.base_lr, cfg.warmup_frac)
