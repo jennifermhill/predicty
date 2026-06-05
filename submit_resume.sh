@@ -13,7 +13,7 @@
 # LSF directives (same shape as submit_train.sh)
 # ---------------------------------------------------------------------------
 #BSUB -J predicty_resume             # job name (shows in bjobs)
-#BSUB -q gpu_a100                    # A100 queue: 12 slots/GPU, 40GB ram/slot
+#BSUB -q gpu_h200                    # H200 queue: 12 slots/GPU, 40GB ram/slot, 141GB VRAM
 #BSUB -gpu "num=1"                   # request 1 GPU
 #BSUB -n 8                           # 8 slots = 8 cores + 320 GB ram (slot-implied)
 #BSUB -W 72:00                       # 72 hour walltime

@@ -109,7 +109,16 @@ def main() -> None:
     scaler = GradScaler(device.type, enabled=use_amp)
 
     # ---- io ----
-    writer = SummaryWriter(cfg.log_dir)
+    # each invocation writes to its own timestamped subdirectory so multiple
+    # runs stay separate in tensorboard's UI instead of accumulating into the
+    # same log_dir as opaque event files. resumes get a `_resume` suffix so
+    # they're visually distinguishable from fresh runs.
+    run_name = time.strftime("%Y%m%d_%H%M%S")
+    if args.resume:
+        run_name = f"{run_name}_resume"
+    run_log_dir = Path(cfg.log_dir) / run_name
+    writer = SummaryWriter(run_log_dir)
+    print(f"[train] tensorboard logs -> {run_log_dir}")
     ckpt_dir = Path(cfg.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 

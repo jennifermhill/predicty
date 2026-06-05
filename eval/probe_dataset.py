@@ -1,0 +1,299 @@
+"""Linear probe for dataset identity on a frozen WS-DINO encoder.
+
+We freeze the encoder, extract embeddings of t1 global crops over many samples,
+and train a single nn.Linear to predict which zarr (dataset_idx) each crop came
+from. The intent is for this classifier to FAIL: low val accuracy means the
+encoder has learned representations that don't encode dataset identity, which
+is what we want — biology rather than microscope/illumination signatures.
+
+usage:
+    python eval/probe_dataset.py --config configs/train.yaml --checkpoint checkpoints/latest.pt
+    python eval/probe_dataset.py --config configs/train.yaml --checkpoint checkpoints/step_001500.pt --n-samples 4000
+
+interpretation (3 datasets -> chance = 33.3%):
+    val_acc near 33%  : encoder is dataset-invariant. good.
+    val_acc ~40-60%   : moderate dataset leakage; encoder partially memorized identity.
+    val_acc > 80%     : encoder has clearly memorized dataset identity. bad.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from pathlib import Path
+
+# allow running as `python eval/probe_dataset.py` from project root.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from configs.config import Config
+from data.dataset import MultiZarrDataset, worker_init_fn
+from models.encoder import HybridEncoder
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--config", required=True, help="path to a yaml config (same one used for training)")
+    p.add_argument("--checkpoint", required=True, help="path to a *.pt file (latest.pt, final.pt, step_*.pt)")
+    p.add_argument("--device", default=None, help="override cfg.device (e.g. 'cpu')")
+    p.add_argument(
+        "--n-samples", type=int, default=5000,
+        help="number of t1 globals to embed before training the linear head",
+    )
+    p.add_argument(
+        "--probe-steps", type=int, default=300,
+        help="optimizer steps for the linear head",
+    )
+    p.add_argument("--probe-lr", type=float, default=1e-3)
+    p.add_argument("--probe-batch-size", type=int, default=512)
+    p.add_argument("--probe-weight-decay", type=float, default=0.0)
+    p.add_argument("--seed", type=int, default=42, help="seed for sampling + train/val split")
+    return p.parse_args()
+
+
+def disable_augmentations(cfg: Config) -> None:
+    """turn off stochastic augs so embeddings are deterministic given the
+    sampled (t, z, y, x). per-crop norm stays on since that's how the encoder
+    was trained to receive its input.
+    """
+    for name in ("aug_intensity", "aug_gamma", "aug_noise", "aug_blur"):
+        getattr(cfg, name).enabled = False
+    # aug_percrop_norm stays enabled — it's the input convention the encoder learned.
+
+
+@torch.no_grad()
+def extract_embeddings(
+    cfg: Config,
+    encoder: nn.Module,
+    device: torch.device,
+    n_samples: int,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """run encoder on the t1 global of many samples; return (X, y) tensors."""
+    cfg.seed = seed
+    disable_augmentations(cfg)
+
+    if not cfg.zarr_paths:
+        raise ValueError("probe requires cfg.zarr_paths (a multi-zarr dataset)")
+    ds = MultiZarrDataset(cfg)
+
+    loader = DataLoader(
+        ds,
+        batch_size=cfg.batch_size,
+        num_workers=cfg.num_workers,
+        worker_init_fn=worker_init_fn,
+        persistent_workers=cfg.num_workers > 0,
+        pin_memory=device.type == "cuda",
+    )
+
+    encoder.eval()
+    embeddings: list[torch.Tensor] = []
+    labels: list[torch.Tensor] = []
+    seen = 0
+    t0 = time.time()
+    print_every = max(1, n_samples // (cfg.batch_size * 10))
+    iters = 0
+
+    for batch in loader:
+        # globals shape: (B, 2, 1, Z, H, W). index 0 is t1.
+        g_t1 = batch["globals"][:, 0].to(device, non_blocking=True)
+        ds_idx = batch["weak_label"][:, 0]  # (B,) long
+
+        emb = encoder(g_t1)  # (B, latent_dim)
+        embeddings.append(emb.cpu())
+        labels.append(ds_idx)
+
+        seen += g_t1.size(0)
+        iters += 1
+        if iters % print_every == 0:
+            elapsed = time.time() - t0
+            rate = seen / max(elapsed, 1e-6)
+            print(f"  [extract] {seen}/{n_samples} samples  ({rate:.1f} samples/s)")
+        if seen >= n_samples:
+            break
+
+    X = torch.cat(embeddings, dim=0)[:n_samples]
+    y = torch.cat(labels, dim=0)[:n_samples].long()
+    return X, y
+
+
+def train_probe(
+    X_train: torch.Tensor,
+    y_train: torch.Tensor,
+    X_val: torch.Tensor,
+    y_val: torch.Tensor,
+    n_classes: int,
+    probe_steps: int,
+    lr: float,
+    batch_size: int,
+    weight_decay: float,
+    device: torch.device,
+) -> tuple[float, float, torch.Tensor]:
+    """train a single nn.Linear with AdamW + cross-entropy; return train_acc,
+    val_acc, and the val-set confusion matrix.
+    """
+    head = nn.Linear(X_train.size(1), n_classes).to(device)
+    opt = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=weight_decay)
+    ce = nn.CrossEntropyLoss()
+
+    X_train = X_train.to(device)
+    y_train = y_train.to(device)
+    X_val = X_val.to(device)
+    y_val = y_val.to(device)
+
+    n = X_train.size(0)
+    gen = torch.Generator(device=device).manual_seed(0)
+
+    for step in range(probe_steps):
+        idx = torch.randint(0, n, (batch_size,), device=device, generator=gen)
+        logits = head(X_train[idx])
+        loss = ce(logits, y_train[idx])
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+        if step == 0 or (step + 1) % max(1, probe_steps // 10) == 0:
+            with torch.no_grad():
+                tr_acc = (head(X_train).argmax(1) == y_train).float().mean().item()
+                va_acc = (head(X_val).argmax(1) == y_val).float().mean().item()
+            print(
+                f"  [probe] step {step+1:4d}/{probe_steps}  "
+                f"loss={loss.item():.4f}  train_acc={tr_acc:.3f}  val_acc={va_acc:.3f}"
+            )
+
+    with torch.no_grad():
+        tr_acc = (head(X_train).argmax(1) == y_train).float().mean().item()
+        preds = head(X_val).argmax(1)
+        va_acc = (preds == y_val).float().mean().item()
+        cm = torch.zeros(n_classes, n_classes, dtype=torch.long)
+        for t, p in zip(y_val.cpu().tolist(), preds.cpu().tolist()):
+            cm[t, p] += 1
+
+    return tr_acc, va_acc, cm
+
+
+def print_confusion_matrix(cm: torch.Tensor, zarr_paths: list[str]) -> None:
+    """print a labeled confusion matrix and per-class accuracy."""
+    n = cm.size(0)
+    short_names = [Path(p).name[:30] for p in zarr_paths]
+
+    print()
+    print("  confusion matrix (rows = true dataset, cols = predicted):")
+    header = "    " + " ".join(f" pred{c}" for c in range(n))
+    print(header)
+    for r in range(n):
+        row = " ".join(f"{int(cm[r,c]):6d}" for c in range(n))
+        print(f"  true{r}  {row}    {short_names[r]}")
+
+    print()
+    print("  per-class val accuracy:")
+    for r in range(n):
+        total = int(cm[r].sum())
+        correct = int(cm[r, r])
+        pct = 100.0 * correct / max(total, 1)
+        print(f"    ds{r} ({short_names[r]:30s})  {correct:4d}/{total:4d}  ({pct:.1f}%)")
+
+
+def interpret(val_acc: float, n_classes: int) -> str:
+    chance = 1.0 / n_classes
+    margin = val_acc - chance
+    if margin < 0.10:
+        return (
+            f"val accuracy is near chance ({chance*100:.1f}%) — encoder appears "
+            f"dataset-invariant. this is the desired outcome."
+        )
+    if val_acc > 0.80:
+        return (
+            f"val accuracy is well above chance — encoder has clearly memorized "
+            f"dataset identity. downstream tasks will likely be contaminated by "
+            f"this. consider stronger augmentations, adversarial dataset confusion, "
+            f"or more aggressive per-crop normalization."
+        )
+    return (
+        f"val accuracy is moderately above chance ({val_acc*100:.1f}% vs "
+        f"{chance*100:.1f}%) — some dataset leakage. worth tracking across "
+        f"checkpoints to see whether it grows or stabilizes."
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    cfg = Config.from_yaml(args.config)
+
+    device = torch.device(args.device or cfg.device)
+    print(f"[probe] device      : {device}")
+    if device.type == "cuda":
+        idx = device.index if device.index is not None else 0
+        print(f"[probe] cuda gpu    : {torch.cuda.get_device_name(idx)}")
+    print(f"[probe] config      : {args.config}")
+    print(f"[probe] checkpoint  : {args.checkpoint}")
+    print(f"[probe] n_samples   : {args.n_samples}")
+    print(f"[probe] probe_steps : {args.probe_steps}")
+    print(f"[probe] seed        : {args.seed}")
+    print()
+
+    # --- load encoder ---
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    print(f"[probe] checkpoint saved at training step {ckpt['step']}")
+    encoder = HybridEncoder(stem_channels=cfg.stem_channels).to(device)
+    encoder.load_state_dict(ckpt["encoder_state_dict"])
+    for p in encoder.parameters():
+        p.requires_grad = False
+    encoder.eval()
+
+    n_datasets = len(cfg.zarr_paths) if cfg.zarr_paths else 1
+    chance_pct = 100.0 / n_datasets
+    print(f"[probe] n_datasets  : {n_datasets}  (chance baseline = {chance_pct:.1f}%)")
+    print()
+
+    # --- extract embeddings ---
+    print(f"[probe] extracting {args.n_samples} embeddings (this will run the encoder forward, no augmentations)...")
+    t0 = time.time()
+    X, y = extract_embeddings(cfg, encoder, device, args.n_samples, args.seed)
+    print(f"[probe] extracted in {time.time()-t0:.1f}s.  X.shape={tuple(X.shape)}  y.shape={tuple(y.shape)}")
+    print(f"[probe] dataset_idx counts: {torch.bincount(y, minlength=n_datasets).tolist()}")
+    print()
+
+    # --- 80/20 split ---
+    gen = torch.Generator().manual_seed(args.seed)
+    perm = torch.randperm(X.size(0), generator=gen)
+    X, y = X[perm], y[perm]
+    n_train = int(0.8 * X.size(0))
+    X_train, X_val = X[:n_train], X[n_train:]
+    y_train, y_val = y[:n_train], y[n_train:]
+    print(f"[probe] train n={X_train.size(0)}  counts={torch.bincount(y_train, minlength=n_datasets).tolist()}")
+    print(f"[probe] val   n={X_val.size(0)}  counts={torch.bincount(y_val,   minlength=n_datasets).tolist()}")
+    print()
+
+    # --- train probe ---
+    print(f"[probe] training linear head (in_dim={cfg.latent_dim}, out_dim={n_datasets})...")
+    tr_acc, va_acc, cm = train_probe(
+        X_train, y_train, X_val, y_val,
+        n_classes=n_datasets,
+        probe_steps=args.probe_steps,
+        lr=args.probe_lr,
+        batch_size=args.probe_batch_size,
+        weight_decay=args.probe_weight_decay,
+        device=device,
+    )
+
+    # --- report ---
+    print()
+    print("=" * 70)
+    print(f"  RESULT @ training step {ckpt['step']}")
+    print("=" * 70)
+    print(f"  train_acc        : {tr_acc*100:6.2f}%")
+    print(f"  val_acc          : {va_acc*100:6.2f}%   (chance = {chance_pct:.1f}%)")
+    print(f"  val_acc - chance : {(va_acc - 1.0/n_datasets)*100:+6.2f} percentage points")
+    print_confusion_matrix(cm, cfg.zarr_paths)
+    print()
+    print(f"  interpretation: {interpret(va_acc, n_datasets)}")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()

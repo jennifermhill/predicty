@@ -175,7 +175,7 @@ center_momentum: 0.9
 # weight_decay:   applied to weight matrices only (biases / norm scales excluded).
 # grad_clip_norm: clip gradient L2 norm to this value before each optimizer step.
 # warmup_frac:    fraction of total_steps spent in linear warmup. cosine after.
-base_lr: 1.25e-4
+base_lr: 2.5e-4
 weight_decay: 0.04
 grad_clip_norm: 3.0
 warmup_frac: 0.1
@@ -190,10 +190,10 @@ warmup_frac: 0.1
 #                plus a `latest.pt` symlink-style copy.
 # device:        'cuda' for HPC GPU, 'cpu' for local smoke tests.
 # use_amp:       fp16 autocast on cuda. silently disabled on cpu.
-batch_size: 16
-total_steps: 100000
+batch_size: 32
+total_steps: 3000
 log_interval: 50
-ckpt_interval: 2000
+ckpt_interval: 500
 device: cuda
 use_amp: true
 
