@@ -115,7 +115,7 @@ aug_intensity:
 # random gamma correction sampled uniformly from gamma_range.
 aug_gamma:
   enabled: true
-  p: 0.9c
+  p: 0.9
   gamma_range: [0.3, 3.0]
 
 # additive gaussian noise with sigma sampled uniformly from sigma_range.
