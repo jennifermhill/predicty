@@ -111,6 +111,16 @@ def _resolve_row(zarr_path: str, index_path: str) -> Any:
     ]
 
     if matches.empty:
+        # strain disambiguation failed; fall back to well column (e.g. "B2"
+        # appears in a path like ".../Field_B2/...").
+        if "well" in rows.columns:
+            wells = rows["well"].astype(str).str.strip()
+            valid_wells = wells[wells.str.lower() != "nan"]
+            well_matches = rows.loc[
+                valid_wells.index[[w.lower() in path_lower for w in valid_wells]]
+            ]
+            if len(well_matches) == 1:
+                return well_matches.iloc[0]
         raise ValueError(
             f"{mixin_id!r} has {len(rows)} rows (strains {strains.tolist()}) "
             f"but none of those strain tokens appear in zarr_path: {zarr_path}"
