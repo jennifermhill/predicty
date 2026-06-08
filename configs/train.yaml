@@ -15,9 +15,18 @@
 zarr_path: null
 # example multi-zarr setup:
 zarr_paths:
-- /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test65_2024-04-16/NC28.1_overnight_day1/2024-04-16_ERH_mixin65_plate1_NC28.1_overnight_ERH Red FarRed.zarr
+- /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test41_2024-01-09/Field_B2/2024-01-09_ERH_42hr_ERH Red FarRed_Field_B2.zarr
+- /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test41_2024-01-09/Field_B3/2024-01-09_ERH_42hr_ERH Red FarRed Field_B3.zarr
+- /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test42_2024-01-12/Field_B2/2024-01-12_ERH_66hrs_ERH Red FarRed_Field_B2.zarr
+- /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test42_2024-01-12/Field_B3/2024-01-12_ERH_66hrs Red FarRed.zarr
+- /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test43_2024-01-16/2024-01-16_ERH_24hr_ERH Red FarRed.zarr
 - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test44_2024-01-17/2024-01-17_ERH_23hr_ERH Red FarRed.zarr
+- /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test45_2024-01-30/20240130_ERH_mixin45_wellC2_19.5hr_ERH Red FarRed.zarr
 - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test49_2024-02-08/mixin49_wellB2_24hr_ERH Red FarRed.zarr
+- /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test52_2024-02-21/ERH_2024-02-20_mixin52_22hr_ERH Red FarRed.zarr
+- /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test65_2024-04-16/NC28.1_overnight_day1/2024-04-16_ERH_mixin65_plate1_NC28.1_overnight_ERH Red FarRed.zarr
+
+
 
 channel: 0              # which channel to read from the (t, c, z, y, x) array.
 z_thickness: 10         # number of z slices per global crop (depth of the 3d sub-volume).
@@ -100,26 +109,26 @@ max_intensity: 10000.0
 # random global brightness/contrast shift; `strength` controls magnitude.
 aug_intensity:
   enabled: true
-  p: 0.8
-  strength: 0.4
+  p: 0.9
+  strength: 0.6
 
 # random gamma correction sampled uniformly from gamma_range.
 aug_gamma:
   enabled: true
-  p: 0.8
-  gamma_range: [0.5, 2.0]
+  p: 0.9
+  gamma_range: [0.3, 3.0]
 
 # additive gaussian noise with sigma sampled uniformly from sigma_range.
 aug_noise:
   enabled: true
-  p: 0.5
-  sigma_range: [0.0, 0.05]
+  p: 0.7
+  sigma_range: [0.0, 0.1]
 
 # gaussian blur with sigma sampled uniformly from sigma_range.
 aug_blur:
   enabled: true
-  p: 0.5
-  sigma_range: [0.1, 2.0]
+  p: 0.7
+  sigma_range: [0.1, 3.0]
   kernel_size: 5
 
 # per-crop z-score normalization. applied last so each crop has zero mean,
