@@ -107,19 +107,19 @@ class Config:
     # (ResNet's default 3-channel conv is replaced).
     stem_channels: int = 64
     # ResNet-50's pre-classifier output dim, the encoder's representation size.
-    latent_dim: int = 2048
+    latent_dim: int = 512
 
     # projector (DINO head) discarded after training. K is the prototype count
     # the cross-entropy operates over.
-    projector_hidden: int = 2048
+    projector_hidden: int = 512
     projector_bottleneck: int = 256
-    projector_k: int = 4096
+    projector_k: int = 512
 
     # ------------------------------------------------------------------
     # DINO
     # ------------------------------------------------------------------
     # teacher softmax temperature (sharp). lower -> more confident targets.
-    teacher_temp: float = 0.04
+    teacher_temp: float = 0.07
     # student softmax temperature (softer). asymmetry vs teacher drives learning.
     student_temp: float = 0.1
     # EMA momentum schedule for teacher weights. cosine from start to end.
@@ -131,11 +131,11 @@ class Config:
     # ------------------------------------------------------------------
     # optimizer / schedule
     # ------------------------------------------------------------------
-    base_lr: float = 5e-4
+    base_lr: float = 2.5e-4
     weight_decay: float = 0.04
-    grad_clip_norm: float = 3.0
+    grad_clip_norm: float = 1.0
     # fraction of total_steps spent in linear warmup. rest is cosine decay.
-    warmup_frac: float = 0.1
+    warmup_frac: float = 0.15
 
     # ------------------------------------------------------------------
     # training loop

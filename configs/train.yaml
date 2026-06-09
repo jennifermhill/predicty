@@ -159,10 +159,10 @@ seed: 0
 # projector_*:   DINO head sitting on top of the encoder during training.
 #                discarded after training; only the encoder ships.
 stem_channels: 64
-latent_dim: 2048
-projector_hidden: 2048
+latent_dim: 512
+projector_hidden: 512
 projector_bottleneck: 256
-projector_k: 4096
+projector_k: 512
 
 # ---------------------------------------------------------------------------
 # DINO loss + EMA
@@ -171,7 +171,7 @@ projector_k: 4096
 # student_temp:  softmax temperature for the student. asymmetry drives learning.
 # ema_momentum_*: cosine schedule for teacher EMA. starts at 0.996, ends at 1.0.
 # center_momentum: EMA on the centering buffer. prevents prototype collapse.
-teacher_temp: 0.04
+teacher_temp: 0.07
 student_temp: 0.1
 ema_momentum_start: 0.996
 ema_momentum_end: 1.0
@@ -186,8 +186,8 @@ center_momentum: 0.9
 # warmup_frac:    fraction of total_steps spent in linear warmup. cosine after.
 base_lr: 2.5e-4
 weight_decay: 0.04
-grad_clip_norm: 3.0
-warmup_frac: 0.1
+grad_clip_norm: 1.0
+warmup_frac: 0.15
 
 # ---------------------------------------------------------------------------
 # training loop
