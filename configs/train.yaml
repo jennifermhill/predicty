@@ -171,7 +171,7 @@ projector_k: 512
 # student_temp:  softmax temperature for the student. asymmetry drives learning.
 # ema_momentum_*: cosine schedule for teacher EMA. starts at 0.996, ends at 1.0.
 # center_momentum: EMA on the centering buffer. prevents prototype collapse.
-teacher_temp: 0.07
+teacher_temp: 0.04
 student_temp: 0.1
 ema_momentum_start: 0.996
 ema_momentum_end: 1.0
