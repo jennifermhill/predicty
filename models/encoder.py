@@ -1,14 +1,14 @@
-"""hybrid 3D-stem + 2D ResNet-18 encoder.
+"""hybrid 3D-stem + 2D ResNet-50 encoder.
 
 input  : (B, 1, Z, H, W)   Z is the slab depth (10 globals, 5 locals)
                             H = W is the spatial crop size (256 globals, 96 locals)
-output : (B, latent_dim)    latent_dim is 512 for ResNet-18
+output : (B, latent_dim)    latent_dim is 2048 for ResNet-50
 
 design:
   - a small 3D stem learns depth-aware features over the z slab.
   - ZAttentionPool collapses z using learned per-slice attention weights; one
     set of encoder weights handles both globals (Z=10) and locals (Z=5).
-  - the 2D backbone is a ResNet-18 with its first conv adapted to take
+  - the 2D backbone is a ResNet-50 with its first conv adapted to take
     `stem_channels` inputs and its classification head removed. weights
     are randomly initialized; ImageNet pretraining doesn't transfer to
     microscopy at the scale of this dataset.
@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from torchvision.models import resnet18
+from torchvision.models import resnet50
 
 
 class ZAttentionPool(nn.Module):
@@ -58,9 +58,9 @@ class HybridEncoder(nn.Module):
         )
         self.z_pool = ZAttentionPool(stem_channels)
 
-        # 2D ResNet-18 backbone. swap the input conv (3 -> stem_channels) and
-        # drop the classifier (we want the 512-d pre-classifier feature).
-        self.backbone = resnet18(weights=None)
+        # 2D ResNet-50 backbone. swap the input conv (3 -> stem_channels) and
+        # drop the classifier (we want the 2048-d pre-classifier feature).
+        self.backbone = resnet50(weights=None)
         self.backbone.conv1 = nn.Conv2d(
             stem_channels, 64, kernel_size=7, stride=2, padding=3, bias=False
         )
@@ -73,7 +73,7 @@ class HybridEncoder(nn.Module):
         x = self.z_pool(x)
         # drop trivial z axis -> (B, stem_channels, H, W) for ResNet
         x = x.squeeze(2)
-        # backbone returns (B, 512).
+        # backbone returns (B, 2048).
         return self.backbone(x)
 
 
@@ -89,6 +89,6 @@ if __name__ == "__main__":
         z_l = enc(l)
     print(f"global input  {tuple(g.shape)} -> output {tuple(z_g.shape)}")
     print(f"local  input  {tuple(l.shape)} -> output {tuple(z_l.shape)}")
-    assert z_g.shape == (2, 512), f"unexpected global output shape: {z_g.shape}"
-    assert z_l.shape == (2, 512), f"unexpected local output shape: {z_l.shape}"
+    assert z_g.shape == (2, 2048), f"unexpected global output shape: {z_g.shape}"
+    assert z_l.shape == (2, 2048), f"unexpected local output shape: {z_l.shape}"
     print("encoder smoke test passed.")
