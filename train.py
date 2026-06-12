@@ -44,6 +44,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--device", default=None, help="override cfg.device (e.g. 'cpu', 'cuda:0')"
     )
+    p.add_argument(
+        "--run-name",
+        default=None,
+        help="namespace checkpoints + logs under this run so concurrent runs "
+        "don't clobber each other (checkpoints/<run>/, logs/<run>/)",
+    )
     return p.parse_args()
 
 
@@ -60,6 +66,11 @@ def main() -> None:
     cfg = Config.from_yaml(args.config)
     if args.device:
         cfg.device = args.device
+    # namespace io under the run name so multiple concurrent runs keep their
+    # checkpoints and tensorboard logs separate instead of overwriting.
+    if args.run_name:
+        cfg.checkpoint_dir = str(Path(cfg.checkpoint_dir) / args.run_name)
+        cfg.log_dir = str(Path(cfg.log_dir) / args.run_name)
 
     device = torch.device(cfg.device)
     # amp is only supported on cuda. silently disable on cpu.

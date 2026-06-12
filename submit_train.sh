@@ -1,32 +1,51 @@
 #!/bin/bash
-# submit a WS-DINO training run from scratch to the Janelia LSF cluster.
+# LSF job body for a WS-DINO training run from scratch (step 0).
 #
-# usage:
+# do not submit this directly. launch it through launch.sh, which assigns the
+# per-run name, snapshots the config, and overrides the -J/-oo/-eo directives
+# so concurrent runs stay separate:
+#
 #   cd /groups/sgro/sgrolab/Ankit/predicty
-#   bsub < submit_train.sh
+#   ./launch.sh <run_name>
 #
-# this script starts training at step 0. once the first checkpoint exists
-# (after ckpt_interval steps), use submit_resume.sh to continue from where
-# the job left off.
+# once the first checkpoint exists (after ckpt_interval steps), resume with
+#   ./launch.sh <run_name> --resume
 
 # ---------------------------------------------------------------------------
 # LSF directives
 # ---------------------------------------------------------------------------
+# -J/-oo/-eo are overridden per-run by launch.sh; the values here are only the
+# fallback for a raw `bsub < submit_train.sh` (run name defaults to 'default').
 #BSUB -J predicty_train              # job name (shows in bjobs)
 #BSUB -q gpu_h200                    # H200 queue: 12 slots/GPU, 40GB ram/slot, 141GB VRAM
 #BSUB -gpu "num=1"                   # request 1 GPU
 #BSUB -n 8                           # 8 slots = 8 cores + 320 GB ram (slot-implied)
 #BSUB -W 72:00                       # 72 hour walltime
-#BSUB -oo logs/lsf/train.out         # stdout log (overwritten on each submit; -oo not -o)
-#BSUB -eo logs/lsf/train.err         # stderr log (overwritten on each submit)
+#BSUB -oo logs/lsf/default/train.out # stdout log (overwritten on each submit; -oo not -o)
+#BSUB -eo logs/lsf/default/train.err # stderr log (overwritten on each submit)
 
 # ---------------------------------------------------------------------------
 # script body
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
+# run name drives every output path. launch.sh exports it; a raw bsub falls
+# back to 'default' so an un-namespaced submit still works (but two of them
+# would collide, so prefer launch.sh).
+RUN_NAME="${RUN_NAME:-default}"
+# each run reads the config snapshot launch.sh froze at submit time, not the
+# live configs/train.yaml. this is what lets you edit train.yaml and launch the
+# next run while this one is still queued.
+config_path="checkpoints/${RUN_NAME}/config.yaml"
+lsf_dir="logs/lsf/${RUN_NAME}"
+
 # LSF needs the log directory to exist before it can write into it.
-mkdir -p logs/lsf
+mkdir -p "${lsf_dir}"
+
+if [ ! -f "${config_path}" ]; then
+    echo "ERROR: ${config_path} not found. launch via ./launch.sh ${RUN_NAME}" >&2
+    exit 1
+fi
 
 # cap per-process threading. without these, every numerical library detects
 # the full node's core count and spawns that many threads per process. with
@@ -47,18 +66,19 @@ source ~/miniconda3/etc/profile.d/conda.sh
 conda activate predicty
 
 # spin up a background nvidia-smi sampler. polls every 30s and writes CSV
-# rows to logs/lsf/gpu.out so we can confirm the GPU is actually doing work.
+# rows to the run's gpu.out so we can confirm the GPU is actually doing work.
 # the EXIT trap kills it whenever this shell exits (normal end, error, bkill).
 nvidia-smi \
     --query-gpu=timestamp,index,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw \
     --format=csv \
     --loop=30 \
-    > logs/lsf/gpu.out 2>&1 &
+    > "${lsf_dir}/gpu.out" 2>&1 &
 GPU_SAMPLER_PID=$!
 trap 'kill ${GPU_SAMPLER_PID} 2>/dev/null || true' EXIT
 
-# launch training. tensorboard logs go to logs/, checkpoints to checkpoints/.
-python train.py --config configs/train.yaml
+# launch training. --run-name namespaces checkpoints (-> checkpoints/<run>/)
+# and tensorboard logs (-> logs/<run>/).
+python train.py --config "${config_path}" --run-name "${RUN_NAME}"
 
 # clean up node-local scratch on the way out.
 rm -rf $TMPDIR

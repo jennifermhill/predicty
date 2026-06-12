@@ -1,5 +1,8 @@
 # Project-specific
 /annotations
+# per-run training artifacts (checkpoints, tensorboard + lsf logs, config snapshots)
+/checkpoints/
+/logs/
 plans/
 notes.txt
 TRAINING_GUIDE.txt
