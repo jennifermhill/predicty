@@ -22,9 +22,9 @@ worker process.
 two dataset shapes are exposed:
 - `ZarrCellDataset` samples from a single zarr.
 - `MultiZarrDataset` holds N `ZarrCellDataset` children and, per sample, picks
-  one child weighted by its usable t1 range, then yields a sample from it.
-  each batch therefore mixes crops across experiments; pairs themselves
-  never cross experiment boundaries.
+  children according to a batch-aware schedule. by default each batch gives
+  every child equal representation; this can be disabled to sample children
+  weighted by usable t1 range. pairs never cross experiment boundaries.
 
 the dataset is iterable because the crop space is too large to index usefully.
 
@@ -44,6 +44,7 @@ from torch.utils.data import IterableDataset, get_worker_info
 
 from configs.config import Config
 from data.augmentations import build_augmentations
+from data.balancing import balanced_batch_indices
 from data.metadata import get_interval_minutes, get_z_limit
 
 
@@ -415,9 +416,9 @@ class MultiZarrDataset(IterableDataset):
 
     each child is a fully-initialized `ZarrCellDataset` built from a copy of
     the parent config with `zarr_path` set to one of `cfg.zarr_paths`. on
-    every draw, this wrapper picks a child weighted by its usable t1 range
-    and asks it for one pair. pairs never cross experiment boundaries; only
-    the batch does.
+    every balanced batch, this wrapper schedules equal child counts (within
+    one sample when division is uneven) and rotates remainder slots across
+    batches. pairs never cross experiment boundaries; only the batch does.
     """
 
     def __init__(self, cfg: Config) -> None:
@@ -426,6 +427,8 @@ class MultiZarrDataset(IterableDataset):
             raise ValueError(
                 "cfg.zarr_paths must be a non-empty list to build a MultiZarrDataset"
             )
+        if cfg.batch_size < 1:
+            raise ValueError(f"cfg.batch_size must be >= 1; got {cfg.batch_size}")
         self.cfg = cfg
 
         # filter out experiments marked not-for-training (blank z_limit in the
@@ -468,7 +471,12 @@ class MultiZarrDataset(IterableDataset):
         self._log_open()
 
     def _log_open(self) -> None:
-        print(f"[MultiZarrDataset] {len(self.children)} children:")
+        mode = (
+            "balanced batches"
+            if self.cfg.balance_datasets
+            else "weighted sampling"
+        )
+        print(f"[MultiZarrDataset] {len(self.children)} children ({mode}):")
         for i, (child, w) in enumerate(zip(self.children, self.weights)):
             print(
                 f"  [{i}] {child.cfg.zarr_path} "
@@ -488,9 +496,21 @@ class MultiZarrDataset(IterableDataset):
             rng = random.Random(self.cfg.seed + info.id)
 
         indices = list(range(len(self.children)))
+        batch_number = info.id if info is not None else 0
         while True:
-            idx = rng.choices(indices, weights=self.weights, k=1)[0]
-            yield self.children[idx]._sample_pair(rng, dataset_idx=idx)
+            if self.cfg.balance_datasets:
+                batch_indices = balanced_batch_indices(
+                    len(self.children),
+                    self.cfg.batch_size,
+                    batch_number,
+                    rng,
+                )
+                batch_number += 1
+                for idx in batch_indices:
+                    yield self.children[idx]._sample_pair(rng, dataset_idx=idx)
+            else:
+                idx = rng.choices(indices, weights=self.weights, k=1)[0]
+                yield self.children[idx]._sample_pair(rng, dataset_idx=idx)
 
 
 def worker_init_fn(worker_id: int) -> None:

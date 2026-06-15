@@ -27,6 +27,8 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     cfg = Config.from_yaml(args.config) if args.config else Config()
+    batch_size = 4
+    cfg.batch_size = batch_size
 
     # multi-zarr training takes precedence; single-zarr falls back to the picker.
     if cfg.zarr_paths:
@@ -42,7 +44,7 @@ def main() -> None:
         ds = ZarrCellDataset(cfg)
     loader = DataLoader(
         ds,
-        batch_size=4,
+        batch_size=batch_size,
         num_workers=cfg.num_workers,
         worker_init_fn=worker_init_fn,
         persistent_workers=cfg.num_workers > 0,
@@ -50,7 +52,6 @@ def main() -> None:
 
     per_crop_ms: list[float] = []
     n_batches = 20
-    batch_size = 4
     # crops per sample: 2 globals (one at t1, one at t2) + n_locals.
     crops_per_sample = 2 + cfg.n_local_crops
     print(

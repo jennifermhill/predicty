@@ -27,6 +27,10 @@ class Config:
     # every listed zarr in each batch and `zarr_path` is ignored.
     zarr_paths: list[str] | None = None
 
+    # give every usable zarr equal representation within each batch. counts
+    # differ by at most one when batch_size is not divisible by dataset count.
+    balance_datasets: bool = True
+
     channel: int = 0
     z_thickness: int = 10
 

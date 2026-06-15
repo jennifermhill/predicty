@@ -162,6 +162,12 @@ def main() -> None:
             print(f"[train] first batch globals device: {batch['globals'].device}")
             if "locals" in batch:
                 print(f"[train] first batch locals  device: {batch['locals'].device}")
+            dataset_indices = batch["weak_label"][:, 0].detach().cpu()
+            n_datasets = len(ds.children) if isinstance(ds, MultiZarrDataset) else 1
+            dataset_counts = torch.bincount(
+                dataset_indices, minlength=n_datasets
+            ).tolist()
+            print(f"[train] first batch dataset counts: {dataset_counts}")
 
         # set LR per-step from the schedule.
         lr = lr_schedule(step, cfg.total_steps, cfg.base_lr, cfg.warmup_frac)
