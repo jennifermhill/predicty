@@ -1,0 +1,428 @@
+"""Latent-space visualization for a frozen WS-DINO encoder.
+
+This samples normal training crops, embeds them with a checkpointed encoder,
+then projects the high-dimensional embeddings to 2D for inspection.
+
+Usage:
+    python eval/latent_space.py --config configs/train.yaml --checkpoint checkpoints/latest.pt
+    python eval/latent_space.py --config configs/train.yaml --checkpoint checkpoints/latest.pt --n-crops 20000 --method umap
+
+Outputs:
+    <out-dir>/embeddings.npz       raw embeddings, 2D coordinates, labels
+    <out-dir>/metadata.csv         crop metadata for each point
+    <out-dir>/latent_by_*.png      scatter plots colored by metadata fields
+
+UMAP and t-SNE are used when their optional packages are installed. Otherwise
+the script falls back to PCA, which is enough to catch obvious dataset islands.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+# allow running as `python eval/latent_space.py` from project root.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from configs.config import Config
+from data.dataset import MultiZarrDataset, ZarrCellDataset, worker_init_fn
+from models.encoder import HybridEncoder
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--config", required=True, help="path to the training yaml config")
+    p.add_argument("--checkpoint", required=True, help="path to latest.pt/final.pt/step_*.pt")
+    p.add_argument("--device", default=None, help="override cfg.device, e.g. cpu or cuda:0")
+    p.add_argument("--out-dir", default=None, help="output directory; defaults under latent_space/")
+    p.add_argument("--n-crops", type=int, default=10000, help="number of global crops to embed")
+    p.add_argument("--batch-size", type=int, default=None, help="override cfg.batch_size for extraction")
+    p.add_argument("--num-workers", type=int, default=None, help="override cfg.num_workers for extraction")
+    p.add_argument("--seed", type=int, default=42, help="sampling seed")
+    p.add_argument(
+        "--views",
+        choices=("both", "t1", "t2"),
+        default="both",
+        help="which global crops to include as points",
+    )
+    p.add_argument(
+        "--method",
+        choices=("auto", "umap", "tsne", "pca"),
+        default="auto",
+        help="2D projection method. auto tries UMAP, then t-SNE, then PCA.",
+    )
+    p.add_argument("--pca-dim", type=int, default=50, help="pre-reduction dim for UMAP/t-SNE")
+    p.add_argument("--umap-neighbors", type=int, default=30)
+    p.add_argument("--umap-min-dist", type=float, default=0.1)
+    p.add_argument("--tsne-perplexity", type=float, default=30.0)
+    p.add_argument("--plot-size", type=float, default=8.0)
+    return p.parse_args()
+
+
+def disable_augmentations(cfg: Config) -> None:
+    """Turn off stochastic augmentations for deterministic visual diagnostics."""
+    for name in ("aug_intensity", "aug_gamma", "aug_noise", "aug_blur"):
+        getattr(cfg, name).enabled = False
+    # Keep per-crop normalization on because it is the encoder input convention.
+
+
+def build_dataset(cfg: Config):
+    if cfg.zarr_paths:
+        return MultiZarrDataset(cfg)
+    if cfg.zarr_path is None:
+        raise ValueError("latent-space extraction needs cfg.zarr_path or cfg.zarr_paths")
+    return ZarrCellDataset(cfg)
+
+
+def as_numpy_1d(value: Any, batch_size: int) -> np.ndarray:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy().reshape(-1)
+    arr = np.asarray(value)
+    if arr.ndim == 0:
+        return np.full(batch_size, arr.item())
+    return arr.reshape(-1)
+
+
+def view_indices(views: str) -> list[int]:
+    if views == "t1":
+        return [0]
+    if views == "t2":
+        return [1]
+    return [0, 1]
+
+
+@torch.no_grad()
+def extract_embeddings(
+    cfg: Config,
+    encoder: nn.Module,
+    device: torch.device,
+    n_crops: int,
+    views: str,
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    ds = build_dataset(cfg)
+    loader = DataLoader(
+        ds,
+        batch_size=cfg.batch_size,
+        num_workers=cfg.num_workers,
+        worker_init_fn=worker_init_fn,
+        persistent_workers=cfg.num_workers > 0,
+        pin_memory=device.type == "cuda",
+    )
+
+    encoder.eval()
+    embeddings: list[torch.Tensor] = []
+    rows: list[dict[str, Any]] = []
+    selected_views = view_indices(views)
+
+    if isinstance(ds, MultiZarrDataset):
+        n_datasets = len(ds.children)
+        zarr_paths = [child.cfg.zarr_path or "" for child in ds.children]
+    else:
+        n_datasets = 1
+        zarr_paths = [cfg.zarr_path or ""]
+    seen = 0
+    t0 = time.time()
+
+    for step, batch in enumerate(loader):
+        globals_ = batch["globals"]  # (B, 2, 1, Z, H, W)
+        weak_label = batch["weak_label"]
+        meta = batch["meta"]
+        batch_size = globals_.size(0)
+
+        crops = torch.cat([globals_[:, i] for i in selected_views], dim=0).to(
+            device, non_blocking=True
+        )
+        emb = encoder(crops).cpu()
+
+        for offset, view_idx in enumerate(selected_views):
+            start = offset * batch_size
+            end = start + batch_size
+            embeddings.append(emb[start:end])
+
+            dataset_idx = as_numpy_1d(weak_label[:, 0], batch_size)
+            frame_gap = as_numpy_1d(weak_label[:, 1], batch_size)
+            t = as_numpy_1d(meta["t1" if view_idx == 0 else "t2"], batch_size)
+            z = as_numpy_1d(meta["z"], batch_size)
+            z_end = as_numpy_1d(meta["z_end"], batch_size)
+            y = as_numpy_1d(meta["global_y"], batch_size)
+            x = as_numpy_1d(meta["global_x"], batch_size)
+
+            for i in range(batch_size):
+                ds_idx = int(dataset_idx[i])
+                rows.append({
+                    "point_idx": len(rows),
+                    "dataset_idx": ds_idx,
+                    "dataset_name": Path(zarr_paths[ds_idx]).name if ds_idx < len(zarr_paths) else "",
+                    "n_datasets": n_datasets,
+                    "view": "t1" if view_idx == 0 else "t2",
+                    "view_idx": int(view_idx),
+                    "t": int(t[i]),
+                    "z": int(z[i]),
+                    "z_end": int(z_end[i]),
+                    "global_y": int(y[i]),
+                    "global_x": int(x[i]),
+                    "frame_gap": int(frame_gap[i]),
+                })
+
+        seen = len(rows)
+        if step == 0 or seen >= n_crops or step % 10 == 0:
+            elapsed = time.time() - t0
+            rate = seen / max(elapsed, 1e-6)
+            print(f"  [extract] {min(seen, n_crops)}/{n_crops} crops  ({rate:.1f} crops/s)")
+        if seen >= n_crops:
+            break
+
+    X = torch.cat(embeddings, dim=0).numpy()[:n_crops]
+    return X, rows[:n_crops]
+
+
+def pca_project(X: np.ndarray, n_components: int = 2) -> tuple[np.ndarray, np.ndarray]:
+    X_t = torch.from_numpy(X).float()
+    X_t = X_t - X_t.mean(dim=0, keepdim=True)
+    q = min(n_components, X_t.shape[0] - 1, X_t.shape[1])
+    _, s, v = torch.pca_lowrank(X_t, q=q, center=False)
+    coords = X_t @ v[:, :q]
+    denom = torch.clamp((X_t ** 2).sum(), min=1e-12)
+    explained = (s[:q] ** 2 / denom).cpu().numpy()
+    return coords.cpu().numpy(), explained
+
+
+def reduce_for_manifold(X: np.ndarray, pca_dim: int) -> np.ndarray:
+    if X.shape[1] <= pca_dim:
+        return X
+    coords, explained = pca_project(X, min(pca_dim, X.shape[0] - 1, X.shape[1]))
+    print(
+        f"[project] PCA pre-reduction to {coords.shape[1]} dims "
+        f"(explained first 2 = {explained[:2].sum()*100:.1f}%)"
+    )
+    return coords
+
+
+def project_2d(args: argparse.Namespace, X: np.ndarray) -> tuple[np.ndarray, str]:
+    method = args.method
+    if method == "auto":
+        try:
+            import umap  # type: ignore
+
+            method = "umap"
+        except Exception:
+            try:
+                from sklearn.manifold import TSNE  # noqa: F401
+
+                method = "tsne"
+            except Exception:
+                method = "pca"
+
+    if method == "umap":
+        try:
+            import umap  # type: ignore
+        except Exception as e:
+            raise RuntimeError("UMAP requested but umap-learn is not installed") from e
+        X_red = reduce_for_manifold(X, args.pca_dim)
+        reducer = umap.UMAP(
+            n_components=2,
+            n_neighbors=args.umap_neighbors,
+            min_dist=args.umap_min_dist,
+            metric="euclidean",
+            random_state=args.seed,
+        )
+        return reducer.fit_transform(X_red), "umap"
+
+    if method == "tsne":
+        try:
+            from sklearn.manifold import TSNE
+        except Exception as e:
+            raise RuntimeError("t-SNE requested but scikit-learn is not installed") from e
+        X_red = reduce_for_manifold(X, args.pca_dim)
+        perplexity = min(args.tsne_perplexity, max(5.0, (X.shape[0] - 1) / 3))
+        reducer = TSNE(
+            n_components=2,
+            perplexity=perplexity,
+            init="pca",
+            learning_rate="auto",
+            random_state=args.seed,
+        )
+        return reducer.fit_transform(X_red), "tsne"
+
+    coords, explained = pca_project(X, 2)
+    print(f"[project] PCA explained variance in 2D: {explained.sum()*100:.1f}%")
+    return coords, "pca"
+
+
+def write_metadata_csv(path: Path, rows: list[dict[str, Any]], coords: np.ndarray) -> None:
+    fieldnames = ["coord_x", "coord_y"] + list(rows[0].keys())
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row, xy in zip(rows, coords):
+            writer.writerow({"coord_x": float(xy[0]), "coord_y": float(xy[1]), **row})
+
+
+def save_npz(path: Path, X: np.ndarray, coords: np.ndarray, rows: list[dict[str, Any]]) -> None:
+    labels = np.asarray([r["dataset_idx"] for r in rows], dtype=np.int64)
+    t = np.asarray([r["t"] for r in rows], dtype=np.int64)
+    z = np.asarray([r["z"] for r in rows], dtype=np.int64)
+    view_idx = np.asarray([r["view_idx"] for r in rows], dtype=np.int64)
+    np.savez_compressed(
+        path,
+        embeddings=X.astype(np.float32),
+        coords=coords.astype(np.float32),
+        dataset_idx=labels,
+        t=t,
+        z=z,
+        view_idx=view_idx,
+    )
+
+
+def plot_categorical(
+    coords: np.ndarray,
+    values: list[Any],
+    title: str,
+    out_path: Path,
+    plot_size: float,
+) -> None:
+    fig, ax = plt.subplots(figsize=(plot_size, plot_size), dpi=160)
+    labels = sorted(set(values), key=lambda x: str(x))
+    cmap = plt.get_cmap("tab20")
+    for idx, label in enumerate(labels):
+        mask = np.asarray([v == label for v in values])
+        ax.scatter(
+            coords[mask, 0],
+            coords[mask, 1],
+            s=5,
+            alpha=0.65,
+            color=cmap(idx % 20),
+            label=str(label)[:36],
+            linewidths=0,
+        )
+    ax.set_title(title)
+    ax.set_xlabel("dim 1")
+    ax.set_ylabel("dim 2")
+    ax.legend(markerscale=3, fontsize=7, frameon=False, loc="best")
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def plot_continuous(
+    coords: np.ndarray,
+    values: np.ndarray,
+    title: str,
+    out_path: Path,
+    plot_size: float,
+) -> None:
+    fig, ax = plt.subplots(figsize=(plot_size, plot_size), dpi=160)
+    sc = ax.scatter(
+        coords[:, 0],
+        coords[:, 1],
+        c=values,
+        s=5,
+        alpha=0.75,
+        cmap="viridis",
+        linewidths=0,
+    )
+    ax.set_title(title)
+    ax.set_xlabel("dim 1")
+    ax.set_ylabel("dim 2")
+    fig.colorbar(sc, ax=ax, shrink=0.85)
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def save_plots(coords: np.ndarray, rows: list[dict[str, Any]], out_dir: Path, plot_size: float) -> None:
+    dataset_idx = [r["dataset_idx"] for r in rows]
+    dataset_name = [r["dataset_name"] for r in rows]
+    view = [r["view"] for r in rows]
+    t = np.asarray([r["t"] for r in rows])
+    z = np.asarray([r["z"] for r in rows])
+    frame_gap = np.asarray([r["frame_gap"] for r in rows])
+
+    plot_categorical(coords, dataset_idx, "Latent space colored by dataset_idx", out_dir / "latent_by_dataset_idx.png", plot_size)
+    plot_categorical(coords, dataset_name, "Latent space colored by dataset name", out_dir / "latent_by_dataset_name.png", plot_size)
+    plot_categorical(coords, view, "Latent space colored by global view", out_dir / "latent_by_view.png", plot_size)
+    plot_continuous(coords, t, "Latent space colored by time", out_dir / "latent_by_time.png", plot_size)
+    plot_continuous(coords, z, "Latent space colored by z", out_dir / "latent_by_z.png", plot_size)
+    plot_continuous(coords, frame_gap, "Latent space colored by frame_gap", out_dir / "latent_by_frame_gap.png", plot_size)
+
+
+def maybe_print_cluster_metrics(coords: np.ndarray, rows: list[dict[str, Any]]) -> None:
+    labels = np.asarray([r["dataset_idx"] for r in rows], dtype=np.int64)
+    if len(np.unique(labels)) < 2:
+        print("[metrics] only one dataset label; skipping dataset clustering metrics")
+        return
+    try:
+        from sklearn.metrics import silhouette_score
+    except Exception:
+        print("[metrics] scikit-learn not installed; skipping silhouette score")
+        return
+    score = silhouette_score(coords, labels)
+    print(f"[metrics] silhouette by dataset_idx on 2D projection: {score:.3f}")
+    print("[metrics] near 0 means mixed/overlapping datasets; high positive means dataset-separated islands")
+
+
+def main() -> None:
+    args = parse_args()
+    cfg = Config.from_yaml(args.config)
+    cfg.seed = args.seed
+    if args.batch_size is not None:
+        cfg.batch_size = args.batch_size
+    if args.num_workers is not None:
+        cfg.num_workers = args.num_workers
+    disable_augmentations(cfg)
+
+    device = torch.device(args.device or cfg.device)
+    out_dir = (
+        Path(args.out_dir)
+        if args.out_dir
+        else Path("latent_space") / f"{Path(args.checkpoint).stem}_{time.strftime('%Y%m%d_%H%M%S')}"
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"[latent] device     : {device}")
+    print(f"[latent] config     : {args.config}")
+    print(f"[latent] checkpoint : {args.checkpoint}")
+    print(f"[latent] out_dir    : {out_dir}")
+    print(f"[latent] n_crops    : {args.n_crops}")
+    print(f"[latent] views      : {args.views}")
+
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    print(f"[latent] checkpoint step: {ckpt.get('step', 'unknown')}")
+    encoder = HybridEncoder(stem_channels=cfg.stem_channels).to(device)
+    encoder.load_state_dict(ckpt["encoder_state_dict"])
+    for p in encoder.parameters():
+        p.requires_grad = False
+    encoder.eval()
+
+    t0 = time.time()
+    X, rows = extract_embeddings(cfg, encoder, device, args.n_crops, args.views)
+    print(f"[latent] extracted embeddings: {X.shape} in {time.time() - t0:.1f}s")
+
+    coords, method = project_2d(args, X)
+    print(f"[latent] projection method: {method}  coords={coords.shape}")
+
+    write_metadata_csv(out_dir / "metadata.csv", rows, coords)
+    save_npz(out_dir / "embeddings.npz", X, coords, rows)
+    save_plots(coords, rows, out_dir, args.plot_size)
+    maybe_print_cluster_metrics(coords, rows)
+
+    print("[latent] wrote:")
+    for path in sorted(out_dir.iterdir()):
+        print(f"  - {path}")
+
+
+if __name__ == "__main__":
+    main()
