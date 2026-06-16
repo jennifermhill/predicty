@@ -91,6 +91,10 @@ def save_checkpoint(path, model, optimizer, scaler, step: int) -> None:
         "center": model.center.detach().cpu(),
         "step": int(step),
     }
+    if getattr(model, "dataset_classifier", None) is not None:
+        state["dataset_classifier_state_dict"] = model.dataset_classifier.state_dict()
+    if getattr(model, "mae_decoder", None) is not None:
+        state["mae_decoder_state_dict"] = model.mae_decoder.state_dict()
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(state, path)
@@ -103,9 +107,33 @@ def load_checkpoint(
     state = torch.load(path, map_location="cpu")
     model.student.load_state_dict(state["student_state_dict"])
     model.teacher.load_state_dict(state["teacher_state_dict"])
+    if getattr(model, "dataset_classifier", None) is not None:
+        if "dataset_classifier_state_dict" in state:
+            model.dataset_classifier.load_state_dict(
+                state["dataset_classifier_state_dict"]
+            )
+        else:
+            print(
+                "[checkpoint] no dataset classifier state in checkpoint; "
+                "starting adversarial head from initialization"
+            )
+    if getattr(model, "mae_decoder", None) is not None:
+        if "mae_decoder_state_dict" in state:
+            model.mae_decoder.load_state_dict(state["mae_decoder_state_dict"])
+        else:
+            print(
+                "[checkpoint] no MAE decoder state in checkpoint; "
+                "starting MAE decoder from initialization"
+            )
     model.center.copy_(state["center"].to(model.center.device))
     if optimizer is not None:
-        optimizer.load_state_dict(state["optimizer_state_dict"])
+        try:
+            optimizer.load_state_dict(state["optimizer_state_dict"])
+        except ValueError as e:
+            print(
+                "[checkpoint] optimizer state is incompatible with the current "
+                f"trainable modules; continuing with a fresh optimizer ({e})"
+            )
     if scaler is not None:
         scaler.load_state_dict(state["scaler_state_dict"])
     return int(state["step"])

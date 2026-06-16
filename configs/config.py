@@ -111,7 +111,7 @@ class Config:
     # (ResNet's default 3-channel conv is replaced).
     stem_channels: int = 64
     # ResNet-50's pre-classifier output dim, the encoder's representation size.
-    latent_dim: int = 512
+    latent_dim: int = 2048
 
     # projector (DINO head) discarded after training. K is the prototype count
     # the cross-entropy operates over.
@@ -131,6 +131,33 @@ class Config:
     ema_momentum_end: float = 1.0
     # center buffer momentum. prevents one prototype from dominating.
     center_momentum: float = 0.9
+
+    # ------------------------------------------------------------------
+    # adversarial dataset classifier
+    # ------------------------------------------------------------------
+    # Trains a small classifier to predict dataset_idx from encoder features,
+    # while a gradient reversal layer sends the opposite gradient into the
+    # encoder. This discourages dataset identity leakage in the representation.
+    dataset_adversary_enabled: bool = False
+    dataset_adversary_weight: float = 0.1
+    dataset_adversary_grl_scale: float = 1.0
+    dataset_adversary_hidden: int = 256
+    dataset_adversary_dropout: float = 0.1
+
+    # ------------------------------------------------------------------
+    # masked patch autoencoder
+    # ------------------------------------------------------------------
+    # Auxiliary reconstruction loss on global crops. The student encoder sees
+    # a patch-masked crop; the training-only decoder predicts only masked
+    # patch contents. The encoder is still what ships downstream.
+    mae_enabled: bool = False
+    mae_weight: float = 0.05
+    mae_mask_ratio: float = 0.75
+    mae_patch_z: int = 2
+    mae_patch_size: int = 16
+    mae_decoder_hidden: int = 512
+    mae_decoder_depth: int = 2
+    mae_norm_pix_loss: bool = True
 
     # ------------------------------------------------------------------
     # optimizer / schedule

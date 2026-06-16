@@ -181,6 +181,32 @@ ema_momentum_end: 1.0
 center_momentum: 0.9
 
 # ---------------------------------------------------------------------------
+# adversarial dataset classifier
+# ---------------------------------------------------------------------------
+# predicts dataset_idx from encoder features while gradient reversal pushes the
+# encoder to remove dataset identity. automatically inactive for single-zarr
+# runs because there is no multi-class dataset signal.
+dataset_adversary_enabled: true
+dataset_adversary_weight: 0.1
+dataset_adversary_grl_scale: 1.0
+dataset_adversary_hidden: 256
+dataset_adversary_dropout: 0.1
+
+# ---------------------------------------------------------------------------
+# masked patch autoencoder
+# ---------------------------------------------------------------------------
+# auxiliary global-crop reconstruction. the shared encoder sees patch-masked
+# crops; the training-only decoder predicts masked voxel patches.
+mae_enabled: true
+mae_weight: 0.05
+mae_mask_ratio: 0.75
+mae_patch_z: 2
+mae_patch_size: 16
+mae_decoder_hidden: 512
+mae_decoder_depth: 2
+mae_norm_pix_loss: true
+
+# ---------------------------------------------------------------------------
 # optimizer / LR schedule
 # ---------------------------------------------------------------------------
 # base_lr:        peak LR after warmup. scale linearly with batch_size if changed.

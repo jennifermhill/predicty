@@ -27,6 +27,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class _GradientReversal(torch.autograd.Function):
+    """Identity in forward, sign-flipped gradient in backward."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, scale: float) -> torch.Tensor:
+        ctx.scale = float(scale)
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output.neg().mul(ctx.scale), None
+
+
+def gradient_reverse(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    return _GradientReversal.apply(x, scale)
+
+
 class DINOHead(nn.Module):
     """3-layer MLP -> L2 normalize -> weight-normed prototype layer.
 
@@ -71,6 +88,28 @@ class DINOHead(nn.Module):
         return self.last_layer(z)
 
 
+class DatasetClassifier(nn.Module):
+    """Small adversarial head for predicting dataset identity from encoder features."""
+
+    def __init__(
+        self,
+        in_dim: int,
+        n_classes: int,
+        hidden_dim: int = 256,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, n_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class StudentNet(nn.Module):
     """encoder + projector. stashes the last encoder features (no grad) so the
     training loop can compute embedding variance without a redundant forward."""
@@ -81,19 +120,26 @@ class StudentNet(nn.Module):
         self.projector = projector
         self.last_features: Optional[torch.Tensor] = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
         z = self.encoder(x)
         self.last_features = z.detach()
+        return z
+
+    def project(self, z: torch.Tensor) -> torch.Tensor:
         return self.projector(z)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.project(self.encode(x))
 
 
 class DINOWrapper(nn.Module):
     """owns the trainable student, the EMA teacher, and the centering buffer."""
 
-    def __init__(self, cfg) -> None:
+    def __init__(self, cfg, n_datasets: Optional[int] = None) -> None:
         super().__init__()
         # local import keeps the encoder module decoupled from the wrapper.
         from models.encoder import HybridEncoder
+        from models.mae import MaskedPatchAutoencoder
 
         student_enc = HybridEncoder(stem_channels=cfg.stem_channels)
         student_proj = DINOHead(
@@ -103,6 +149,38 @@ class DINOWrapper(nn.Module):
             out_dim=cfg.projector_k,
         )
         self.student = StudentNet(student_enc, student_proj)
+
+        if n_datasets is None:
+            n_datasets = len(cfg.zarr_paths) if cfg.zarr_paths else 1
+        self.n_datasets = int(n_datasets)
+        self.dataset_classifier = (
+            DatasetClassifier(
+                in_dim=cfg.latent_dim,
+                n_classes=self.n_datasets,
+                hidden_dim=cfg.dataset_adversary_hidden,
+                dropout=cfg.dataset_adversary_dropout,
+            )
+            if cfg.dataset_adversary_enabled and self.n_datasets > 1
+            else None
+        )
+        self.dataset_adversary_grl_scale = float(cfg.dataset_adversary_grl_scale)
+        self.mae_decoder = (
+            MaskedPatchAutoencoder(
+                latent_dim=cfg.latent_dim,
+                crop_shape=(
+                    cfg.z_thickness,
+                    cfg.global_crop_size,
+                    cfg.global_crop_size,
+                ),
+                patch_shape=(cfg.mae_patch_z, cfg.mae_patch_size, cfg.mae_patch_size),
+                hidden_dim=cfg.mae_decoder_hidden,
+                depth=cfg.mae_decoder_depth,
+                mask_ratio=cfg.mae_mask_ratio,
+                norm_pix_loss=cfg.mae_norm_pix_loss,
+            )
+            if cfg.mae_enabled
+            else None
+        )
 
         # teacher: frozen deep-copy of the student. EMA-updated each step.
         self.teacher = copy.deepcopy(self.student)
@@ -121,15 +199,40 @@ class DINOWrapper(nn.Module):
 
         # student processes globals + locals; teacher only globals.
         g_flat = globals_.flatten(0, 1)
-        s_g = self.student(g_flat)
+        g_features = self.student.encode(g_flat)
+        s_g = self.student.project(g_features)
 
         if locals_ is not None and locals_.numel() > 0:
             n_l = locals_.shape[1]
             l_flat = locals_.flatten(0, 1)
-            s_l = self.student(l_flat)
+            l_features = self.student.encode(l_flat)
+            s_l = self.student.project(l_features)
+            student_features = torch.cat([g_features, l_features], dim=0)
         else:
             n_l = 0
+            l_features = None
             s_l = None
+            student_features = g_features
+
+        self.student.last_features = student_features.detach()
+
+        dataset_logits = None
+        dataset_targets = None
+        if self.dataset_classifier is not None:
+            dataset_idx = batch["weak_label"][:, 0]
+            global_targets = dataset_idx.repeat_interleave(n_g)
+            if l_features is not None:
+                local_targets = dataset_idx.repeat_interleave(n_l)
+                dataset_targets = torch.cat([global_targets, local_targets], dim=0)
+            else:
+                dataset_targets = global_targets
+            dataset_logits = self.dataset_classifier(
+                gradient_reverse(student_features, self.dataset_adversary_grl_scale)
+            )
+
+        mae_out = None
+        if self.mae_decoder is not None:
+            mae_out = self.mae_decoder(g_flat, self.student.encoder)
 
         with torch.no_grad():
             t_g = self.teacher(g_flat)
@@ -141,6 +244,9 @@ class DINOWrapper(nn.Module):
             "B": B,
             "n_g": n_g,
             "n_l": n_l,
+            "dataset_logits": dataset_logits,
+            "dataset_targets": dataset_targets,
+            "mae": mae_out,
         }
 
     @torch.no_grad()
@@ -211,8 +317,12 @@ if __name__ == "__main__":
 
     cfg = Config()
     cfg.projector_k = 256  # tiny K for fast test
+    cfg.global_crop_size = 96
+    cfg.local_crop_size = 48
+    cfg.dataset_adversary_enabled = True
+    cfg.mae_enabled = True
 
-    wrapper = DINOWrapper(cfg)
+    wrapper = DINOWrapper(cfg, n_datasets=3)
     wrapper.eval()
 
     B = 2
@@ -220,6 +330,7 @@ if __name__ == "__main__":
         # smaller spatial dims than real config for a quick CPU smoke test.
         "globals": torch.randn(B, 2, 1, 10, 96, 96),
         "locals": torch.randn(B, 6, 1, 5, 48, 48),
+        "weak_label": torch.tensor([[0, 5], [2, 5]], dtype=torch.long),
     }
     out = wrapper(batch)
     print(
@@ -234,6 +345,11 @@ if __name__ == "__main__":
         f"teacher_globals: {tuple(out['teacher_globals'].shape)}  "
         f"(expected ({B * 2}, {cfg.projector_k}))"
     )
+    print(
+        f"dataset_logits: {tuple(out['dataset_logits'].shape)}  "
+        f"(expected ({B * (2 + 6)}, 3))"
+    )
+    print(f"mae_loss: {out['mae']['loss'].item():.4f}")
 
     loss = dino_loss(
         out["student_globals"],
@@ -242,6 +358,9 @@ if __name__ == "__main__":
         wrapper.center,
         out["B"], out["n_g"], out["n_l"],
         cfg.teacher_temp, cfg.student_temp,
+    )
+    loss = loss + out["mae"]["loss"] + F.cross_entropy(
+        out["dataset_logits"], out["dataset_targets"]
     )
     print(f"loss: {loss.item():.4f}")
     assert torch.isfinite(loss), "loss is not finite"

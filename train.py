@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
@@ -93,6 +94,7 @@ def main() -> None:
 
     # ---- data ----
     ds = build_dataset(cfg)
+    n_datasets = len(ds.children) if isinstance(ds, MultiZarrDataset) else 1
     loader = DataLoader(
         ds,
         batch_size=cfg.batch_size,
@@ -103,17 +105,42 @@ def main() -> None:
     )
 
     # ---- model ----
-    model = DINOWrapper(cfg).to(device)
+    model = DINOWrapper(cfg, n_datasets=n_datasets).to(device)
     n_params = sum(p.numel() for p in model.student.parameters())
     print(f"[train] student params: {n_params:,}")
+    if model.dataset_classifier is not None:
+        n_adv_params = sum(p.numel() for p in model.dataset_classifier.parameters())
+        print(
+            f"[train] dataset adversary: enabled "
+            f"(classes={n_datasets}, params={n_adv_params:,}, "
+            f"weight={cfg.dataset_adversary_weight}, "
+            f"grl_scale={cfg.dataset_adversary_grl_scale})"
+        )
+    else:
+        print("[train] dataset adversary: disabled")
+    if model.mae_decoder is not None:
+        n_mae_params = sum(p.numel() for p in model.mae_decoder.parameters())
+        print(
+            f"[train] masked autoencoder: enabled "
+            f"(patch=({cfg.mae_patch_z}, {cfg.mae_patch_size}, {cfg.mae_patch_size}), "
+            f"mask_ratio={cfg.mae_mask_ratio}, params={n_mae_params:,}, "
+            f"weight={cfg.mae_weight})"
+        )
+    else:
+        print("[train] masked autoencoder: disabled")
     # confirms .to(device) actually moved the model. if this prints 'cpu'
     # while device says 'cuda', training will silently run on cpu.
     print(f"[train] student params live on: {next(model.student.parameters()).device}")
     print(f"[train] teacher params live on: {next(model.teacher.parameters()).device}")
 
     # ---- optimizer + amp ----
+    trainable_modules = torch.nn.ModuleList([model.student])
+    if model.dataset_classifier is not None:
+        trainable_modules.append(model.dataset_classifier)
+    if model.mae_decoder is not None:
+        trainable_modules.append(model.mae_decoder)
     optimizer = AdamW(
-        get_param_groups(model.student, cfg.weight_decay),
+        get_param_groups(trainable_modules, cfg.weight_decay),
         lr=cfg.base_lr,
         betas=(0.9, 0.999),
     )
@@ -163,7 +190,6 @@ def main() -> None:
             if "locals" in batch:
                 print(f"[train] first batch locals  device: {batch['locals'].device}")
             dataset_indices = batch["weak_label"][:, 0].detach().cpu()
-            n_datasets = len(ds.children) if isinstance(ds, MultiZarrDataset) else 1
             dataset_counts = torch.bincount(
                 dataset_indices, minlength=n_datasets
             ).tolist()
@@ -177,7 +203,7 @@ def main() -> None:
         # forward + loss under autocast (fp16 ops on cuda).
         with autocast(device.type, dtype=torch.float16, enabled=use_amp):
             out = model(batch)
-            loss = dino_loss(
+            dino = dino_loss(
                 out["student_globals"],
                 out["student_locals"],
                 out["teacher_globals"],
@@ -186,12 +212,24 @@ def main() -> None:
                 teacher_temp=cfg.teacher_temp,
                 student_temp=cfg.student_temp,
             )
+            dataset_loss = None
+            if out["dataset_logits"] is not None:
+                dataset_loss = F.cross_entropy(
+                    out["dataset_logits"], out["dataset_targets"]
+                )
+            mae_loss = out["mae"]["loss"] if out["mae"] is not None else None
+
+            loss = dino
+            if dataset_loss is not None:
+                loss = loss + cfg.dataset_adversary_weight * dataset_loss
+            if mae_loss is not None:
+                loss = loss + cfg.mae_weight * mae_loss
 
         # backward, unscale grads to apply clipping in fp32, step + update.
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.student.parameters(), cfg.grad_clip_norm
+            trainable_modules.parameters(), cfg.grad_clip_norm
         )
         scaler.step(optimizer)
         scaler.update()
@@ -226,12 +264,23 @@ def main() -> None:
                     else torch.tensor(0.0)
                 )
                 center_norm = model.center.norm()
+                if dataset_loss is not None:
+                    dataset_acc = (
+                        out["dataset_logits"].argmax(dim=1)
+                        == out["dataset_targets"]
+                    ).float().mean()
+                else:
+                    dataset_acc = None
+                mae_mask_ratio = (
+                    out["mae"]["mask_ratio"] if out["mae"] is not None else None
+                )
 
             dt = time.time() - t_last_log
             t_last_log = time.time()
             steps_per_sec = cfg.log_interval / max(dt, 1e-6) if step > start_step else 0.0
 
             writer.add_scalar("loss", loss.item(), step)
+            writer.add_scalar("loss/dino", dino.item(), step)
             writer.add_scalar("lr", lr, step)
             writer.add_scalar("ema_momentum", m, step)
             writer.add_scalar("grad_norm", grad_norm.item(), step)
@@ -239,12 +288,26 @@ def main() -> None:
             writer.add_scalar("collapse/embedding_var", emb_var.item(), step)
             writer.add_scalar("collapse/center_norm", center_norm.item(), step)
             writer.add_scalar("throughput/steps_per_sec", steps_per_sec, step)
+            if dataset_loss is not None and dataset_acc is not None:
+                writer.add_scalar("dataset_adversary/loss", dataset_loss.item(), step)
+                writer.add_scalar("dataset_adversary/acc", dataset_acc.item(), step)
+            if mae_loss is not None and mae_mask_ratio is not None:
+                writer.add_scalar("mae/loss", mae_loss.item(), step)
+                writer.add_scalar("mae/mask_ratio", mae_mask_ratio.item(), step)
 
-            print(
+            msg = (
                 f"step {step:06d}  loss={loss.item():.4f}  lr={lr:.2e}  "
                 f"ent={entropy.item():.3f}  emb_var={emb_var.item():.4f}  "
                 f"center_norm={center_norm.item():.3f}  {steps_per_sec:.2f} step/s"
             )
+            if dataset_loss is not None and dataset_acc is not None:
+                msg += (
+                    f"  ds_loss={dataset_loss.item():.4f} "
+                    f"ds_acc={dataset_acc.item():.3f}"
+                )
+            if mae_loss is not None:
+                msg += f"  mae_loss={mae_loss.item():.4f}"
+            print(msg)
 
         # ---- checkpoint ----
         if step > 0 and step % cfg.ckpt_interval == 0:
