@@ -46,6 +46,11 @@ from configs.config import Config
 from data.augmentations import build_augmentations
 from data.balancing import balanced_batch_indices
 from data.metadata import get_interval_minutes, get_z_limit
+from data.spatial_regions import (
+    region_bounds_for_top_left,
+    region_index_for_top_left,
+    select_nonadjacent_regions,
+)
 
 
 class ZarrCellDataset(IterableDataset):
@@ -57,16 +62,14 @@ class ZarrCellDataset(IterableDataset):
 
         # open once here to read shape and resolve ranges.
         self._open_zarr()
+        # Initialized before range resolution because content-aware holdout
+        # selection scores crops relative to cached frame means.
+        self._frame_mean_cache: dict[tuple[int, int], float] = {}
         self._resolve_ranges()
         self._log_open()
 
         # augmentations are stateless across workers.
         self._augment = build_augmentations(cfg)
-
-        # per-(t, z_slab) mean cache for intensity gating. keyed by the actual
-        # z slab the crops will compare against, not the full z window, so the
-        # threshold lives in the same units as the crop means.
-        self._frame_mean_cache: dict[tuple[int, int], float] = {}
 
     def _open_zarr(self) -> None:
         # cells are already low resolution, so always read the native pyramid level.
@@ -89,6 +92,7 @@ class ZarrCellDataset(IterableDataset):
         self._check_fraction("t1_frac_min", cfg.t1_frac_min)
         self._check_fraction("t1_frac_max", cfg.t1_frac_max)
         self._check_order("t1_frac", cfg.t1_frac_min, cfg.t1_frac_max)
+        self._check_spatial_region_config()
 
         if cfg.z_thickness < 1:
             raise ValueError(f"z_thickness must be >= 1; got {cfg.z_thickness}")
@@ -218,6 +222,9 @@ class ZarrCellDataset(IterableDataset):
                 f"resulting range was [{self.t1_min}, {self.t1_max})"
             )
 
+        self._spatial_holdout_regions = self._resolve_spatial_holdout_regions()
+        self._spatial_regions = self._build_spatial_regions()
+
     @staticmethod
     def _check_fraction(name: str, value: float) -> None:
         if not 0.0 <= value <= 1.0:
@@ -227,6 +234,184 @@ class ZarrCellDataset(IterableDataset):
     def _check_order(name: str, low: float, high: float) -> None:
         if low > high:
             raise ValueError(f"{name}_min must be <= {name}_max; got {low} > {high}")
+
+    def _check_spatial_region_config(self) -> None:
+        cfg = self.cfg
+        if cfg.spatial_region_grid_y < 1 or cfg.spatial_region_grid_x < 1:
+            raise ValueError(
+                "spatial_region_grid_y and spatial_region_grid_x must be >= 1; "
+                f"got {cfg.spatial_region_grid_y}x{cfg.spatial_region_grid_x}"
+            )
+        if cfg.spatial_region_mode not in ("all", "exclude_holdout", "holdout"):
+            raise ValueError(
+                "spatial_region_mode must be one of "
+                "'all', 'exclude_holdout', or 'holdout'; "
+                f"got {cfg.spatial_region_mode!r}"
+            )
+        if cfg.spatial_holdout_selection not in ("manual", "content"):
+            raise ValueError(
+                "spatial_holdout_selection must be 'manual' or 'content'; "
+                f"got {cfg.spatial_holdout_selection!r}"
+            )
+        if cfg.spatial_holdout_region_count < 1:
+            raise ValueError(
+                "spatial_holdout_region_count must be >= 1; "
+                f"got {cfg.spatial_holdout_region_count}"
+            )
+        if cfg.spatial_holdout_nonadjacent_gap < 0:
+            raise ValueError(
+                "spatial_holdout_nonadjacent_gap must be >= 0; "
+                f"got {cfg.spatial_holdout_nonadjacent_gap}"
+            )
+        if cfg.spatial_holdout_content_samples_per_region < 1:
+            raise ValueError(
+                "spatial_holdout_content_samples_per_region must be >= 1; "
+                f"got {cfg.spatial_holdout_content_samples_per_region}"
+            )
+        n_regions = cfg.spatial_region_grid_y * cfg.spatial_region_grid_x
+        resolved_regions = self._resolved_spatial_holdout_regions()
+        for idx in resolved_regions:
+            if not 0 <= idx < n_regions:
+                raise ValueError(
+                    f"resolved spatial holdout region must be in [0, {n_regions}); got {idx}"
+                )
+        manual_regions = self._manual_spatial_holdout_regions()
+        for idx in manual_regions:
+            if not 0 <= idx < n_regions:
+                raise ValueError(
+                    f"spatial holdout region must be in [0, {n_regions}); got {idx}"
+                )
+        if cfg.spatial_region_mode != "all" and cfg.spatial_holdout_selection == "manual":
+            if not manual_regions:
+                raise ValueError(
+                    f"spatial_region_mode={cfg.spatial_region_mode!r} requires "
+                    "spatial_holdout_regions or spatial_holdout_region"
+                )
+
+    def _manual_spatial_holdout_regions(self) -> list[int]:
+        cfg = self.cfg
+        regions: list[int] = []
+        if cfg.spatial_holdout_regions is not None:
+            regions.extend(int(idx) for idx in cfg.spatial_holdout_regions)
+        if cfg.spatial_holdout_region is not None:
+            regions.append(int(cfg.spatial_holdout_region))
+        return sorted(set(regions))
+
+    def _resolved_spatial_holdout_regions(self) -> list[int]:
+        if self.cfg.spatial_holdout_resolved_regions is None:
+            return []
+        return sorted(set(int(idx) for idx in self.cfg.spatial_holdout_resolved_regions))
+
+    def _resolve_spatial_holdout_regions(self) -> list[int]:
+        cfg = self.cfg
+        if cfg.spatial_region_mode == "all":
+            return []
+        resolved = self._resolved_spatial_holdout_regions()
+        if resolved:
+            return resolved
+        if cfg.spatial_holdout_selection == "manual":
+            return self._manual_spatial_holdout_regions()
+        return self._select_content_holdout_regions()
+
+    def _score_spatial_regions_by_content(self) -> dict[int, float]:
+        cfg = self.cfg
+        rng = random.Random(cfg.spatial_holdout_seed + 7919)
+        n_regions = cfg.spatial_region_grid_y * cfg.spatial_region_grid_x
+        scores: dict[int, float] = {}
+        for idx in range(n_regions):
+            y0, y1, x0, x1 = region_bounds_for_top_left(
+                self.Y,
+                self.X,
+                cfg.global_crop_size,
+                cfg.spatial_region_grid_y,
+                cfg.spatial_region_grid_x,
+                idx,
+            )
+            ratios: list[float] = []
+            for _ in range(cfg.spatial_holdout_content_samples_per_region):
+                z = rng.randrange(self.z_min, self.z_max - cfg.z_thickness + 1)
+                t = rng.randrange(self.t1_min, self.t1_max)
+                y_off = rng.randrange(y0, y1)
+                x_off = rng.randrange(x0, x1)
+                raw = self._load_crop_raw(
+                    t,
+                    z,
+                    y_off,
+                    x_off,
+                    cfg.global_crop_size,
+                    cfg.global_crop_size,
+                )
+                frame_mean = max(self._get_frame_mean(t, z), 1e-12)
+                ratios.append(float(raw.mean()) / frame_mean)
+            scores[idx] = float(np.median(ratios))
+        return scores
+
+    def _select_content_holdout_regions(self) -> list[int]:
+        cfg = self.cfg
+        scores = self._score_spatial_regions_by_content()
+        selected = select_nonadjacent_regions(
+            scores,
+            cfg.spatial_holdout_region_count,
+            cfg.spatial_region_grid_x,
+            cfg.spatial_holdout_nonadjacent_gap,
+            cfg.spatial_holdout_min_content,
+        )
+        score_text = ", ".join(f"{idx}:{scores[idx]:.3f}" for idx in sorted(scores))
+        print(
+            f"[ZarrCellDataset] content scores by spatial region: {score_text}; "
+            f"selected holdout regions={selected}"
+        )
+        return selected
+
+    def _build_spatial_regions(self) -> list[tuple[int, int, int, int, int]]:
+        cfg = self.cfg
+        n_regions = cfg.spatial_region_grid_y * cfg.spatial_region_grid_x
+        holdout_regions = set(self._spatial_holdout_regions)
+        regions: list[tuple[int, int, int, int, int]] = []
+        for idx in range(n_regions):
+            y0, y1, x0, x1 = region_bounds_for_top_left(
+                self.Y,
+                self.X,
+                cfg.global_crop_size,
+                cfg.spatial_region_grid_y,
+                cfg.spatial_region_grid_x,
+                idx,
+            )
+            if cfg.spatial_region_mode == "holdout" and idx not in holdout_regions:
+                continue
+            if cfg.spatial_region_mode == "exclude_holdout" and idx in holdout_regions:
+                continue
+            regions.append((idx, y0, y1, x0, x1))
+        if not regions:
+            raise ValueError(
+                f"spatial_region_mode={cfg.spatial_region_mode!r} left no "
+                "sampleable regions"
+            )
+        return regions
+
+    def _sample_global_offset(self, rng: random.Random) -> tuple[int, int, int]:
+        cfg = self.cfg
+        if cfg.spatial_region_mode == "all":
+            y_off = rng.randrange(0, self.Y - cfg.global_crop_size + 1)
+            x_off = rng.randrange(0, self.X - cfg.global_crop_size + 1)
+            region_idx = region_index_for_top_left(
+                y_off,
+                x_off,
+                self.Y,
+                self.X,
+                cfg.global_crop_size,
+                cfg.spatial_region_grid_y,
+                cfg.spatial_region_grid_x,
+            )
+            return y_off, x_off, region_idx
+
+        weights = [(y1 - y0) * (x1 - x0) for _, y0, y1, x0, x1 in self._spatial_regions]
+        region_idx, y0, y1, x0, x1 = rng.choices(
+            self._spatial_regions,
+            weights=weights,
+            k=1,
+        )[0]
+        return rng.randrange(y0, y1), rng.randrange(x0, x1), region_idx
 
     def _log_open(self) -> None:
         print(
@@ -246,6 +431,13 @@ class ZarrCellDataset(IterableDataset):
             f"[ZarrCellDataset] t1 range resolved to "
             f"[{self.t1_min}, {self.t1_max}) frames"
         )
+        if self.cfg.spatial_region_mode != "all":
+            regions = [r[0] for r in self._spatial_regions]
+            print(
+                f"[ZarrCellDataset] spatial regions sampled: {regions} "
+                f"(mode={self.cfg.spatial_region_mode}, "
+                f"holdout={self._spatial_holdout_regions})"
+            )
 
     def _reopen_zarrs(self) -> None:
         """uniform hook used by `worker_init_fn` across dataset types."""
@@ -281,8 +473,7 @@ class ZarrCellDataset(IterableDataset):
         # since both globals share the spatial offset; the gate runs once.
         threshold = cfg.intensity_min_frac * self._get_frame_mean(t1, z)
         while True:
-            y_off = rng.randrange(0, self.Y - g_size + 1)
-            x_off = rng.randrange(0, self.X - g_size + 1)
+            y_off, x_off, region_idx = self._sample_global_offset(rng)
             raw_t1 = self._load_crop_raw(t1, z, y_off, x_off, g_size, g_size)
             if float(raw_t1.mean()) >= threshold:
                 break
@@ -343,6 +534,9 @@ class ZarrCellDataset(IterableDataset):
                 "global_t": torch.tensor([t1, t2]),
                 "global_y": y_off,
                 "global_x": x_off,
+                "frame_y": self.Y,
+                "frame_x": self.X,
+                "spatial_region_idx": region_idx,
             },
         }
         if locals_:
@@ -457,10 +651,19 @@ class MultiZarrDataset(IterableDataset):
         # build one fully-initialized child per usable zarr. each child reads
         # its own shape, looks up its own interval_minutes, and computes its
         # own frame_gap from the shared target_gap_minutes.
+        common_content_holdout = (
+            cfg.spatial_region_mode != "all"
+            and cfg.spatial_holdout_selection == "content"
+            and cfg.spatial_holdout_resolved_regions is None
+            and len(usable_paths) > 1
+        )
         self.children: list[ZarrCellDataset] = []
         for path in usable_paths:
             child_cfg = replace(cfg, zarr_path=path, zarr_paths=None)
+            if common_content_holdout:
+                child_cfg = replace(child_cfg, spatial_region_mode="all")
             self.children.append(ZarrCellDataset(child_cfg))
+        self._apply_common_content_holdout()
 
         # weight each child by the number of valid t1 anchors it exposes.
         # this proportionally favors longer experiments without starving
@@ -469,6 +672,48 @@ class MultiZarrDataset(IterableDataset):
         total = float(sum(sizes))
         self.weights = [s / total for s in sizes]
         self._log_open()
+
+    def _apply_common_content_holdout(self) -> None:
+        cfg = self.cfg
+        if cfg.spatial_region_mode == "all":
+            return
+        if cfg.spatial_holdout_selection != "content":
+            return
+        if cfg.spatial_holdout_resolved_regions is not None:
+            return
+        if len(self.children) < 2:
+            return
+
+        child_scores = [child._score_spatial_regions_by_content() for child in self.children]
+        region_ids = sorted(child_scores[0])
+        aggregate_scores = {
+            idx: min(scores[idx] for scores in child_scores)
+            for idx in region_ids
+        }
+        selected = select_nonadjacent_regions(
+            aggregate_scores,
+            cfg.spatial_holdout_region_count,
+            cfg.spatial_region_grid_x,
+            cfg.spatial_holdout_nonadjacent_gap,
+            cfg.spatial_holdout_min_content,
+        )
+        score_text = ", ".join(
+            f"{idx}:{aggregate_scores[idx]:.3f}" for idx in region_ids
+        )
+        print(
+            "[MultiZarrDataset] common content holdout scores "
+            f"(min across datasets): {score_text}; selected={selected}"
+        )
+
+        self.cfg = replace(cfg, spatial_holdout_resolved_regions=selected)
+        for child in self.children:
+            child.cfg = replace(
+                child.cfg,
+                spatial_region_mode=cfg.spatial_region_mode,
+                spatial_holdout_resolved_regions=selected,
+            )
+            child._spatial_holdout_regions = selected
+            child._spatial_regions = child._build_spatial_regions()
 
     def _log_open(self) -> None:
         mode = (

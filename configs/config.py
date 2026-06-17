@@ -52,6 +52,29 @@ class Config:
     # mean intensity over the active z slab at t1. lower values are more permissive.
     intensity_min_frac: float = 0.95
 
+    # Spatial region holdout for leakage-controlled probes. Regions are a
+    # row-major grid over legal global-crop top-left positions. DINO training
+    # should use "exclude_holdout"; the dataset-ID probe can override this to
+    # "holdout" so it only sees regions the encoder did not.
+    spatial_region_grid_y: int = 3
+    spatial_region_grid_x: int = 3
+    # Backward-compatible single manual holdout region.
+    spatial_holdout_region: int | None = None
+    # Preferred manual form for multiple held-out regions.
+    spatial_holdout_regions: list[int] | None = None
+    spatial_region_mode: str = "all"
+    # "manual" uses spatial_holdout_regions/spatial_holdout_region. "content"
+    # scores tiles per dataset and selects high-content, non-adjacent regions.
+    spatial_holdout_selection: str = "manual"
+    spatial_holdout_region_count: int = 3
+    spatial_holdout_nonadjacent_gap: int = 1
+    spatial_holdout_min_content: float = 0.95
+    spatial_holdout_content_samples_per_region: int = 8
+    spatial_holdout_seed: int = 0
+    # Internal override used by MultiZarrDataset after aggregating content
+    # scores across datasets, so every dataset holds out the same tile indices.
+    spatial_holdout_resolved_regions: list[int] | None = None
+
     # spreadsheet that maps experiment id -> interval_minutes.
     training_data_index_path: str = "training_data_index.xlsx"
 

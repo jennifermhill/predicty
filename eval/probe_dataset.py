@@ -2,13 +2,17 @@
 
 We freeze the encoder, extract embeddings of t1 global crops over many samples,
 and train a single nn.Linear to predict which zarr (dataset_idx) each crop came
-from. The intent is for this classifier to FAIL: low val accuracy means the
-encoder has learned representations that don't encode dataset identity, which
-is what we want — biology rather than microscope/illumination signatures.
+from. By default, extraction samples only the configured held-out spatial
+regions, which DINO training should exclude, then splits those regions
+spatially into probe train/val. The intent is for this classifier to FAIL: low
+val accuracy means the encoder has learned representations that don't encode
+dataset identity, which is what we want: biology rather than
+microscope/illumination signatures.
 
 usage:
     python eval/probe_dataset.py --config configs/train.yaml --checkpoint checkpoints/latest.pt
     python eval/probe_dataset.py --config configs/train.yaml --checkpoint checkpoints/step_001500.pt --n-samples 4000
+    python eval/probe_dataset.py --config configs/train.yaml --checkpoint checkpoints/latest.pt --split random
 
 interpretation (3 datasets -> chance = 33.3%):
     val_acc near 33%  : encoder is dataset-invariant. good.
@@ -22,6 +26,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 # allow running as `python eval/probe_dataset.py` from project root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -32,6 +37,7 @@ from torch.utils.data import DataLoader
 
 from configs.config import Config
 from data.dataset import MultiZarrDataset, worker_init_fn
+from data.spatial_regions import region_bounds_for_top_left
 from models.encoder import HybridEncoder
 
 
@@ -52,6 +58,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--probe-batch-size", type=int, default=512)
     p.add_argument("--probe-weight-decay", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=42, help="seed for sampling + train/val split")
+    p.add_argument(
+        "--split",
+        choices=("spatial-holdout", "random"),
+        default="spatial-holdout",
+        help=(
+            "spatial-holdout samples only the configured held-out regions and "
+            "splits them spatially for probe train/val; random keeps the old "
+            "80/20 random embedding split"
+        ),
+    )
+    p.add_argument(
+        "--val-frac",
+        type=float,
+        default=0.2,
+        help="fraction of the held-out region reserved spatially for probe validation",
+    )
     return p.parse_args()
 
 
@@ -62,7 +84,7 @@ def disable_augmentations(cfg: Config) -> None:
     """
     for name in ("aug_intensity", "aug_gamma", "aug_noise", "aug_blur"):
         getattr(cfg, name).enabled = False
-    # aug_percrop_norm stays enabled — it's the input convention the encoder learned.
+    # aug_percrop_norm stays enabled; it's the input convention the encoder learned.
 
 
 @torch.no_grad()
@@ -72,8 +94,8 @@ def extract_embeddings(
     device: torch.device,
     n_samples: int,
     seed: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """run encoder on the t1 global of many samples; return (X, y) tensors."""
+) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+    """run encoder on the t1 global of many samples; return embeddings, labels, metadata."""
     cfg.seed = seed
     disable_augmentations(cfg)
 
@@ -93,6 +115,7 @@ def extract_embeddings(
     encoder.eval()
     embeddings: list[torch.Tensor] = []
     labels: list[torch.Tensor] = []
+    rows: list[dict[str, Any]] = []
     seen = 0
     t0 = time.time()
     print_every = max(1, n_samples // (cfg.batch_size * 10))
@@ -102,10 +125,24 @@ def extract_embeddings(
         # globals shape: (B, 2, 1, Z, H, W). index 0 is t1.
         g_t1 = batch["globals"][:, 0].to(device, non_blocking=True)
         ds_idx = batch["weak_label"][:, 0]  # (B,) long
+        meta = batch["meta"]
 
         emb = encoder(g_t1)  # (B, latent_dim)
         embeddings.append(emb.cpu())
         labels.append(ds_idx)
+
+        batch_size = g_t1.size(0)
+        for i in range(batch_size):
+            rows.append({
+                "dataset_idx": int(ds_idx[i]),
+                "t": int(meta["t1"][i]),
+                "z": int(meta["z"][i]),
+                "global_y": int(meta["global_y"][i]),
+                "global_x": int(meta["global_x"][i]),
+                "frame_y": int(meta["frame_y"][i]),
+                "frame_x": int(meta["frame_x"][i]),
+                "spatial_region_idx": int(meta["spatial_region_idx"][i]),
+            })
 
         seen += g_t1.size(0)
         iters += 1
@@ -118,7 +155,71 @@ def extract_embeddings(
 
     X = torch.cat(embeddings, dim=0)[:n_samples]
     y = torch.cat(labels, dim=0)[:n_samples].long()
-    return X, y
+    return X, y, rows[:n_samples]
+
+
+def random_split(
+    X: torch.Tensor,
+    y: torch.Tensor,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    gen = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(X.size(0), generator=gen)
+    X, y = X[perm], y[perm]
+    n_train = int(0.8 * X.size(0))
+    return X[:n_train], y[:n_train], X[n_train:], y[n_train:]
+
+
+def spatial_holdout_split(
+    X: torch.Tensor,
+    y: torch.Tensor,
+    rows: list[dict[str, Any]],
+    cfg: Config,
+    val_frac: float,
+    n_classes: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not 0.0 < val_frac < 1.0:
+        raise ValueError(f"--val-frac must be in (0, 1); got {val_frac}")
+
+    train_idx: list[int] = []
+    val_idx: list[int] = []
+    for i, row in enumerate(rows):
+        y0, y1, x0, x1 = region_bounds_for_top_left(
+            int(row["frame_y"]),
+            int(row["frame_x"]),
+            cfg.global_crop_size,
+            cfg.spatial_region_grid_y,
+            cfg.spatial_region_grid_x,
+            int(row["spatial_region_idx"]),
+        )
+        split_on_y = (y1 - y0) >= (x1 - x0)
+        lo = y0 if split_on_y else x0
+        hi = y1 if split_on_y else x1
+        coord = int(row["global_y"] if split_on_y else row["global_x"])
+        threshold = lo + max(1, int(round((hi - lo) * (1.0 - val_frac))))
+        if coord >= threshold:
+            val_idx.append(i)
+        else:
+            train_idx.append(i)
+
+    if not train_idx or not val_idx:
+        raise ValueError(
+            "spatial-holdout split produced an empty train or val set; "
+            "increase --n-samples or adjust --val-frac"
+        )
+
+    X_train, y_train = X[train_idx], y[train_idx]
+    X_val, y_val = X[val_idx], y[val_idx]
+    train_counts = torch.bincount(y_train, minlength=n_classes)
+    val_counts = torch.bincount(y_val, minlength=n_classes)
+    if bool((train_counts == 0).any()) or bool((val_counts == 0).any()):
+        raise ValueError(
+            "spatial-holdout split is missing at least one dataset class in "
+            f"train or val; train_counts={train_counts.tolist()} "
+            f"val_counts={val_counts.tolist()}. Increase --n-samples."
+        )
+
+    return X_train, y_train, X_val, y_val
 
 
 def train_probe(
@@ -203,19 +304,19 @@ def interpret(val_acc: float, n_classes: int) -> str:
     margin = val_acc - chance
     if margin < 0.10:
         return (
-            f"val accuracy is near chance ({chance*100:.1f}%) — encoder appears "
+            f"val accuracy is near chance ({chance*100:.1f}%) - encoder appears "
             f"dataset-invariant. this is the desired outcome."
         )
     if val_acc > 0.80:
         return (
-            f"val accuracy is well above chance — encoder has clearly memorized "
+            f"val accuracy is well above chance - encoder has clearly memorized "
             f"dataset identity. downstream tasks will likely be contaminated by "
             f"this. consider stronger augmentations, adversarial dataset confusion, "
             f"or more aggressive per-crop normalization."
         )
     return (
         f"val accuracy is moderately above chance ({val_acc*100:.1f}% vs "
-        f"{chance*100:.1f}%) — some dataset leakage. worth tracking across "
+        f"{chance*100:.1f}%) - some dataset leakage. worth tracking across "
         f"checkpoints to see whether it grows or stabilizes."
     )
 
@@ -234,6 +335,7 @@ def main() -> None:
     print(f"[probe] n_samples   : {args.n_samples}")
     print(f"[probe] probe_steps : {args.probe_steps}")
     print(f"[probe] seed        : {args.seed}")
+    print(f"[probe] split       : {args.split}")
     print()
 
     # --- load encoder ---
@@ -251,20 +353,47 @@ def main() -> None:
     print()
 
     # --- extract embeddings ---
+    if args.split == "spatial-holdout":
+        has_manual_holdout = (
+            cfg.spatial_holdout_region is not None
+            or bool(cfg.spatial_holdout_regions)
+        )
+        if cfg.spatial_holdout_selection == "manual" and not has_manual_holdout:
+            raise ValueError(
+                "--split spatial-holdout with manual selection requires "
+                "spatial_holdout_regions or spatial_holdout_region in the config"
+            )
+        cfg.spatial_region_mode = "holdout"
+        print(
+            "[probe] spatial split: sampling only held-out region(s) "
+            "from each dataset"
+        )
+
     print(f"[probe] extracting {args.n_samples} embeddings (this will run the encoder forward, no augmentations)...")
     t0 = time.time()
-    X, y = extract_embeddings(cfg, encoder, device, args.n_samples, args.seed)
+    X, y, rows = extract_embeddings(cfg, encoder, device, args.n_samples, args.seed)
     print(f"[probe] extracted in {time.time()-t0:.1f}s.  X.shape={tuple(X.shape)}  y.shape={tuple(y.shape)}")
     print(f"[probe] dataset_idx counts: {torch.bincount(y, minlength=n_datasets).tolist()}")
     print()
 
-    # --- 80/20 split ---
-    gen = torch.Generator().manual_seed(args.seed)
-    perm = torch.randperm(X.size(0), generator=gen)
-    X, y = X[perm], y[perm]
-    n_train = int(0.8 * X.size(0))
-    X_train, X_val = X[:n_train], X[n_train:]
-    y_train, y_val = y[:n_train], y[n_train:]
+    # --- train/val split ---
+    if args.split == "spatial-holdout":
+        X_train, y_train, X_val, y_val = spatial_holdout_split(
+            X,
+            y,
+            rows,
+            cfg,
+            args.val_frac,
+            n_datasets,
+        )
+        print(
+            "[probe] split detail: held-out region was split spatially; "
+            "validation uses the high-coordinate strip inside that region"
+        )
+    else:
+        X_train, y_train, X_val, y_val = random_split(X, y, args.seed)
+        print("[probe] split detail: random 80/20 embedding split")
+
     print(f"[probe] train n={X_train.size(0)}  counts={torch.bincount(y_train, minlength=n_datasets).tolist()}")
     print(f"[probe] val   n={X_val.size(0)}  counts={torch.bincount(y_val,   minlength=n_datasets).tolist()}")
     print()

@@ -53,6 +53,29 @@ local_crop_size: 96
 intensity_min_frac: 0.95
 
 # ---------------------------------------------------------------------------
+# spatial holdout
+# ---------------------------------------------------------------------------
+# Regions are defined as a row-major grid over legal global-crop top-left
+# positions in each dataset. For this 3x3 grid, content-based selection scores
+# each tile by crop intensity relative to its frame/slab mean. In multi-zarr
+# runs, scores are aggregated across datasets and the same three high-content,
+# non-adjacent tile indices are held out everywhere. DINO training excludes
+# those selected tiles. The dataset-ID probe overrides spatial_region_mode to
+# "holdout", samples only those selected tiles from every dataset, then splits
+# each held-out tile spatially into probe train/val.
+spatial_region_grid_y: 3
+spatial_region_grid_x: 3
+spatial_holdout_region: null
+spatial_holdout_regions: null
+spatial_region_mode: exclude_holdout
+spatial_holdout_selection: content
+spatial_holdout_region_count: 3
+spatial_holdout_nonadjacent_gap: 1
+spatial_holdout_min_content: 0.95
+spatial_holdout_content_samples_per_region: 8
+spatial_holdout_seed: 0
+
+# ---------------------------------------------------------------------------
 # metadata lookup
 # ---------------------------------------------------------------------------
 # spreadsheet that maps mixin id -> interval_minutes.

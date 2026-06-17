@@ -159,6 +159,9 @@ def extract_embeddings(
             z_end = as_numpy_1d(meta["z_end"], batch_size)
             y = as_numpy_1d(meta["global_y"], batch_size)
             x = as_numpy_1d(meta["global_x"], batch_size)
+            frame_y = as_numpy_1d(meta["frame_y"], batch_size)
+            frame_x = as_numpy_1d(meta["frame_x"], batch_size)
+            spatial_region_idx = as_numpy_1d(meta["spatial_region_idx"], batch_size)
 
             for i in range(batch_size):
                 ds_idx = int(dataset_idx[i])
@@ -174,6 +177,9 @@ def extract_embeddings(
                     "z_end": int(z_end[i]),
                     "global_y": int(y[i]),
                     "global_x": int(x[i]),
+                    "frame_y": int(frame_y[i]),
+                    "frame_x": int(frame_x[i]),
+                    "spatial_region_idx": int(spatial_region_idx[i]),
                     "frame_gap": int(frame_gap[i]),
                 })
 
