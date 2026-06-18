@@ -3,10 +3,12 @@
 This samples one global crop from the configured dataset, applies the same
 MaskedPatchAutoencoder patch mask used during training, and saves diagnostic
 PNGs showing the original crop, masked crop, and mask layout.
+If --checkpoint is provided, it also visualizes the trained MAE reconstruction.
 
 Usage:
     python eval/visualize_mae_mask.py --config configs/train.yaml
     python eval/visualize_mae_mask.py --config configs/train.yaml --view t2 --sample-index 5
+    python eval/visualize_mae_mask.py --config configs/train.yaml --checkpoint checkpoints/latest.pt
 """
 
 from __future__ import annotations
@@ -28,12 +30,15 @@ import torch
 
 from configs.config import Config
 from data.dataset import MultiZarrDataset, ZarrCellDataset
+from models.encoder import HybridEncoder
 from models.mae import MaskedPatchAutoencoder
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--config", required=True, help="path to training yaml config")
+    p.add_argument("--checkpoint", default=None, help="optional checkpoint for MAE reconstruction panels")
+    p.add_argument("--device", default=None, help="device for reconstruction when --checkpoint is used")
     p.add_argument("--out-dir", default=None, help="defaults under mae_masks/")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--sample-index", type=int, default=0, help="skip this many samples before plotting")
@@ -104,29 +109,96 @@ def save_overview(
     mask_volume: np.ndarray,
     meta_text: str,
     patch_size: int,
+    reconstruction: np.ndarray | None = None,
 ) -> None:
     orig_proj = mean_projection(original)
     masked_proj = mean_projection(masked)
     mask_proj = mask_volume.max(axis=0)
-    diff_proj = mean_projection(np.abs(original - masked))
-    limits = robust_limits(orig_proj, masked_proj)
+    masked_diff_proj = mean_projection(np.abs(original - masked))
+    images = [orig_proj, masked_proj]
+    if reconstruction is not None:
+        recon_proj = mean_projection(reconstruction)
+        recon_diff_proj = mean_projection(np.abs(original - reconstruction))
+        images.append(recon_proj)
+    else:
+        recon_proj = None
+        recon_diff_proj = None
+    limits = robust_limits(*images)
 
-    fig, axes = plt.subplots(1, 4, figsize=(14, 4), dpi=180)
+    n_cols = 6 if reconstruction is not None else 4
+    fig, axes = plt.subplots(1, n_cols, figsize=(3.5 * n_cols, 4), dpi=180)
     show_gray(axes[0], orig_proj, "original crop\nmean over z", limits, patch_size)
     show_gray(axes[1], masked_proj, "MAE input\nmasked patches zeroed", limits, patch_size)
     show_gray(axes[2], orig_proj, "mask overlay\nred = hidden", limits, patch_size)
     axes[2].imshow(mask_proj, cmap="Reds", alpha=0.45, vmin=0, vmax=1)
     show_gray(
         axes[3],
-        diff_proj,
-        "absolute difference\nmean over z",
-        robust_limits(diff_proj),
+        masked_diff_proj,
+        "abs diff\noriginal - masked input",
+        robust_limits(masked_diff_proj),
         patch_size,
     )
+    if reconstruction is not None and recon_proj is not None and recon_diff_proj is not None:
+        show_gray(
+            axes[4],
+            recon_proj,
+            "MAE reconstruction\nmasked patches predicted",
+            limits,
+            patch_size,
+        )
+        show_gray(
+            axes[5],
+            recon_diff_proj,
+            "abs error\noriginal - reconstruction",
+            robust_limits(recon_diff_proj),
+            patch_size,
+        )
     fig.suptitle(meta_text, fontsize=10)
     fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)
+
+
+@torch.no_grad()
+def reconstruct_with_checkpoint(
+    checkpoint_path: str,
+    crop: torch.Tensor,
+    mask: torch.Tensor,
+    mae: MaskedPatchAutoencoder,
+    cfg: Config,
+    device: torch.device,
+) -> np.ndarray:
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if "mae_decoder_state_dict" not in ckpt:
+        raise ValueError(f"{checkpoint_path} does not contain mae_decoder_state_dict")
+
+    encoder = HybridEncoder(stem_channels=cfg.stem_channels).to(device)
+    encoder.load_state_dict(ckpt["encoder_state_dict"])
+    encoder.eval()
+
+    mae = mae.to(device)
+    mae.load_state_dict(ckpt["mae_decoder_state_dict"])
+    mae.eval()
+
+    crop_d = crop.to(device)
+    mask_d = mask.to(device)
+    masked_crop = mae.apply_patch_mask(crop_d, mask_d)
+    target = mae.patchify(crop_d)
+
+    z = encoder(masked_crop)
+    h = mae.latent_proj(z).unsqueeze(1)
+    tokens = h + mae.pos_embed + mae.mask_token * mask_d.unsqueeze(-1).to(h.dtype)
+    pred = mae.decoder(tokens)
+
+    if mae.norm_pix_loss:
+        mean = target.mean(dim=-1, keepdim=True)
+        var = target.var(dim=-1, keepdim=True, unbiased=False)
+        pred = pred * (var + 1e-6).sqrt() + mean
+
+    recon_patches = target.clone()
+    recon_patches[mask_d] = pred[mask_d]
+    recon = mae.unpatchify(recon_patches)
+    return recon[0, 0].detach().cpu().numpy()
 
 
 def save_z_montage(
@@ -153,6 +225,7 @@ def main() -> None:
     args = parse_args()
     cfg = Config.from_yaml(args.config)
     cfg.seed = args.seed
+    device = torch.device(args.device or cfg.device)
     if args.spatial_region_mode != "config":
         cfg.spatial_region_mode = args.spatial_region_mode
 
@@ -190,6 +263,16 @@ def main() -> None:
 
     original_np = crop[0, 0].numpy()
     masked_np = masked_crop[0, 0].numpy()
+    reconstruction_np = None
+    if args.checkpoint is not None:
+        reconstruction_np = reconstruct_with_checkpoint(
+            args.checkpoint,
+            crop,
+            mask,
+            mae,
+            cfg,
+            device,
+        )
     meta = sample["meta"]
     dataset_idx = as_int(sample["weak_label"][0])
     t_key = "t1" if view_idx == 0 else "t2"
@@ -208,6 +291,7 @@ def main() -> None:
         mask_volume,
         meta_text,
         cfg.mae_patch_size,
+        reconstruction_np,
     )
     save_z_montage(
         out_dir / "mae_mask_z_slices.png",
@@ -217,13 +301,15 @@ def main() -> None:
         cfg.mae_patch_size,
     )
 
-    np.savez_compressed(
-        out_dir / "mae_mask_sample.npz",
-        original=original_np.astype(np.float32),
-        masked=masked_np.astype(np.float32),
-        mask_volume=mask_volume.astype(np.float32),
-        mask=mask.cpu().numpy(),
-    )
+    arrays = {
+        "original": original_np.astype(np.float32),
+        "masked": masked_np.astype(np.float32),
+        "mask_volume": mask_volume.astype(np.float32),
+        "mask": mask.cpu().numpy(),
+    }
+    if reconstruction_np is not None:
+        arrays["reconstruction"] = reconstruction_np.astype(np.float32)
+    np.savez_compressed(out_dir / "mae_mask_sample.npz", **arrays)
 
     print(f"[mae-mask] wrote {out_dir}")
     for path in sorted(out_dir.iterdir()):

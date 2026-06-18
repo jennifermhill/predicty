@@ -69,6 +69,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--umap-min-dist", type=float, default=0.1)
     p.add_argument("--tsne-perplexity", type=float, default=30.0)
     p.add_argument("--plot-size", type=float, default=8.0)
+    p.add_argument(
+        "--embedding-preprocess",
+        choices=("raw", "l2", "standardize"),
+        default="l2",
+        help=(
+            "preprocess encoder embeddings before projection. l2 is usually "
+            "best for comparing representation geometry because raw encoder "
+            "feature norms can dominate PCA/UMAP distances."
+        ),
+    )
     return p.parse_args()
 
 
@@ -206,6 +216,50 @@ def pca_project(X: np.ndarray, n_components: int = 2) -> tuple[np.ndarray, np.nd
     return coords.cpu().numpy(), explained
 
 
+def preprocess_embeddings(X: np.ndarray, mode: str) -> np.ndarray:
+    X = X.astype(np.float32, copy=False)
+    if mode == "raw":
+        return X
+    if mode == "l2":
+        denom = np.linalg.norm(X, axis=1, keepdims=True)
+        return X / np.maximum(denom, 1e-12)
+    if mode == "standardize":
+        mean = X.mean(axis=0, keepdims=True)
+        std = X.std(axis=0, keepdims=True)
+        return (X - mean) / np.maximum(std, 1e-6)
+    raise ValueError(f"unknown embedding preprocess mode: {mode}")
+
+
+def print_embedding_diagnostics(X_raw: np.ndarray, X_projected: np.ndarray) -> None:
+    norms = np.linalg.norm(X_raw, axis=1)
+    feature_var = X_raw.var(axis=0)
+    _, explained_raw = pca_project(X_raw, min(10, X_raw.shape[0] - 1, X_raw.shape[1]))
+    _, explained_projected = pca_project(
+        X_projected, min(10, X_projected.shape[0] - 1, X_projected.shape[1])
+    )
+    print(
+        "[diagnostics] raw embedding norm "
+        f"mean={norms.mean():.4f} std={norms.std():.4f} "
+        f"min={norms.min():.4f} max={norms.max():.4f}"
+    )
+    print(
+        "[diagnostics] raw feature variance "
+        f"mean={feature_var.mean():.6f} median={np.median(feature_var):.6f}"
+    )
+    print(
+        "[diagnostics] PCA explained variance raw "
+        f"PC1={explained_raw[0]*100:.1f}% "
+        f"PC2={explained_raw[1]*100 if explained_raw.size > 1 else 0.0:.1f}% "
+        f"PC1-10={explained_raw.sum()*100:.1f}%"
+    )
+    print(
+        "[diagnostics] PCA explained variance after preprocess "
+        f"PC1={explained_projected[0]*100:.1f}% "
+        f"PC2={explained_projected[1]*100 if explained_projected.size > 1 else 0.0:.1f}% "
+        f"PC1-10={explained_projected.sum()*100:.1f}%"
+    )
+
+
 def reduce_for_manifold(X: np.ndarray, pca_dim: int) -> np.ndarray:
     if X.shape[1] <= pca_dim:
         return X
@@ -299,6 +353,8 @@ def plot_categorical(
     title: str,
     out_path: Path,
     plot_size: float,
+    x_label: str,
+    y_label: str,
 ) -> None:
     fig, ax = plt.subplots(figsize=(plot_size, plot_size), dpi=160)
     labels = sorted(set(values), key=lambda x: str(x))
@@ -315,8 +371,8 @@ def plot_categorical(
             linewidths=0,
         )
     ax.set_title(title)
-    ax.set_xlabel("dim 1")
-    ax.set_ylabel("dim 2")
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
     ax.legend(markerscale=3, fontsize=7, frameon=False, loc="best")
     fig.tight_layout()
     fig.savefig(out_path)
@@ -329,6 +385,8 @@ def plot_continuous(
     title: str,
     out_path: Path,
     plot_size: float,
+    x_label: str,
+    y_label: str,
 ) -> None:
     fig, ax = plt.subplots(figsize=(plot_size, plot_size), dpi=160)
     sc = ax.scatter(
@@ -341,15 +399,21 @@ def plot_continuous(
         linewidths=0,
     )
     ax.set_title(title)
-    ax.set_xlabel("dim 1")
-    ax.set_ylabel("dim 2")
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
     fig.colorbar(sc, ax=ax, shrink=0.85)
     fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)
 
 
-def save_plots(coords: np.ndarray, rows: list[dict[str, Any]], out_dir: Path, plot_size: float) -> None:
+def save_plots(
+    coords: np.ndarray,
+    rows: list[dict[str, Any]],
+    out_dir: Path,
+    plot_size: float,
+    method: str,
+) -> None:
     dataset_idx = [r["dataset_idx"] for r in rows]
     dataset_name = [r["dataset_name"] for r in rows]
     view = [r["view"] for r in rows]
@@ -357,12 +421,17 @@ def save_plots(coords: np.ndarray, rows: list[dict[str, Any]], out_dir: Path, pl
     z = np.asarray([r["z"] for r in rows])
     frame_gap = np.asarray([r["frame_gap"] for r in rows])
 
-    plot_categorical(coords, dataset_idx, "Latent space colored by dataset_idx", out_dir / "latent_by_dataset_idx.png", plot_size)
-    plot_categorical(coords, dataset_name, "Latent space colored by dataset name", out_dir / "latent_by_dataset_name.png", plot_size)
-    plot_categorical(coords, view, "Latent space colored by global view", out_dir / "latent_by_view.png", plot_size)
-    plot_continuous(coords, t, "Latent space colored by time", out_dir / "latent_by_time.png", plot_size)
-    plot_continuous(coords, z, "Latent space colored by z", out_dir / "latent_by_z.png", plot_size)
-    plot_continuous(coords, frame_gap, "Latent space colored by frame_gap", out_dir / "latent_by_frame_gap.png", plot_size)
+    if method == "pca":
+        x_label, y_label = "PCA 1", "PCA 2"
+    else:
+        x_label, y_label = f"{method.upper()} 1", f"{method.upper()} 2"
+
+    plot_categorical(coords, dataset_idx, "Latent space colored by dataset_idx", out_dir / "latent_by_dataset_idx.png", plot_size, x_label, y_label)
+    plot_categorical(coords, dataset_name, "Latent space colored by dataset name", out_dir / "latent_by_dataset_name.png", plot_size, x_label, y_label)
+    plot_categorical(coords, view, "Latent space colored by global view", out_dir / "latent_by_view.png", plot_size, x_label, y_label)
+    plot_continuous(coords, t, "Latent space colored by time", out_dir / "latent_by_time.png", plot_size, x_label, y_label)
+    plot_continuous(coords, z, "Latent space colored by z", out_dir / "latent_by_z.png", plot_size, x_label, y_label)
+    plot_continuous(coords, frame_gap, "Latent space colored by frame_gap", out_dir / "latent_by_frame_gap.png", plot_size, x_label, y_label)
 
 
 def maybe_print_cluster_metrics(coords: np.ndarray, rows: list[dict[str, Any]]) -> None:
@@ -416,13 +485,16 @@ def main() -> None:
     t0 = time.time()
     X, rows = extract_embeddings(cfg, encoder, device, args.n_crops, args.views)
     print(f"[latent] extracted embeddings: {X.shape} in {time.time() - t0:.1f}s")
+    X_projected = preprocess_embeddings(X, args.embedding_preprocess)
+    print(f"[latent] embedding preprocess: {args.embedding_preprocess}")
+    print_embedding_diagnostics(X, X_projected)
 
-    coords, method = project_2d(args, X)
+    coords, method = project_2d(args, X_projected)
     print(f"[latent] projection method: {method}  coords={coords.shape}")
 
     write_metadata_csv(out_dir / "metadata.csv", rows, coords)
     save_npz(out_dir / "embeddings.npz", X, coords, rows)
-    save_plots(coords, rows, out_dir, args.plot_size)
+    save_plots(coords, rows, out_dir, args.plot_size, method)
     maybe_print_cluster_metrics(coords, rows)
 
     print("[latent] wrote:")
