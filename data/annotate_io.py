@@ -139,6 +139,37 @@ def load_pending_skips(out_dir: str | Path) -> list[dict[str, Any]]:
     return pending
 
 
+def load_counts(out_dir: str | Path) -> dict[int, dict[str, int]]:
+    """Per dataset_idx, a count of each label in index.jsonl.
+
+    Returns e.g. {0: {"class_a": 12, "unsure": 1}, 3: {"class_b": 7}}.
+    """
+    counts: dict[int, dict[str, int]] = {}
+    for rec in _read_records(index_path(out_dir)):
+        try:
+            idx = int(rec["dataset_idx"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        label = rec.get("label")
+        if label is None:
+            continue
+        counts.setdefault(idx, {})
+        counts[idx][label] = counts[idx].get(label, 0) + 1
+    return counts
+
+
+def pending_skip_counts(out_dir: str | Path) -> dict[int, int]:
+    """Per dataset_idx count of skips not yet labeled (for the counts table)."""
+    counts: dict[int, int] = {}
+    for rec in load_pending_skips(out_dir):
+        try:
+            idx = int(rec["dataset_idx"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        counts[idx] = counts.get(idx, 0) + 1
+    return counts
+
+
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
@@ -251,11 +282,14 @@ def relabel_skip(
 
 
 def _save_mip_png(volume: np.ndarray, path: str | Path) -> None:
-    """Write a grayscale max-intensity projection of a (Z, H, W) volume."""
-    import matplotlib
+    """Write a grayscale max-intensity projection of a (Z, H, W) volume.
 
-    matplotlib.use("Agg", force=False)
-    import matplotlib.pyplot as plt
+    Uses the object-oriented ``Figure`` API (not ``pyplot``) and never calls
+    ``matplotlib.use(...)``, so saving a preview does not touch the notebook's
+    active backend — otherwise the first label would switch it to Agg and break
+    inline display.
+    """
+    from matplotlib.figure import Figure
 
     mip = volume.max(axis=0)
     lo, hi = np.percentile(mip, [1.0, 99.0])
@@ -264,8 +298,8 @@ def _save_mip_png(volume: np.ndarray, path: str | Path) -> None:
     if hi <= lo:
         hi = lo + 1e-6
 
-    fig, ax = plt.subplots(figsize=(4, 4))
+    fig = Figure(figsize=(4, 4))
+    ax = fig.subplots()
     ax.imshow(mip, cmap="gray", vmin=lo, vmax=hi)
     ax.axis("off")
     fig.savefig(path, bbox_inches="tight", pad_inches=0, dpi=100)
-    plt.close(fig)
