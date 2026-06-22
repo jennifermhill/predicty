@@ -22,9 +22,19 @@ zarr_paths:
   - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test43_2024-01-16/2024-01-16_ERH_24hr_ERH Red FarRed.zarr
   - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test44_2024-01-17/2024-01-17_ERH_23hr_ERH Red FarRed.zarr
   - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test45_2024-01-30/20240130_ERH_mixin45_wellC2_19.5hr_ERH Red FarRed.zarr
+  - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test48_2024-02-08/mixin48_wellB3_24hr_ERH Red FarRed.zarr
   - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test49_2024-02-08/mixin49_wellB2_24hr_ERH Red FarRed.zarr
   - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test52_2024-02-21/ERH_2024-02-20_mixin52_22hr_ERH Red FarRed.zarr
+  - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test53_2025-02-22/ERH_2024-02-21_mixin53_24hr_ERH Red FarRed 2.zarr
+  - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test54_2024-02-22/2024-02-22_ERH_mixin54_24hr_ERH Red FarRed.zarr
+  - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test57_2024-02-29/2024-02-29_mixin57_overnight_25um_ERH_Red_FarRed_25.zarr
+  - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test60_2024-03-06/2024-03-06_mixin60_img2_overnight_Emily Cryo Red Yellow FarRed_F0.zarr
+  - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test61_2024-03-07/2024-03-07_mixin61_overnight_ERH Red FarRed.zarr
+  - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test62_2024-03-08/2024-03-08_mixin62_weekend_ERH Red FarRed.zarr
+  - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test64_2024-04-04/ERH_2024-04-04_mixin64_wellC5_10x_overnight_ERH Red FarRed_1.zarr
+  - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test65_2024-04-16/WS205_overnight_day2/2024-04-17_ERH_mixin65_plate2_WS205_overnight_day2_ERH Red FarRed/2024-04-17_ERH_mixin65_plate2_WS205_overnight_day2_ERH Red FarRed.zarr
   - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test65_2024-04-16/NC28.1_overnight_day1/2024-04-16_ERH_mixin65_plate1_NC28.1_overnight_ERH Red FarRed.zarr
+  - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test66_2024-04-30/ERH_2024-04-30_mixin66_plate1_day1_ERH Red FarRed.zarr
 
 # balanced batches contain floor(batch_size / dataset_count) samples from
 # every usable zarr. remainder slots rotate across batches. set false to use
@@ -56,7 +66,7 @@ intensity_min_frac: 0.95
 # metadata lookup
 # ---------------------------------------------------------------------------
 # spreadsheet that maps mixin id -> interval_minutes.
-training_data_index_path: training_data_index.xlsx
+training_data_index_path: ../training_data_index.xlsx
 
 # ---------------------------------------------------------------------------
 # temporal sampling
