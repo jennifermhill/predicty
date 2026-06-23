@@ -58,6 +58,14 @@ def skipped_path(out_dir: str | Path) -> Path:
     return Path(out_dir) / "skipped.jsonl"
 
 
+def heldout_path(out_dir: str | Path) -> Path:
+    return Path(out_dir) / "heldout.jsonl"
+
+
+def removed_path(out_dir: str | Path) -> Path:
+    return Path(out_dir) / "removed.jsonl"
+
+
 def make_uid(meta: dict[str, Any], crop_size: int) -> str:
     """Deterministic id from the crop's anchor.
 
@@ -168,6 +176,80 @@ def pending_skip_counts(out_dir: str | Path) -> dict[int, int]:
             continue
         counts[idx] = counts.get(idx, 0) + 1
     return counts
+
+
+def load_labeled_records(out_dir: str | Path, label: str | None = None) -> list[dict[str, Any]]:
+    """Labeled records from index.jsonl, in annotation order.
+
+    Pass `label` to keep only that class (e.g. "clumps"); None keeps all.
+    """
+    recs = _read_records(index_path(out_dir))
+    if label is None:
+        return recs
+    return [r for r in recs if r.get("label") == label]
+
+
+def load_heldout(out_dir: str | Path) -> set[str]:
+    """uids already exported to heldout.jsonl (the curated held-out set)."""
+    return _read_uids(heldout_path(out_dir))
+
+
+def load_heldout_records(out_dir: str | Path, label: str | None = None) -> list[dict[str, Any]]:
+    """Records in heldout.jsonl, in export order; optionally filtered to one class."""
+    recs = _read_records(heldout_path(out_dir))
+    if label is None:
+        return recs
+    return [r for r in recs if r.get("label") == label]
+
+
+def export_heldout(out_dir: str | Path, uids: list[str] | set[str]) -> int:
+    """Append the given crops' records to heldout.jsonl; return the count added.
+
+    Looks each uid up in index.jsonl and appends its record, skipping any uid
+    already present in heldout.jsonl. Non-destructive: index.jsonl is untouched,
+    so held-out crops remain valid annotations and are additionally recorded as
+    the curated set used to train/eval the linear classifier.
+    """
+    want = set(uids)
+    already = load_heldout(out_dir)
+    by_uid = {r["uid"]: r for r in _read_records(index_path(out_dir)) if "uid" in r}
+    added = 0
+    for uid in want:
+        if uid in already or uid not in by_uid:
+            continue
+        _append(heldout_path(out_dir), by_uid[uid])
+        already.add(uid)
+        added += 1
+    return added
+
+
+def remove_annotations(out_dir: str | Path, uids: list[str] | set[str]) -> int:
+    """Drop the given uids from index.jsonl; return the count removed.
+
+    Rewrites index.jsonl without those records (atomically, via a temp file) and
+    appends each dropped record to removed.jsonl for an audit trail. Crop/MIP
+    pixel files are left on disk, so a removed crop is no longer suppressed and
+    the live annotator can show and re-label it.
+    """
+    drop = set(uids)
+    if not drop:
+        return 0
+    path = index_path(out_dir)
+    kept: list[dict[str, Any]] = []
+    removed: list[dict[str, Any]] = []
+    for rec in _read_records(path):
+        (removed if rec.get("uid") in drop else kept).append(rec)
+    if not removed:
+        return 0
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w") as fh:
+        for rec in kept:
+            fh.write(json.dumps(rec) + "\n")
+        fh.flush()
+    tmp.replace(path)
+    for rec in removed:
+        _append(removed_path(out_dir), rec)
+    return len(removed)
 
 
 def _now() -> str:
