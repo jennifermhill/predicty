@@ -51,6 +51,8 @@ local_crop_size: 96
 # z slab at t1. a global crop is accepted only if its mean is at least
 # intensity_min_frac * slab_mean. cached per worker, keyed by (t1, z).
 intensity_min_frac: 0.95
+# fail clearly instead of hanging forever if no sampled crop passes the gate.
+intensity_max_attempts: 1000
 
 # ---------------------------------------------------------------------------
 # spatial holdout

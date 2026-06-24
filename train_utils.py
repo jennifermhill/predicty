@@ -20,6 +20,7 @@ device + checkpoints:
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -97,14 +98,24 @@ def save_checkpoint(path, model, optimizer, scaler, step: int) -> None:
         state["mae_decoder_state_dict"] = model.mae_decoder.state_dict()
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(state, path)
+    # Write beside the destination and atomically replace it only after
+    # serialization succeeds. This keeps latest.pt valid if a job is killed
+    # during a checkpoint write.
+    tmp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        torch.save(state, tmp_path)
+        os.replace(tmp_path, path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def load_checkpoint(
     path, model, optimizer=None, scaler=None
 ) -> int:
     """restore training state. returns the step at which the checkpoint was saved."""
-    state = torch.load(path, map_location="cpu")
+    # Checkpoints created here contain tensors and primitive optimizer state;
+    # the restricted loader avoids executing arbitrary pickled objects.
+    state = torch.load(path, map_location="cpu", weights_only=True)
     model.student.load_state_dict(state["student_state_dict"])
     model.teacher.load_state_dict(state["teacher_state_dict"])
     if getattr(model, "dataset_classifier", None) is not None:

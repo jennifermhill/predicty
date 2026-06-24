@@ -339,9 +339,12 @@ def main() -> None:
     print()
 
     # --- load encoder ---
-    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     print(f"[probe] checkpoint saved at training step {ckpt['step']}")
-    encoder = HybridEncoder(stem_channels=cfg.stem_channels).to(device)
+    encoder = HybridEncoder(
+        stem_channels=cfg.stem_channels,
+        latent_dim=cfg.latent_dim,
+    ).to(device)
     encoder.load_state_dict(ckpt["encoder_state_dict"])
     for p in encoder.parameters():
         p.requires_grad = False

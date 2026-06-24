@@ -141,7 +141,10 @@ class DINOWrapper(nn.Module):
         from models.encoder import HybridEncoder
         from models.mae import MaskedPatchAutoencoder
 
-        student_enc = HybridEncoder(stem_channels=cfg.stem_channels)
+        student_enc = HybridEncoder(
+            stem_channels=cfg.stem_channels,
+            latent_dim=cfg.latent_dim,
+        )
         student_proj = DINOHead(
             in_dim=cfg.latent_dim,
             hidden_dim=cfg.projector_hidden,

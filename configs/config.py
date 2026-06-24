@@ -51,6 +51,9 @@ class Config:
     # accept a global crop only if its mean is at least this fraction of the
     # mean intensity over the active z slab at t1. lower values are more permissive.
     intensity_min_frac: float = 0.95
+    # Stop retrying an impossible intensity gate forever. A bad threshold or
+    # empty field should fail with context instead of hanging a DataLoader.
+    intensity_max_attempts: int = 1000
 
     # Spatial region holdout for leakage-controlled probes. Regions are a
     # row-major grid over legal global-crop top-left positions. DINO training

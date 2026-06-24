@@ -474,9 +474,12 @@ def main() -> None:
     print(f"[latent] n_crops    : {args.n_crops}")
     print(f"[latent] views      : {args.views}")
 
-    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     print(f"[latent] checkpoint step: {ckpt.get('step', 'unknown')}")
-    encoder = HybridEncoder(stem_channels=cfg.stem_channels).to(device)
+    encoder = HybridEncoder(
+        stem_channels=cfg.stem_channels,
+        latent_dim=cfg.latent_dim,
+    ).to(device)
     encoder.load_state_dict(ckpt["encoder_state_dict"])
     for p in encoder.parameters():
         p.requires_grad = False

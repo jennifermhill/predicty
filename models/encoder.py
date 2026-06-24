@@ -42,8 +42,12 @@ class ZAttentionPool(nn.Module):
 
 
 class HybridEncoder(nn.Module):
-    def __init__(self, stem_channels: int = 64) -> None:
+    def __init__(self, stem_channels: int = 64, latent_dim: int = 2048) -> None:
         super().__init__()
+        if stem_channels < 1:
+            raise ValueError(f"stem_channels must be >= 1; got {stem_channels}")
+        if latent_dim < 1:
+            raise ValueError(f"latent_dim must be >= 1; got {latent_dim}")
 
         # 3D stem: two conv layers that preserve (Z, H, W) and grow channels.
         # ZAttentionPool then collapses z with learned weights so the 2D
@@ -64,7 +68,11 @@ class HybridEncoder(nn.Module):
         self.backbone.conv1 = nn.Conv2d(
             stem_channels, 64, kernel_size=7, stride=2, padding=3, bias=False
         )
-        self.backbone.fc = nn.Identity()
+        # Keep the default checkpoint layout unchanged. For an explicitly
+        # smaller/larger representation, use ResNet's final projection layer.
+        self.backbone.fc = (
+            nn.Identity() if latent_dim == 2048 else nn.Linear(2048, latent_dim)
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, 1, Z, H, W) -> stem -> (B, stem_channels, Z, H, W)

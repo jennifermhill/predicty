@@ -135,6 +135,19 @@ class ZarrCellDataset(IterableDataset):
             raise ValueError(
                 f"intensity_min_frac must be >= 0; got {cfg.intensity_min_frac}"
             )
+        if cfg.intensity_max_attempts < 1:
+            raise ValueError(
+                "intensity_max_attempts must be >= 1; "
+                f"got {cfg.intensity_max_attempts}"
+            )
+        if not 0 <= cfg.channel < self.C:
+            raise ValueError(
+                f"channel must be in [0, {self.C}); got {cfg.channel}"
+            )
+        if not np.isfinite(cfg.max_intensity) or cfg.max_intensity <= 0:
+            raise ValueError(
+                f"max_intensity must be finite and > 0; got {cfg.max_intensity}"
+            )
 
         if cfg.target_gap_minutes <= 0:
             raise ValueError(
@@ -472,11 +485,22 @@ class ZarrCellDataset(IterableDataset):
         # gate against the per-(t1, z_slab) baseline. only one (y, x) is drawn
         # since both globals share the spatial offset; the gate runs once.
         threshold = cfg.intensity_min_frac * self._get_frame_mean(t1, z)
-        while True:
+        best_mean = float("-inf")
+        for _ in range(cfg.intensity_max_attempts):
             y_off, x_off, region_idx = self._sample_global_offset(rng)
             raw_t1 = self._load_crop_raw(t1, z, y_off, x_off, g_size, g_size)
-            if float(raw_t1.mean()) >= threshold:
+            crop_mean = float(raw_t1.mean())
+            best_mean = max(best_mean, crop_mean)
+            if crop_mean >= threshold:
                 break
+        else:
+            raise RuntimeError(
+                "could not sample a global crop that passes the intensity gate "
+                f"after {cfg.intensity_max_attempts} attempts: dataset={cfg.zarr_path!r}, "
+                f"t1={t1}, z={z}, threshold={threshold:.6g}, "
+                f"best_crop_mean={best_mean:.6g}. Lower intensity_min_frac or "
+                "inspect this dataset for empty regions."
+            )
         raw_t2 = self._load_crop_raw(t2, z, y_off, x_off, g_size, g_size)
 
         # global index 0 is at t1, index 1 is at t2.

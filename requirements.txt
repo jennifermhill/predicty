@@ -10,3 +10,4 @@ PyYAML==6.0.2
 matplotlib==3.9.4
 notebook==7.3.2
 ipykernel==6.29.5
+tensorboard==2.18.0
