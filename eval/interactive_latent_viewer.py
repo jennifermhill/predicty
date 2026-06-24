@@ -437,7 +437,7 @@ def main() -> None:
 
     print(f"[viewer] loaded {len(rows)} latent points")
     print("[viewer] left-click for nearest points; right-click-drag to lasso; C to clear")
-    LatentCropViewer(
+    viewer = LatentCropViewer(
         rows,
         coords,
         cfg,
@@ -446,7 +446,10 @@ def main() -> None:
         max_crops=args.max_crops,
         point_size=args.point_size,
     )
+    # Keep the viewer and its weakly-referenced Matplotlib callbacks alive until
+    # all GUI windows have closed.
     plt.show()
+    del viewer
 
 
 if __name__ == "__main__":
