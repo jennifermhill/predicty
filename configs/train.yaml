@@ -109,6 +109,11 @@ z_frac_min: 0.0
 z_abs_min: null
 z_abs_max: null
 
+# Always sample the global z slab from the lowest or highest 5% of valid
+# z-start positions (low/high edge chosen with equal probability).
+z_edge_bias: 1.0
+z_edge_band_frac: 0.05
+
 # ---------------------------------------------------------------------------
 # t1 window
 # ---------------------------------------------------------------------------
