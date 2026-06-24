@@ -304,11 +304,24 @@ class LatentCropViewer:
         self.clear_button = Button(clear_ax, "Clear")
         self.clear_button.on_clicked(self.clear)
 
-        self.crop_fig = plt.figure(figsize=(12, 8))
-        self.crop_fig.suptitle("Select points in the latent map")
+        self.crop_fig = None
+        self._create_crop_figure()
         self.lasso = LassoSelector(self.map_ax, self.on_lasso, button=3)
         self.map_fig.canvas.mpl_connect("button_press_event", self.on_click)
         self.map_fig.canvas.mpl_connect("key_press_event", self.on_key)
+
+    def _create_crop_figure(self) -> None:
+        """Create the crop window and stop retaining it after its GUI is closed."""
+        self.crop_fig = plt.figure(figsize=(12, 8))
+        self.crop_fig.suptitle("Select points in the latent map")
+        self.crop_fig.canvas.mpl_connect("close_event", self._on_crop_figure_closed)
+
+    def _on_crop_figure_closed(self, _event: Any) -> None:
+        self.crop_fig = None
+
+    def _ensure_crop_figure(self) -> None:
+        if self.crop_fig is None or not plt.fignum_exists(self.crop_fig.number):
+            self._create_crop_figure()
 
     def set_status(self, message: str) -> None:
         self.status.set_text(message)
@@ -347,9 +360,10 @@ class LatentCropViewer:
 
     def clear(self, _event: Any = None) -> None:
         self.highlight.set_offsets(np.empty((0, 2)))
-        self.crop_fig.clear()
-        self.crop_fig.suptitle("Select points in the latent map")
-        self.crop_fig.canvas.draw_idle()
+        if self.crop_fig is not None and plt.fignum_exists(self.crop_fig.number):
+            self.crop_fig.clear()
+            self.crop_fig.suptitle("Select points in the latent map")
+            self.crop_fig.canvas.draw_idle()
         self.set_status("Selection cleared")
 
     def show_selection(self, indices: np.ndarray, description: str) -> None:
@@ -366,6 +380,8 @@ class LatentCropViewer:
         self.set_status(description)
 
     def render_crops(self, indices: np.ndarray, description: str) -> None:
+        self._ensure_crop_figure()
+        assert self.crop_fig is not None
         self.crop_fig.clear()
         n = len(indices)
         if n < 1:
