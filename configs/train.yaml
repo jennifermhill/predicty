@@ -39,7 +39,7 @@ zarr_paths:
 # annotated examples and overrepresenting underrpresented classes, assuming the datasets
 # have the same class distribution as the annotated examples.   
 
-annotation_path: ..\data\index.jsonl
+annotation_path: /groups/sgro/sgrolab/Aran/predicty/jsonl
 overrepresent_classes: true
 
 

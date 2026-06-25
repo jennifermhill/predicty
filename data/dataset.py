@@ -42,6 +42,8 @@ import numpy as np
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
+import pandas as pd
+
 from configs.config import Config
 from data.augmentations import build_augmentations
 from data.balancing import balanced_batch_indices
@@ -84,7 +86,7 @@ class ZarrCellDataset(IterableDataset):
         self.T, self.C, self.Z, self.Y, self.X = self.arr.shape
         if self.T < 2:
             raise ValueError(f"need at least 2 timepoints; got T={self.T}")
-
+        
     def _resolve_ranges(self) -> None:
         cfg = self.cfg
 
@@ -673,6 +675,12 @@ class MultiZarrDataset(IterableDataset):
             raise ValueError(f"cfg.batch_size must be >= 1; got {cfg.batch_size}")
         self.cfg = cfg
 
+        #sets to none until _load_annotations is called, which is only if train.yaml includes it.
+        self.annotations: pd.DataFrame | None = None
+        self.class_proportions: dict[Any, float] | None = None
+
+        
+
         # filter out experiments marked not-for-training (blank z_limit in the
         # spreadsheet). these are excluded silently from training; we log which
         # ones got skipped so misconfigured spreadsheet rows are visible.
@@ -695,6 +703,9 @@ class MultiZarrDataset(IterableDataset):
                 "no usable zarrs after filtering by spreadsheet z_limit; "
                 "every entry in cfg.zarr_paths has a blank z_limit"
             )
+        
+        if cfg.overrepresent_classes:
+            self._load_annotations(usable_paths)
 
         # build one fully-initialized child per usable zarr. each child reads
         # its own shape, looks up its own interval_minutes, and computes its
@@ -720,6 +731,24 @@ class MultiZarrDataset(IterableDataset):
         total = float(sum(sizes))
         self.weights = [s / total for s in sizes]
         self._log_open()
+
+    def _load_annotations(self, usable_paths: list[str]) -> None:
+        cfg = self.cfg
+        if cfg.annotation_path is None:
+            raise ValueError("cfg.annotation_path must be set to load annotations.")
+        df = pd.read_json(cfg.annotation_path, lines=True)
+        df = df[df["zarr_path"].isin(usable_paths)]
+        df = df[df['labels'] != 'empty']
+        if df.empty:
+            raise ValueError(
+                f"No annotations found for usable zarrs in {cfg.annotation_path}"
+            )
+        self.annotations = df
+        self.class_proportions = df["labels"].value_counts(normalize=True).to_dict()
+
+        #TO DO: Use alpha rate (less -> more streams/slug/aggregate sampling) to determine samples. 
+        #Probably use an alpha rate of 0.4 -> assume random sampling yields 50/50 single-cells/clumps
+        #when sampling from annotations, sample equally from streams/slug/aggregate
 
     def _apply_common_content_holdout(self) -> None:
         cfg = self.cfg

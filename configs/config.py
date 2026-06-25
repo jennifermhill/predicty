@@ -26,6 +26,7 @@ class Config:
     #when True, training data compensates for class imbalance using annotated examples
     annotation_path: str | None = None
     overrepresent_classes: bool = False
+    overrepresentation_alpha: float = 0.5
 
     # multi-zarr training. when non-null, the dataloader mixes pairs from
     # every listed zarr in each batch and `zarr_path` is ignored.
