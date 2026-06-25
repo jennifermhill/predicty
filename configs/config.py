@@ -23,6 +23,10 @@ class Config:
     # left null so the file picker / --zarr-path flag can fill it at runtime.
     zarr_path: str | None = None
 
+    #when True, training data compensates for class imbalance using annotated examples
+    annotation_path: str | None = None
+    overrepresent_classes: bool = False
+
     # multi-zarr training. when non-null, the dataloader mixes pairs from
     # every listed zarr in each batch and `zarr_path` is ignored.
     zarr_paths: list[str] | None = None
@@ -98,6 +102,15 @@ class Config:
     # z_limit (it can only narrow the window, never extend past z_limit).
     z_abs_min: int | None = None
     z_abs_max: int | None = None
+
+    # bias z-slab sampling toward the top/bottom of the z range. with
+    # probability `z_edge_bias` a sample's z slab is drawn from an edge band
+    # (low or high, 50/50) instead of uniformly across the whole z range;
+    # 0.0 (default) keeps uniform sampling. `z_edge_band_frac` is each band's
+    # width as a fraction of the usable z-start span.
+    z_edge_bias: float = 0.0
+    z_edge_band_frac: float = 0.15
+
 
     # t1 window as a fraction of each dataset.
     t1_frac_min: float = 0.0

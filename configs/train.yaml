@@ -28,13 +28,20 @@ zarr_paths:
   - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test53_2025-02-22/ERH_2024-02-21_mixin53_24hr_ERH Red FarRed 2.zarr
   - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test54_2024-02-22/2024-02-22_ERH_mixin54_24hr_ERH Red FarRed.zarr
   - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test57_2024-02-29/2024-02-29_mixin57_overnight_25um_ERH_Red_FarRed_25.zarr
-  - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test60_2024-03-06/2024-03-06_mixin60_img2_overnight_Emily Cryo Red Yellow FarRed_F0.zarr
   - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test61_2024-03-07/2024-03-07_mixin61_overnight_ERH Red FarRed.zarr
   - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test62_2024-03-08/2024-03-08_mixin62_weekend_ERH Red FarRed.zarr
   - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test64_2024-04-04/ERH_2024-04-04_mixin64_wellC5_10x_overnight_ERH Red FarRed_1.zarr
   - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test65_2024-04-16/WS205_overnight_day2/2024-04-17_ERH_mixin65_plate2_WS205_overnight_day2_ERH Red FarRed/2024-04-17_ERH_mixin65_plate2_WS205_overnight_day2_ERH Red FarRed.zarr
   - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test65_2024-04-16/NC28.1_overnight_day1/2024-04-16_ERH_mixin65_plate1_NC28.1_overnight_ERH Red FarRed.zarr
   - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test66_2024-04-30/ERH_2024-04-30_mixin66_plate1_day1_ERH Red FarRed.zarr
+
+# to provide model training with a balanced representation of every dataset, using
+# annotated examples and overrepresenting underrpresented classes, assuming the datasets
+# have the same class distribution as the annotated examples.   
+
+annotation_path: ..\data\index.jsonl
+overrepresent_classes: true
+
 
 # balanced batches contain floor(batch_size / dataset_count) samples from
 # every usable zarr. remainder slots rotate across batches. set false to use
@@ -60,7 +67,7 @@ local_crop_size: 96
 # minimum crop intensity, as a fraction of the mean intensity over the active
 # z slab at t1. a global crop is accepted only if its mean is at least
 # intensity_min_frac * slab_mean. cached per worker, keyed by (t1, z).
-intensity_min_frac: 0.95
+intensity_min_frac: 0.85
 # fail clearly instead of hanging forever if no sampled crop passes the gate.
 intensity_max_attempts: 1000
 
@@ -118,6 +125,11 @@ z_frac_min: 0.0
 # (it can only narrow the window, never extend past it). leave null to skip.
 z_abs_min: null
 z_abs_max: null
+
+# Always sample the global z slab from the lowest or highest 5% of valid
+# z-start positions (low/high edge chosen with equal probability).
+z_edge_bias: 0.85
+z_edge_band_frac: 0.1
 
 
 
@@ -184,7 +196,7 @@ aug_percrop_norm:
 # to fetch crops in parallel. each worker reopens its own zarr handle and
 # pulls samples independently, then hands batches back to the main process.
 # 0 means "load in the main process" (slower but easier to debug).
-num_workers: 4
+num_workers: 6
 
 # seed: base integer used to make sampling reproducible. each worker derives
 # its own rng from (seed + worker_id), and numpy/torch are seeded the same way.
