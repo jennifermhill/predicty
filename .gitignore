@@ -1,5 +1,9 @@
 # Project-specific
 /annotations
+# node tooling + generated artifacts (not part of the training code)
+node_modules/
+package.json
+/outputs/
 # per-run training artifacts (checkpoints, tensorboard + lsf logs, config snapshots)
 /checkpoints/
 /logs/
