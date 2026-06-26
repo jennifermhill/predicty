@@ -491,19 +491,17 @@ class ZarrCellDataset(IterableDataset):
         l_z = cfg.local_z_thickness
 
         # one global z slab shared by both globals and constrained for locals.
+        # optionally bias the slab start toward the low/high edges of the z
+        # range (where the behaviors of interest tend to sit).
         z_start_max = self.z_max - g_z
-        z = rng.randrange(self.z_min, z_start_max + 1)
-        # z-edge biasing disabled: edge slabs are too sparse for the intensity
-        # gate, so the sampler stalled retrying empty slabs. reverted to uniform
-        # z sampling. to re-enable, restore the block below and set z_edge_bias.
-        # if cfg.z_edge_bias > 0.0 and rng.random() < cfg.z_edge_bias:
-        #     band = int(round(cfg.z_edge_band_frac * (z_start_max - self.z_min)))
-        #     if rng.random() < 0.5:  # low edge (near z_min)
-        #         z = rng.randrange(self.z_min, self.z_min + band + 1)
-        #     else:  # high edge (near z_max)
-        #         z = rng.randrange(z_start_max - band, z_start_max + 1)
-        # else:
-        #     z = rng.randrange(self.z_min, z_start_max + 1)
+        if cfg.z_edge_bias > 0.0 and rng.random() < cfg.z_edge_bias:
+            band = int(round(cfg.z_edge_band_frac * (z_start_max - self.z_min)))
+            if rng.random() < 0.5:  # low edge (near z_min)
+                z = rng.randrange(self.z_min, self.z_min + band + 1)
+            else:  # high edge (near z_max)
+                z = rng.randrange(z_start_max - band, z_start_max + 1)
+        else:
+            z = rng.randrange(self.z_min, z_start_max + 1)
         t1 = rng.randrange(self.t1_min, self.t1_max)
         sign = 1 if cfg.temporal_direction == "forward" else -1
         t2 = t1 + sign * self.frame_gap
