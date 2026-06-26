@@ -512,13 +512,30 @@ class ZarrCellDataset(IterableDataset):
         # since both globals share the spatial offset; the gate runs once.
         threshold = cfg.intensity_min_frac * self._get_frame_mean(t1, z)
         best_mean = float("-inf")
-        for _ in range(cfg.intensity_max_attempts):
+        for attempt in range(cfg.intensity_max_attempts):
             y_off, x_off, region_idx = self._sample_global_offset(rng)
             raw_t1 = self._load_crop_raw(t1, z, y_off, x_off, g_size, g_size)
             crop_mean = float(raw_t1.mean())
             best_mean = max(best_mean, crop_mean)
             if crop_mean >= threshold:
+                # debug: flag crops that only passed after a lot of retries.
+                if attempt >= 50:
+                    print(
+                        f"[gate] dataset_idx={dataset_idx} t1={t1} z={z} "
+                        f"passed after {attempt + 1} attempts "
+                        f"(threshold={threshold:.4g}, crop_mean={crop_mean:.4g})",
+                        flush=True,
+                    )
                 break
+            # debug: if this floods the log, the gate is cycling on a near-empty
+            # slab (same t1/z, only y/x changing). prints every 100 retries.
+            if (attempt + 1) % 100 == 0:
+                print(
+                    f"[gate] dataset_idx={dataset_idx} t1={t1} z={z} still retrying "
+                    f"{attempt + 1}/{cfg.intensity_max_attempts} "
+                    f"(threshold={threshold:.4g}, best_mean={best_mean:.4g})",
+                    flush=True,
+                )
         else:
             raise RuntimeError(
                 "could not sample a global crop that passes the intensity gate "
