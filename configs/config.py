@@ -104,15 +104,6 @@ class Config:
     z_abs_min: int | None = None
     z_abs_max: int | None = None
 
-    # bias z-slab sampling toward the top/bottom of the z range. with
-    # probability `z_edge_bias` a sample's z slab is drawn from an edge band
-    # (low or high, 50/50) instead of uniformly across the whole z range;
-    # 0.0 (default) keeps uniform sampling. `z_edge_band_frac` is each band's
-    # width as a fraction of the usable z-start span.
-    z_edge_bias: float = 0.0
-    z_edge_band_frac: float = 0.15
-
-
     # t1 window as a fraction of each dataset.
     t1_frac_min: float = 0.0
     t1_frac_max: float = 1.0

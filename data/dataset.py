@@ -250,15 +250,6 @@ class ZarrCellDataset(IterableDataset):
                 f"{self.z_max - self.z_min} slices, but z_thickness={cfg.z_thickness}"
             )
 
-        if not 0.0 <= cfg.z_edge_bias <= 1.0:
-            raise ValueError(
-                f"z_edge_bias must be in [0, 1]; got {cfg.z_edge_bias}"
-            )
-        if not 0.0 <= cfg.z_edge_band_frac <= 1.0:
-            raise ValueError(
-                f"z_edge_band_frac must be in [0, 1]; got {cfg.z_edge_band_frac}"
-            )
-
         # absolute t bounds are only for pinning a known dataset.
         if cfg.t1_abs_min is not None and cfg.t1_abs_max is not None:
             self.t1_min = cfg.t1_abs_min
@@ -482,15 +473,9 @@ class ZarrCellDataset(IterableDataset):
             f"target_gap_minutes={self.cfg.target_gap_minutes} -> "
             f"frame_gap={self.frame_gap} ({self.cfg.temporal_direction})"
         )
-        edge = ""
-        if self.cfg.z_edge_bias > 0.0:
-            edge = (
-                f"; z_edge_bias={self.cfg.z_edge_bias} "
-                f"(band_frac={self.cfg.z_edge_band_frac})"
-            )
         print(
             f"[ZarrCellDataset] Z={self.Z}; z range resolved to "
-            f"[{self.z_min}, {self.z_max}) slices, thickness={self.cfg.z_thickness}{edge}"
+            f"[{self.z_min}, {self.z_max}) slices, thickness={self.cfg.z_thickness}"
         )
         print(
             f"[ZarrCellDataset] t1 range resolved to "
@@ -560,14 +545,7 @@ class ZarrCellDataset(IterableDataset):
             )
 
         else:
-            if cfg.z_edge_bias > 0.0 and rng.random() < cfg.z_edge_bias:
-                band = int(round(cfg.z_edge_band_frac * (z_start_max - self.z_min)))
-                if rng.random() < 0.5:  # low edge (near z_min)
-                    z = rng.randrange(self.z_min, self.z_min + band + 1)
-                else:  # high edge (near z_max)
-                    z = rng.randrange(z_start_max - band, z_start_max + 1)
-            else:
-                z = rng.randrange(self.z_min, z_start_max + 1)
+            z = rng.randrange(self.z_min, z_start_max + 1)
             t1 = rng.randrange(self.t1_min, self.t1_max)
             sign = 1 if cfg.temporal_direction == "forward" else -1
             t2 = t1 + sign * self.frame_gap
