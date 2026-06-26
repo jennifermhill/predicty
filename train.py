@@ -102,6 +102,7 @@ def main() -> None:
         worker_init_fn=worker_init_fn,
         persistent_workers=cfg.num_workers > 0,
         pin_memory=device.type == "cuda",
+        multiprocessing_context="spawn" if cfg.num_workers > 0 else None,
     )
 
     # ---- model ----
