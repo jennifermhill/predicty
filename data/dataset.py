@@ -33,6 +33,7 @@ zarr handles are reopened in each worker so dask handles stay process-local.
 
 from __future__ import annotations
 
+from cProfile import label
 import random
 from dataclasses import replace
 from typing import Any, Iterator
@@ -70,6 +71,9 @@ class ZarrCellDataset(IterableDataset):
         self._resolve_ranges()
         self._log_open()
 
+        if cfg.overrepresent_classes:
+            self._load_annotations(self.cfg.zarr_path)
+
         # augmentations are stateless across workers.
         self._augment = build_augmentations(cfg)
 
@@ -86,6 +90,36 @@ class ZarrCellDataset(IterableDataset):
         self.T, self.C, self.Z, self.Y, self.X = self.arr.shape
         if self.T < 2:
             raise ValueError(f"need at least 2 timepoints; got T={self.T}")
+    
+    def _load_annotations(self, zarr_path: str) -> None:
+        cfg = self.cfg
+        if cfg.annotation_path is None:
+            raise ValueError("cfg.annotation_path must be set to load annotations.")
+        df = pd.read_json(cfg.annotation_path, lines=True)
+
+        df = df[df['label'] != 'empty']
+        if df.empty:
+            raise ValueError(
+                f"No annotations found for usable zarrs in {cfg.annotation_path}"
+            )
+        df = df[df['zarr_path'].isin([zarr_path])]
+
+        excluded = {"single_cells", "clumps"}
+        all_classes = set(df["label"].unique())
+        self.minority_classes = list(all_classes - excluded)
+        df = df[df['label'].isin(self.minority_classes)]
+        if df.empty:
+            print(f"No minority class annotations found for zarrs in {zarr_path}. Proceeding without annotations.")
+        else:
+            df = df.drop(columns = ['timestamp'])
+            for col in df.columns:
+                try:
+                    df[col] = pd.to_numeric(df[col], downcast="integer")
+                except (ValueError, TypeError):
+                    pass
+        self.by_label = {}
+        for label in df["label"].unique():
+            self.by_label[label] = df[df["label"] == label]
         
     def _resolve_ranges(self) -> None:
         cfg = self.cfg
@@ -93,6 +127,7 @@ class ZarrCellDataset(IterableDataset):
         self._check_fraction("z_frac_min", cfg.z_frac_min)
         self._check_fraction("t1_frac_min", cfg.t1_frac_min)
         self._check_fraction("t1_frac_max", cfg.t1_frac_max)
+        self._check_fraction("representation_alpha", cfg.rep_alpha)
         self._check_order("t1_frac", cfg.t1_frac_min, cfg.t1_frac_max)
         self._check_spatial_region_config()
 
@@ -492,42 +527,71 @@ class ZarrCellDataset(IterableDataset):
         g_z = cfg.z_thickness
         l_z = cfg.local_z_thickness
 
+        raw_t1, raw_t2 = None, None
+        z_start_max = self.z_max - g_z
+
         # one global z slab shared by both globals and constrained for locals.
         # optionally bias the slab start toward the low/high edges of the z
         # range (where the behaviors of interest tend to sit).
-        z_start_max = self.z_max - g_z
-        if cfg.z_edge_bias > 0.0 and rng.random() < cfg.z_edge_bias:
-            band = int(round(cfg.z_edge_band_frac * (z_start_max - self.z_min)))
-            if rng.random() < 0.5:  # low edge (near z_min)
-                z = rng.randrange(self.z_min, self.z_min + band + 1)
-            else:  # high edge (near z_max)
-                z = rng.randrange(z_start_max - band, z_start_max + 1)
-        else:
-            z = rng.randrange(self.z_min, z_start_max + 1)
-        t1 = rng.randrange(self.t1_min, self.t1_max)
-        sign = 1 if cfg.temporal_direction == "forward" else -1
-        t2 = t1 + sign * self.frame_gap
 
-        # gate against the per-(t1, z_slab) baseline. only one (y, x) is drawn
-        # since both globals share the spatial offset; the gate runs once.
-        threshold = cfg.intensity_min_frac * self._get_frame_mean(t1, z)
-        best_mean = float("-inf")
-        for _ in range(cfg.intensity_max_attempts):
-            y_off, x_off, region_idx = self._sample_global_offset(rng)
+        if cfg.overrepresent_classes and rng.random() < cfg.rep_alpha and self.minority_classes: 
+            #3-part check - if overrepresenting classes is enabled, if random value below threshold
+            #and if there are minority classes to sample from in this dataset
+            label = self.minority_classes[rng.randrange(len(self.minority_classes))]
+            df = self.by_label[label]
+            row = df.iloc[rng.randrange(len(df))]
+            t1 = row['t1']
+            t2 = row['t2']
+            z = row['z']
+            y_off = row['global_y']
+            x_off = row['global_x']
+
             raw_t1 = self._load_crop_raw(t1, z, y_off, x_off, g_size, g_size)
-            crop_mean = float(raw_t1.mean())
-            best_mean = max(best_mean, crop_mean)
-            if crop_mean >= threshold:
-                break
-        else:
-            raise RuntimeError(
-                "could not sample a global crop that passes the intensity gate "
-                f"after {cfg.intensity_max_attempts} attempts: dataset={cfg.zarr_path!r}, "
-                f"t1={t1}, z={z}, threshold={threshold:.6g}, "
-                f"best_crop_mean={best_mean:.6g}. Lower intensity_min_frac or "
-                "inspect this dataset for empty regions."
+            raw_t2 = self._load_crop_raw(t2, z, y_off, x_off, g_size, g_size)
+
+            region_idx = region_index_for_top_left(
+                y_off,
+                x_off,
+                self.Y,
+                self.X,
+                cfg.global_crop_size,
+                cfg.spatial_region_grid_y,
+                cfg.spatial_region_grid_x,
             )
-        raw_t2 = self._load_crop_raw(t2, z, y_off, x_off, g_size, g_size)
+
+        else:
+            if cfg.z_edge_bias > 0.0 and rng.random() < cfg.z_edge_bias:
+                band = int(round(cfg.z_edge_band_frac * (z_start_max - self.z_min)))
+                if rng.random() < 0.5:  # low edge (near z_min)
+                    z = rng.randrange(self.z_min, self.z_min + band + 1)
+                else:  # high edge (near z_max)
+                    z = rng.randrange(z_start_max - band, z_start_max + 1)
+            else:
+                z = rng.randrange(self.z_min, z_start_max + 1)
+            t1 = rng.randrange(self.t1_min, self.t1_max)
+            sign = 1 if cfg.temporal_direction == "forward" else -1
+            t2 = t1 + sign * self.frame_gap
+
+            # gate against the per-(t1, z_slab) baseline. only one (y, x) is drawn
+            # since both globals share the spatial offset; the gate runs once.
+            threshold = cfg.intensity_min_frac * self._get_frame_mean(t1, z)
+            best_mean = float("-inf")
+            for _ in range(cfg.intensity_max_attempts):
+                y_off, x_off, region_idx = self._sample_global_offset(rng)
+                raw_t1 = self._load_crop_raw(t1, z, y_off, x_off, g_size, g_size)
+                crop_mean = float(raw_t1.mean())
+                best_mean = max(best_mean, crop_mean)
+                if crop_mean >= threshold:
+                    break
+            else:
+                raise RuntimeError(
+                    "could not sample a global crop that passes the intensity gate "
+                    f"after {cfg.intensity_max_attempts} attempts: dataset={cfg.zarr_path!r}, "
+                    f"t1={t1}, z={z}, threshold={threshold:.6g}, "
+                    f"best_crop_mean={best_mean:.6g}. Lower intensity_min_frac or "
+                    "inspect this dataset for empty regions."
+                )
+            raw_t2 = self._load_crop_raw(t2, z, y_off, x_off, g_size, g_size)
 
         # global index 0 is at t1, index 1 is at t2.
         globals_tensor = torch.stack([
@@ -675,12 +739,6 @@ class MultiZarrDataset(IterableDataset):
             raise ValueError(f"cfg.batch_size must be >= 1; got {cfg.batch_size}")
         self.cfg = cfg
 
-        #sets to none until _load_annotations is called, which is only if train.yaml includes it.
-        self.annotations: pd.DataFrame | None = None
-        self.class_proportions: dict[Any, float] | None = None
-
-        
-
         # filter out experiments marked not-for-training (blank z_limit in the
         # spreadsheet). these are excluded silently from training; we log which
         # ones got skipped so misconfigured spreadsheet rows are visible.
@@ -703,9 +761,6 @@ class MultiZarrDataset(IterableDataset):
                 "no usable zarrs after filtering by spreadsheet z_limit; "
                 "every entry in cfg.zarr_paths has a blank z_limit"
             )
-        
-        if cfg.overrepresent_classes:
-            self._load_annotations(usable_paths)
 
         # build one fully-initialized child per usable zarr. each child reads
         # its own shape, looks up its own interval_minutes, and computes its
@@ -731,24 +786,6 @@ class MultiZarrDataset(IterableDataset):
         total = float(sum(sizes))
         self.weights = [s / total for s in sizes]
         self._log_open()
-
-    def _load_annotations(self, usable_paths: list[str]) -> None:
-        cfg = self.cfg
-        if cfg.annotation_path is None:
-            raise ValueError("cfg.annotation_path must be set to load annotations.")
-        df = pd.read_json(cfg.annotation_path, lines=True)
-        df = df[df["zarr_path"].isin(usable_paths)]
-        df = df[df['labels'] != 'empty']
-        if df.empty:
-            raise ValueError(
-                f"No annotations found for usable zarrs in {cfg.annotation_path}"
-            )
-        self.annotations = df
-        self.class_proportions = df["labels"].value_counts(normalize=True).to_dict()
-
-        #TO DO: Use alpha rate (less -> more streams/slug/aggregate sampling) to determine samples. 
-        #Probably use an alpha rate of 0.4 -> assume random sampling yields 50/50 single-cells/clumps
-        #when sampling from annotations, sample equally from streams/slug/aggregate
 
     def _apply_common_content_holdout(self) -> None:
         cfg = self.cfg
