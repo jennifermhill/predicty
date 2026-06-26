@@ -109,10 +109,11 @@ z_frac_min: 0.0
 z_abs_min: null
 z_abs_max: null
 
-# Always sample the global z slab from the lowest or highest 5% of valid
-# z-start positions (low/high edge chosen with equal probability).
-z_edge_bias: 0.85
-z_edge_band_frac: 0.1
+# z-edge biasing disabled (reverted to uniform z sampling). edge slabs were
+# too sparse for the intensity gate and stalled the dataloader. to re-enable,
+# uncomment these and restore the sampling block in data/dataset.py.
+# z_edge_bias: 0.85
+# z_edge_band_frac: 0.1
 
 # ---------------------------------------------------------------------------
 # t1 window
