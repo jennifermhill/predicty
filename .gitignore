@@ -7,6 +7,7 @@ package.json
 # per-run training artifacts (checkpoints, tensorboard + lsf logs, config snapshots)
 /checkpoints/
 /logs/
+/latent_space/
 plans/
 notes.txt
 TRAINING_GUIDE.txt
