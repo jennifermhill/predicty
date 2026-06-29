@@ -31,7 +31,7 @@ zarr_paths:
 # have the same class distribution as the annotated examples.   
 
 annotation_path: /groups/sgro/sgrolab/Aran/predicty/index.jsonl
-overrepresent_classes: true
+overrepresent_classes: false
 rep_alpha: 0.5
 
 
@@ -181,7 +181,7 @@ aug_percrop_norm:
 # to fetch crops in parallel. each worker reopens its own zarr handle and
 # pulls samples independently, then hands batches back to the main process.
 # 0 means "load in the main process" (slower but easier to debug).
-num_workers: 6
+num_workers: 4
 
 # seed: base integer used to make sampling reproducible. each worker derives
 # its own rng from (seed + worker_id), and numpy/torch are seeded the same way.

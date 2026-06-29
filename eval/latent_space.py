@@ -37,6 +37,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+import torch.multiprocessing as mp
+mp.set_start_method("spawn", force=True)
+
 from configs.config import Config
 from data.dataset import MultiZarrDataset, ZarrCellDataset, worker_init_fn
 from models.encoder import HybridEncoder
@@ -48,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint", required=True, help="path to latest.pt/final.pt/step_*.pt")
     p.add_argument("--device", default=None, help="override cfg.device, e.g. cpu or cuda:0")
     p.add_argument("--out-dir", default=None, help="output directory; defaults under latent_space/")
-    p.add_argument("--n-crops", type=int, default=10000, help="number of global crops to embed")
+    p.add_argument("--n-crops", type=int, default=5000, help="number of global crops to embed")
     p.add_argument("--batch-size", type=int, default=None, help="override cfg.batch_size for extraction")
     p.add_argument("--num-workers", type=int, default=None, help="override cfg.num_workers for extraction")
     p.add_argument("--seed", type=int, default=42, help="sampling seed")

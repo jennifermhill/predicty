@@ -503,8 +503,101 @@ class ZarrCellDataset(IterableDataset):
         while True:
             yield self._sample_pair(rng)
 
+    def _annotation_tensor(self, t1: int, t2: int, z: int, x_off: int, y_off: int, dataset_idx: int = 0
+    ) -> dict[str, Any]:
+        cfg = self.cfg
+        g_size = cfg.global_crop_size
+        l_size = cfg.local_crop_size
+        g_z = cfg.z_thickness
+        l_z = cfg.local_z_thickness
+        rng = random.Random()
+
+        raw_t1 = self._load_crop_raw(t1, z, y_off, x_off, g_size, g_size)
+        raw_t2 = self._load_crop_raw(t2, z, y_off, x_off, g_size, g_size)
+
+        region_idx = region_index_for_top_left(
+                y_off,
+                x_off,
+                self.Y,
+                self.X,
+                cfg.global_crop_size,
+                cfg.spatial_region_grid_y,
+                cfg.spatial_region_grid_x,
+        )
+
+        # global index 0 is at t1, index 1 is at t2.
+        globals_tensor = torch.stack([
+            self._augment(self._to_tensor(raw_t1)),
+            self._augment(self._to_tensor(raw_t2)),
+        ])
+
+        # locals split evenly between the two global parents. since both
+        # globals share (y, x), spatial nesting collapses to the same window;
+        # the parent index is still recorded so the loss can pair each local
+        # with the correct teacher target. each local picks its own time in
+        # [t1, t2] and its own contiguous l_z-deep sub-slab inside the global
+        # z window.
+        n_local = cfg.n_local_crops
+        n_per = n_local // 2
+        local_parents: list[int] = [0] * n_per + [1] * (n_local - n_per)
+
+        t_lo, t_hi = (t1, t2) if t1 <= t2 else (t2, t1)
+        lz_start_max = z + g_z - l_z  # inclusive upper bound
+
+        local_ts: list[int] = []
+        local_zs: list[int] = []
+        local_offsets: list[tuple[int, int]] = []
+        locals_: list[torch.Tensor] = []
+        for _parent in local_parents:
+            t_local = rng.randrange(t_lo, t_hi + 1)
+            lz = rng.randrange(z, lz_start_max + 1)
+            ly = rng.randrange(y_off, y_off + g_size - l_size + 1)
+            lx = rng.randrange(x_off, x_off + g_size - l_size + 1)
+            raw_l = self._load_crop_raw(
+                t_local, lz, ly, lx, l_size, l_size, z_thickness=l_z
+            )
+            local_ts.append(t_local)
+            local_zs.append(lz)
+            local_offsets.append((ly, lx))
+            locals_.append(self._augment(self._to_tensor(raw_l)))
+
+        sample: dict[str, Any] = {
+            # (2, 1, z_thickness, g_size, g_size); index 0 is t1, index 1 is t2.
+            "globals": globals_tensor,
+            # WS-DINO weak label: (dataset_idx, frame_gap). dataset_idx is 0 for
+            # a single-zarr dataset; MultiZarrDataset passes the child index it
+            # drew. frame_gap is the per-dataset integer frame spacing.
+            "weak_label": torch.tensor(
+                [dataset_idx, self.frame_gap], dtype=torch.long
+            ),
+            "meta": {
+                "t1": t1,
+                "t2": t2,
+                "z": z,
+                "z_end": z + g_z,
+                "dataset_idx": dataset_idx,
+                "frame_gap": self.frame_gap,
+                "global_t": torch.tensor([t1, t2]),
+                "global_y": y_off,
+                "global_x": x_off,
+                "frame_y": self.Y,
+                "frame_x": self.X,
+                "spatial_region_idx": region_idx,
+            },
+        }
+        if locals_:
+            sample["locals"] = torch.stack(locals_)
+            sample["meta"]["local_parent"] = torch.tensor(local_parents)
+            sample["meta"]["local_t"] = torch.tensor(local_ts)
+            sample["meta"]["local_z"] = torch.tensor(local_zs)
+            sample["meta"]["local_z_end"] = torch.tensor([lz + l_z for lz in local_zs])
+            sample["meta"]["local_y"] = torch.tensor([y for y, _ in local_offsets])
+            sample["meta"]["local_x"] = torch.tensor([x for _, x in local_offsets])
+        return sample
+        
+
     def _sample_pair(
-        self, rng: random.Random, dataset_idx: int = 0
+        self, rng: random.Random, dataset_idx: int = 0,
     ) -> dict[str, Any]:
         cfg = self.cfg
         g_size = cfg.global_crop_size
