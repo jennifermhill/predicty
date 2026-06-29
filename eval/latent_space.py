@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint", required=True, help="path to latest.pt/final.pt/step_*.pt")
     p.add_argument("--device", default=None, help="override cfg.device, e.g. cpu or cuda:0")
     p.add_argument("--out-dir", default=None, help="output directory; defaults under latent_space/")
-    p.add_argument("--n-crops", type=int, default=10000, help="number of global crops to embed")
+    p.add_argument("--n-crops", type=int, default=2000, help="number of global crops to embed")
     p.add_argument("--batch-size", type=int, default=None, help="override cfg.batch_size for extraction")
     p.add_argument("--num-workers", type=int, default=None, help="override cfg.num_workers for extraction")
     p.add_argument("--seed", type=int, default=42, help="sampling seed")
@@ -130,6 +130,9 @@ def extract_embeddings(
         worker_init_fn=worker_init_fn,
         persistent_workers=cfg.num_workers > 0,
         pin_memory=device.type == "cuda",
+        # spawn (not fork) so workers start fresh. forking after the parent has
+        # initialized cuda + the zarr/blosc threadpool deadlocks on first read.
+        multiprocessing_context="spawn" if cfg.num_workers > 0 else None,
     )
 
     encoder.eval()
