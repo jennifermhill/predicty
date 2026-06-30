@@ -6,7 +6,7 @@ The intent is for this classifier to SUCCEED: high val accuracy indicates the en
 has learned a representation that separates behaviors, which is the desired outcome.
 
 usage:
-    python eval/probe_behavior.py --config configs/train.yaml --checkpoint checkpoints/latest.pt
+    python eval/probe_behavior.py --config configs/train.yaml --checkpoint checkpoints/z_filtering/latest.pt
 
 """
 
@@ -17,6 +17,8 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+import statistics
+import pandas as pd
 
 # allow running as `python eval/probe_behavior.py` from project root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -26,8 +28,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import torch.multiprocessing as mp
 mp.set_start_method("spawn", force=True)
-
-import pandas as pd
+from sklearn.model_selection import StratifiedGroupKFold
 
 from configs.config import Config
 from data.dataset import MultiZarrDataset, worker_init_fn
@@ -73,6 +74,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--probe-batch-size", type=int, default=512)
     p.add_argument("--probe-weight-decay", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=42, help="seed for sampling + train/val split")
+    p.add_argument("--n_splits", type=int, default=5, help="Folds for stratified k fold splitting")
     """
     p.add_argument(
         "--val-frac",
@@ -175,59 +177,19 @@ def random_split(
     n_train = int(0.8 * X.size(0))
     return X[:n_train], y[:n_train], X[n_train:], y[n_train:]
 
-"""
-def spatial_holdout_split(
+
+def StratifiedGroupKFoldSplit(
     X: torch.Tensor,
     y: torch.Tensor,
-    rows: list[dict[str, Any]],
-    cfg: Config,
-    val_frac: float,
-    n_classes: int,
+    dataset_idx: list,
+    seed: int,
+    n_splits: int = 5
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if not 0.0 < val_frac < 1.0:
-        raise ValueError(f"--val-frac must be in (0, 1); got {val_frac}")
-
-    train_idx: list[int] = []
-    val_idx: list[int] = []
-    for i, row in enumerate(rows):
-        y0, y1, x0, x1 = region_bounds_for_top_left(
-            int(row["frame_y"]),
-            int(row["frame_x"]),
-            cfg.global_crop_size,
-            cfg.spatial_region_grid_y,
-            cfg.spatial_region_grid_x,
-            int(row["spatial_region_idx"]),
-        )
-        split_on_y = (y1 - y0) >= (x1 - x0)
-        lo = y0 if split_on_y else x0
-        hi = y1 if split_on_y else x1
-        coord = int(row["global_y"] if split_on_y else row["global_x"])
-        threshold = lo + max(1, int(round((hi - lo) * (1.0 - val_frac))))
-        if coord >= threshold:
-            val_idx.append(i)
-        else:
-            train_idx.append(i)
-
-    if not train_idx or not val_idx:
-        raise ValueError(
-            "spatial-holdout split produced an empty train or val set; "
-            "increase --n-samples or adjust --val-frac"
-        )
-
-    X_train, y_train = X[train_idx], y[train_idx]
-    X_val, y_val = X[val_idx], y[val_idx]
-    train_counts = torch.bincount(y_train, minlength=n_classes)
-    val_counts = torch.bincount(y_val, minlength=n_classes)
-    if bool((train_counts == 0).any()) or bool((val_counts == 0).any()):
-        raise ValueError(
-            "spatial-holdout split is missing at least one dataset class in "
-            f"train or val; train_counts={train_counts.tolist()} "
-            f"val_counts={val_counts.tolist()}. Increase --n-samples."
-        )
-
-    return X_train, y_train, X_val, y_val
-
-"""
+    sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    for train_index, test_index in sgkf.split(X, y, groups=dataset_idx):
+        X_train, X_test = X[train_index], X[test_index]
+        y_train, y_test = y[train_index], y[test_index]
+        yield X_train, y_train, X_test, y_test
 
 def train_probe(
     X_train: torch.Tensor,
@@ -355,7 +317,7 @@ def main() -> None:
     print(f"[probe] n_samples   : {len(df)}")
     print(f"[probe] probe_steps : {args.probe_steps}")
     print(f"[probe] seed        : {args.seed}")
-    print(f"[probe] split       : Random")
+    print(f"[probe] split       : Stratified k-fold")
     print()
 
     # --- load encoder ---
@@ -385,37 +347,64 @@ def main() -> None:
     print(f"[probe] extracted in {time.time()-t0:.1f}s.  X.shape={tuple(X.shape)}  y.shape={tuple(y.shape)}")
     print(f"[probe] label counts: {torch.bincount(y, minlength=n_classes).tolist()}")
     print()
-    X_train, y_train, X_val, y_val = random_split(X, y, args.seed)
-    print("[probe] split detail: random 80/20 embedding split")
 
-    print(f"[probe] train n={X_train.size(0)}  counts={torch.bincount(y_train, minlength=n_classes).tolist()}")
-    print(f"[probe] val   n={X_val.size(0)}  counts={torch.bincount(y_val,   minlength=n_classes).tolist()}")
-    print()
+    fold_train_accs, fold_val_accs, fold_cms = [], [], []
 
-    # --- train probe ---
-    print(f"[probe] training linear head (in_dim={cfg.latent_dim}, out_dim={n_classes})...")
-    tr_acc, va_acc, cm = train_probe(
-        X_train, y_train, X_val, y_val,
-        n_classes=len(df['label'].unique()),
-        probe_steps=args.probe_steps,
-        lr=args.probe_lr,
-        batch_size=args.probe_batch_size,
-        weight_decay=args.probe_weight_decay,
-        device=device,
-    )
+    for fold_idx, (X_train, y_train, X_val, y_val) in enumerate(StratifiedGroupKFoldSplit(X, y, list(df['dataset_idx']), args.seed, args.n_splits)):
+        print(f"[probe] fold {fold_idx+1}/{args.n_splits}  (grouped by zarr volume, stratified by label)")
+        print(f"[probe] train n={X_train.size(0)}  counts={torch.bincount(y_train, minlength=n_classes).tolist()}")
+        print(f"[probe] val   n={X_val.size(0)}  counts={torch.bincount(y_val,   minlength=n_classes).tolist()}")
+        print()
 
-    # --- report ---
+        # --- train probe ---
+        print(f"[probe] training linear head (in_dim={cfg.latent_dim}, out_dim={n_classes})...")
+        tr_acc, va_acc, cm = train_probe(
+            X_train, y_train, X_val, y_val,
+            n_classes=n_classes,
+            probe_steps=args.probe_steps,
+            lr=args.probe_lr,
+            batch_size=args.probe_batch_size,
+            weight_decay=args.probe_weight_decay,
+            device=device,
+        )
+        fold_train_accs.append(tr_acc)
+        fold_val_accs.append(va_acc)
+        fold_cms.append(cm)
+
+        # --- fold-specific report ---
+        print()
+        print("=" * 70)
+        print(f"  FOLD {fold_idx+1}/{args.n_splits} RESULT @ training step {ckpt['step']}")
+        print("=" * 70)
+        print(f"  train_acc        : {tr_acc*100:6.2f}%")
+        print(f"  val_acc          : {va_acc*100:6.2f}%   (chance = {chance_pct:.1f}%)")
+        print(f"  val_acc - chance : {(va_acc - 1.0/n_classes)*100:+6.2f} percentage points")
+        print_confusion_matrix(cm, sorted(df['label'].unique()))
+        print()
+        print(f"  interpretation: {interpret(va_acc, n_classes)}")
+        print("=" * 70)
+        print()
+    
+    train_mean = statistics.mean(fold_train_accs)
+    train_std = statistics.stdev(fold_train_accs) if len(fold_train_accs) > 1 else 0.0
+    val_mean = statistics.mean(fold_val_accs)
+    val_std = statistics.stdev(fold_val_accs) if len(fold_val_accs) > 1 else 0.0
+
+    cm_total = torch.stack(fold_cms).sum(dim=0)
+
     print()
-    print("=" * 70)
-    print(f"  RESULT @ training step {ckpt['step']}")
-    print("=" * 70)
-    print(f"  train_acc        : {tr_acc*100:6.2f}%")
-    print(f"  val_acc          : {va_acc*100:6.2f}%   (chance = {chance_pct:.1f}%)")
-    print(f"  val_acc - chance : {(va_acc - 1.0/n_classes)*100:+6.2f} percentage points")
-    print_confusion_matrix(cm, sorted(df['label'].unique()))
+    print("#" * 70)
+    print(f"  CROSS-VALIDATED SUMMARY ({args.n_splits} folds, grouped by zarr volume)")
+    print("#" * 70)
+    print(f"  train_acc : {train_mean*100:6.2f}%  ± {train_std*100:.2f}  (per-fold: {[f'{a*100:.1f}' for a in fold_train_accs]})")
+    print(f"  val_acc   : {val_mean*100:6.2f}%  ± {val_std*100:.2f}  (per-fold: {[f'{a*100:.1f}' for a in fold_val_accs]})")
+    print(f"  val_acc - chance : {(val_mean - 1.0/n_classes)*100:+6.2f} percentage points")
     print()
-    print(f"  interpretation: {interpret(va_acc, n_classes)}")
-    print("=" * 70)
+    print("  pooled confusion matrix (summed across all folds):")
+    print_confusion_matrix(cm_total, sorted(df['label'].unique()))
+    print()
+    print(f"  interpretation: {interpret(val_mean, n_classes)}")
+    print("#" * 70)
 
 
 if __name__ == "__main__":

@@ -45,7 +45,10 @@ def main():
                 "--checkpoint", str(Path("checkpoints") / run / "latest.pt")], 
                 check=True)
             
-            print(f"Latent space processed for run {run}")
+            print(f"[pipeline] Latent space processed for run {run}")
+
+        else:
+            print(f"[pipeline] Skipping latent space processing for run {run}")
 
         run_dirs = [p for p in Path("latent_space").glob(f"{run}*") if p.is_dir()]
         run_dir = max(run_dirs, key=lambda p: p.name) if run_dirs else None
@@ -57,7 +60,9 @@ def main():
                 "--checkpoint", str(Path("checkpoints") / run / "latest.pt")], 
                 check=True)
             
-            print(f"Dataset probe completed for run {run}")
+            print(f"[pipeline] Dataset probe completed for run {run}")
+        else:
+            print(f"[pipeline] Skipped dataset probe for run {run}")
 
         matches = list(run_dir.glob("behavior_probe*")) if run_dir else []
         if not matches or not args.check_evaluated:
@@ -66,7 +71,9 @@ def main():
                 "--checkpoint", str(Path("checkpoints") / run / "latest.pt")], 
                 check=True)
             
-            print(f"Behavior probe completed for run {run}")
+            print(f"[pipeline] Behavior probe completed for run {run}")
+        else:
+            print(f"[pipeline] Skipped behavior probe for run {run}")
 
 
 
