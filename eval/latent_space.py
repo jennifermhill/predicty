@@ -8,12 +8,13 @@ Usage:
     python eval/latent_space.py --config configs/train.yaml --checkpoint checkpoints/latest.pt --n-crops 20000 --method umap
 
 Outputs:
-    <out-dir>/embeddings.npz       raw embeddings, 2D coordinates, labels
-    <out-dir>/metadata.csv         crop metadata for each point
-    <out-dir>/latent_by_*.png      scatter plots colored by metadata fields
+    <out-dir>/embeddings.npz         raw embeddings + 2D coords per method + labels
+    <out-dir>/<method>/metadata.csv  crop metadata + that method's coords per point
+    <out-dir>/<method>/latent_by_*.png  scatter plots colored by metadata fields
 
-UMAP and t-SNE are used when their optional packages are installed. Otherwise
-the script falls back to PCA, which is enough to catch obvious dataset islands.
+PCA always runs so every report has a deterministic, variance-faithful view.
+When umap-learn (or scikit-learn for t-SNE) is installed, that manifold method
+runs too, giving both a umap/ and a pca/ subdirectory side by side.
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint", required=True, help="path to latest.pt/final.pt/step_*.pt")
     p.add_argument("--device", default=None, help="override cfg.device, e.g. cpu or cuda:0")
     p.add_argument("--out-dir", default=None, help="output directory; defaults under latent_space/")
-    p.add_argument("--n-crops", type=int, default=2000, help="number of global crops to embed")
+    p.add_argument("--n-crops", type=int, default=10000, help="number of global crops to embed")
     p.add_argument("--batch-size", type=int, default=None, help="override cfg.batch_size for extraction")
     p.add_argument("--num-workers", type=int, default=None, help="override cfg.num_workers for extraction")
     p.add_argument("--seed", type=int, default=42, help="sampling seed")
@@ -274,21 +275,36 @@ def reduce_for_manifold(X: np.ndarray, pca_dim: int) -> np.ndarray:
     return coords
 
 
-def project_2d(args: argparse.Namespace, X: np.ndarray) -> tuple[np.ndarray, str]:
-    method = args.method
-    if method == "auto":
+def best_available_manifold() -> str:
+    """pick the manifold method to pair with PCA: umap if available, else
+    t-SNE, else nothing extra (pca only)."""
+    try:
+        import umap  # type: ignore  # noqa: F401
+
+        return "umap"
+    except Exception:
         try:
-            import umap  # type: ignore
+            from sklearn.manifold import TSNE  # noqa: F401
 
-            method = "umap"
+            return "tsne"
         except Exception:
-            try:
-                from sklearn.manifold import TSNE  # noqa: F401
+            return "pca"
 
-                method = "tsne"
-            except Exception:
-                method = "pca"
 
+def resolve_methods(method: str) -> list[str]:
+    """which 2D projections to produce. naming a method explicitly produces
+    only that one; the default `auto` pairs the best available manifold method
+    with PCA so a run gets both a manifold view and a deterministic,
+    variance-faithful reference side by side."""
+    if method != "auto":
+        return [method]
+    manifold = best_available_manifold()
+    # dedupe when no manifold lib is installed and auto falls back to pca.
+    return ["pca"] if manifold == "pca" else [manifold, "pca"]
+
+
+def project_single(args: argparse.Namespace, X: np.ndarray, method: str) -> np.ndarray:
+    """project preprocessed embeddings X to 2D with one named method."""
     if method == "umap":
         try:
             import umap  # type: ignore
@@ -302,7 +318,7 @@ def project_2d(args: argparse.Namespace, X: np.ndarray) -> tuple[np.ndarray, str
             metric="euclidean",
             random_state=args.seed,
         )
-        return reducer.fit_transform(X_red), "umap"
+        return reducer.fit_transform(X_red)
 
     if method == "tsne":
         try:
@@ -318,11 +334,14 @@ def project_2d(args: argparse.Namespace, X: np.ndarray) -> tuple[np.ndarray, str
             learning_rate="auto",
             random_state=args.seed,
         )
-        return reducer.fit_transform(X_red), "tsne"
+        return reducer.fit_transform(X_red)
 
-    coords, explained = pca_project(X, 2)
-    print(f"[project] PCA explained variance in 2D: {explained.sum()*100:.1f}%")
-    return coords, "pca"
+    if method == "pca":
+        coords, explained = pca_project(X, 2)
+        print(f"[project] PCA explained variance in 2D: {explained.sum()*100:.1f}%")
+        return coords
+
+    raise ValueError(f"unknown projection method: {method}")
 
 
 def write_metadata_csv(path: Path, rows: list[dict[str, Any]], coords: np.ndarray) -> None:
@@ -334,20 +353,28 @@ def write_metadata_csv(path: Path, rows: list[dict[str, Any]], coords: np.ndarra
             writer.writerow({"coord_x": float(xy[0]), "coord_y": float(xy[1]), **row})
 
 
-def save_npz(path: Path, X: np.ndarray, coords: np.ndarray, rows: list[dict[str, Any]]) -> None:
+def save_npz(
+    path: Path,
+    X: np.ndarray,
+    coords_by_method: dict[str, np.ndarray],
+    rows: list[dict[str, Any]],
+) -> None:
     labels = np.asarray([r["dataset_idx"] for r in rows], dtype=np.int64)
     t = np.asarray([r["t"] for r in rows], dtype=np.int64)
     z = np.asarray([r["z"] for r in rows], dtype=np.int64)
     view_idx = np.asarray([r["view_idx"] for r in rows], dtype=np.int64)
-    np.savez_compressed(
-        path,
-        embeddings=X.astype(np.float32),
-        coords=coords.astype(np.float32),
-        dataset_idx=labels,
-        t=t,
-        z=z,
-        view_idx=view_idx,
-    )
+    arrays: dict[str, np.ndarray] = {
+        "embeddings": X.astype(np.float32),
+        "dataset_idx": labels,
+        "t": t,
+        "z": z,
+        "view_idx": view_idx,
+    }
+    # one coords_<method> array per projection so downstream tools can load
+    # any view from a single file.
+    for method, coords in coords_by_method.items():
+        arrays[f"coords_{method}"] = coords.astype(np.float32)
+    np.savez_compressed(path, **arrays)
 
 
 def plot_categorical(
@@ -495,16 +522,27 @@ def main() -> None:
     print(f"[latent] embedding preprocess: {args.embedding_preprocess}")
     print_embedding_diagnostics(X, X_projected)
 
-    coords, method = project_2d(args, X_projected)
-    print(f"[latent] projection method: {method}  coords={coords.shape}")
+    methods = resolve_methods(args.method)
+    print(f"[latent] projection methods: {', '.join(methods)}")
 
-    write_metadata_csv(out_dir / "metadata.csv", rows, coords)
-    save_npz(out_dir / "embeddings.npz", X, coords, rows)
-    save_plots(coords, rows, out_dir, args.plot_size, method)
-    maybe_print_cluster_metrics(coords, rows)
+    # each method gets its own subdirectory of plots + csv; the shared npz
+    # collects every method's coords next to the raw embeddings.
+    coords_by_method: dict[str, np.ndarray] = {}
+    for method in methods:
+        coords = project_single(args, X_projected, method)
+        print(f"[latent] projection {method}: coords={coords.shape}")
+        coords_by_method[method] = coords
+        method_dir = out_dir / method
+        method_dir.mkdir(parents=True, exist_ok=True)
+        write_metadata_csv(method_dir / "metadata.csv", rows, coords)
+        save_plots(coords, rows, method_dir, args.plot_size, method)
+        print(f"[metrics] {method} projection:")
+        maybe_print_cluster_metrics(coords, rows)
+
+    save_npz(out_dir / "embeddings.npz", X, coords_by_method, rows)
 
     print("[latent] wrote:")
-    for path in sorted(out_dir.iterdir()):
+    for path in sorted(p for p in out_dir.rglob("*") if p.is_file()):
         print(f"  - {path}")
 
 
