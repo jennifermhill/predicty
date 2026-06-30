@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint", required=True, help="path to a *.pt file (latest.pt, final.pt, step_*.pt)")
     p.add_argument("--device", default=None, help="override cfg.device (e.g. 'cpu')")
     p.add_argument(
-        "--n-samples", type=int, default=2000,
+        "--n-samples", type=int, default=5000,
         help="number of t1 globals to embed before training the linear head",
     )
     p.add_argument(

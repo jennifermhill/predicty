@@ -218,6 +218,13 @@ class Config:
     checkpoint_dir: str = "checkpoints"
     log_dir: str = "logs"
 
+    # launch a tensorboard server alongside training so a run is viewable
+    # without a separate `tensorboard --logdir ...` invocation. it serves the
+    # root log_dir (all runs), binds all interfaces so it's reachable from the
+    # compute node, and is torn down when training exits.
+    tensorboard_enabled: bool = True
+    tensorboard_port: int = 6006
+
     @classmethod
     def from_yaml(cls, path: str | Path) -> "Config":
         """build a Config from a yaml file.

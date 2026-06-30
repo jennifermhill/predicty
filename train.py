@@ -12,6 +12,10 @@ logs go to `cfg.log_dir` (tensorboard format). view with:
 from __future__ import annotations
 
 import argparse
+import atexit
+import shutil
+import socket
+import subprocess
 import time
 from pathlib import Path
 
@@ -62,16 +66,87 @@ def build_dataset(cfg: Config):
     return ZarrCellDataset(cfg)
 
 
+def find_free_port(start: int, attempts: int = 50) -> int | None:
+    """first free TCP port at or above `start` on this host.
+
+    lets concurrent runs on the same node each get their own tensorboard
+    instead of the second one colliding on the configured port. returns None
+    if nothing in the scanned range is free.
+    """
+    for port in range(start, start + attempts):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            # SO_REUSEADDR so a recently-closed socket in TIME_WAIT doesn't
+            # make a usable port look taken.
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("", port))
+                return port
+            except OSError:
+                continue
+    return None
+
+
+def launch_tensorboard(log_dir: str, port: int) -> subprocess.Popen | None:
+    """start a tensorboard server pointed at log_dir and tear it down on exit.
+
+    runs as a child process so a missing binary or a busy port can never take
+    down training. returns the handle (or None if it couldn't start).
+    """
+    tb_bin = shutil.which("tensorboard")
+    if tb_bin is None:
+        print("[train] tensorboard not found on PATH, skipping auto-launch")
+        return None
+
+    # walk up from the configured port so a second run on the same node lands
+    # on a free port instead of failing to bind.
+    free_port = find_free_port(port)
+    if free_port is None:
+        print(
+            f"[train] no free port in [{port}, {port + 50}), skipping tensorboard"
+        )
+        return None
+    if free_port != port:
+        print(f"[train] port {port} busy, tensorboard using {free_port} instead")
+
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    try:
+        proc = subprocess.Popen(
+            [tb_bin, "--logdir", log_dir, "--port", str(free_port), "--bind_all"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as e:
+        print(f"[train] failed to launch tensorboard: {e}")
+        return None
+
+    # terminate the server when training exits so it doesn't outlive the job
+    # and hold the port.
+    atexit.register(lambda: proc.terminate())
+    host = socket.gethostname()
+    print(
+        f"[train] tensorboard serving {log_dir} at "
+        f"http://{host}:{free_port} (pid {proc.pid})"
+    )
+    return proc
+
+
 def main() -> None:
     args = parse_args()
     cfg = Config.from_yaml(args.config)
     if args.device:
         cfg.device = args.device
+    # capture the root log dir before namespacing so tensorboard serves every
+    # run (matches the manual `tensorboard --logdir logs`), not just this one.
+    tensorboard_root = cfg.log_dir
     # namespace io under the run name so multiple concurrent runs keep their
     # checkpoints and tensorboard logs separate instead of overwriting.
     if args.run_name:
         cfg.checkpoint_dir = str(Path(cfg.checkpoint_dir) / args.run_name)
         cfg.log_dir = str(Path(cfg.log_dir) / args.run_name)
+
+    # serve tensorboard alongside the run unless disabled in the config.
+    if cfg.tensorboard_enabled:
+        launch_tensorboard(tensorboard_root, cfg.tensorboard_port)
 
     device = torch.device(cfg.device)
     # amp is only supported on cuda. silently disable on cpu.
