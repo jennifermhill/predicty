@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint", required=True, help="path to latest.pt/final.pt/step_*.pt")
     p.add_argument("--device", default=None, help="override cfg.device, e.g. cpu or cuda:0")
     p.add_argument("--out-dir", default=None, help="output directory; defaults under latent_space/")
-    p.add_argument("--n-crops", type=int, default=5000, help="number of global crops to embed")
+    p.add_argument("--n-crops", type=int, default=2000, help="number of global crops to embed")
     p.add_argument("--batch-size", type=int, default=None, help="override cfg.batch_size for extraction")
     p.add_argument("--num-workers", type=int, default=None, help="override cfg.num_workers for extraction")
     p.add_argument("--seed", type=int, default=42, help="sampling seed")
@@ -466,7 +466,7 @@ def main() -> None:
     out_dir = (
         Path(args.out_dir)
         if args.out_dir
-        else Path("latent_space") / f"{Path(args.checkpoint).stem}_{time.strftime('%Y%m%d_%H%M%S')}"
+        else Path("latent_space") / f"{Path(args.checkpoint).parent.name}_{time.strftime('%Y%m%d_%H%M%S')}"
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
