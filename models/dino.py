@@ -360,7 +360,7 @@ if __name__ == "__main__":
         out["teacher_globals"],
         wrapper.center,
         out["B"], out["n_g"], out["n_l"],
-        cfg.teacher_temp, cfg.student_temp,
+        cfg.teacher_temp_end, cfg.student_temp,
     )
     loss = loss + out["mae"]["loss"] + F.cross_entropy(
         out["dataset_logits"], out["dataset_targets"]

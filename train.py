@@ -172,8 +172,6 @@ def main() -> None:
     loader_iter = iter(loader)
     t_last_log = time.time()
 
-    teach_temp = cfg.teacher_temp_start
-
     step = start_step
     for step in range(start_step, cfg.total_steps):
         # the IterableDataset is infinite, but guard against StopIteration anyway
@@ -203,6 +201,10 @@ def main() -> None:
         lr = lr_schedule(step, cfg.total_steps, cfg.base_lr, cfg.warmup_frac)
         for g in optimizer.param_groups:
             g["lr"] = lr
+        
+        teach_temp = teacher_temperature_schedule(
+            step, cfg.total_steps, cfg.teacher_temp_start, cfg.teacher_temp_end, cfg.temp_warmup_frac
+        )
 
         # forward + loss under autocast (fp16 ops on cuda).
         with autocast(device.type, dtype=torch.float16, enabled=use_amp):
@@ -243,9 +245,6 @@ def main() -> None:
         m = ema_momentum_schedule(
             step, cfg.total_steps, cfg.ema_momentum_start, cfg.ema_momentum_end
         )
-        teach_temp = teacher_temperature_schedule(
-            step, cfg.teacher_temp_start, cfg.teacher_temp_end, cfg.teacher_temp_warmup_steps
-        )
         model.update_teacher(m)
         # center is updated on the raw teacher logits (float32 for stability).
         model.update_center(out["teacher_globals"].float(), cfg.center_momentum)
@@ -256,7 +255,7 @@ def main() -> None:
                 # teacher entropy: high at init (uniform softmax), should
                 # decrease then stabilize. crashing to 0 -> collapsed teacher.
                 t_probs = (
-                    (out["teacher_globals"] - model.center) / t
+                    (out["teacher_globals"] - model.center) / teach_temp
                 ).softmax(dim=-1)
                 entropy = -(t_probs * t_probs.clamp(min=1e-8).log()).sum(dim=-1).mean()
                 # embedding variance: stashed from the last student forward.
@@ -290,6 +289,7 @@ def main() -> None:
             writer.add_scalar("loss/dino", dino.item(), step)
             writer.add_scalar("lr", lr, step)
             writer.add_scalar("ema_momentum", m, step)
+            writer.add_scalar("teacher_temp", teach_temp, step)
             writer.add_scalar("grad_norm", grad_norm.item(), step)
             writer.add_scalar("collapse/teacher_entropy", entropy.item(), step)
             writer.add_scalar("collapse/embedding_var", emb_var.item(), step)
@@ -304,6 +304,7 @@ def main() -> None:
 
             msg = (
                 f"step {step:06d}  loss={loss.item():.4f}  lr={lr:.2e}  "
+                f"teach_temp={teach_temp:.4f}  "
                 f"ent={entropy.item():.3f}  emb_var={emb_var.item():.4f}  "
                 f"center_norm={center_norm.item():.3f}  {steps_per_sec:.2f} step/s"
             )

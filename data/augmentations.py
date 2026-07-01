@@ -119,8 +119,4 @@ def build_augmentations(cfg: Config) -> Callable[[Tensor], Tensor]:
         ordered.append(GaussianBlur(cfg.aug_blur))
     if cfg.aug_percrop_norm.enabled:
         ordered.append(PerCropNormalize(cfg.aug_percrop_norm))
-    if cfg.aug_flip.enabled:
-        ordered.append(RandomFlip2D(cfg.aug_flip))
-    if cfg.aug_rotation.enabled:
-        ordered.append(Rotation2D(cfg.aug_rotation))
     return _Pipeline(ordered)
