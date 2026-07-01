@@ -19,6 +19,75 @@ def _trunc_normal_(x: torch.Tensor, std: float = 0.02) -> None:
     nn.init.trunc_normal_(x, std=std, a=-2 * std, b=2 * std)
 
 
+def make_random_mask(
+    batch_size: int, n_patches: int, mask_ratio: float, device: torch.device
+) -> torch.Tensor:
+    """Generate random binary masks for patchified volumes.
+
+    Args:
+        batch_size: Number of masks to generate.
+        n_patches: Total number of patches in a volume.
+        mask_ratio: Fraction of patches to mask.
+        device: Device to create mask on.
+
+    Returns:
+        Boolean tensor of shape (batch_size, n_patches) where True indicates masked patches.
+    """
+    if not 0.0 < mask_ratio < 1.0:
+        raise ValueError(f"mask_ratio must be in (0, 1); got {mask_ratio}")
+
+    n_mask = max(1, min(n_patches - 1, int(round(n_patches * mask_ratio))))
+    noise = torch.rand(batch_size, n_patches, device=device)
+    ids_shuffle = noise.argsort(dim=1)
+    mask = torch.zeros(batch_size, n_patches, dtype=torch.bool, device=device)
+    mask.scatter_(1, ids_shuffle[:, :n_mask], True)
+    return mask
+
+
+def apply_mask_to_volume(
+    x: torch.Tensor,
+    mask: torch.Tensor,
+    grid_shape: tuple[int, int, int],
+    patch_shape: tuple[int, int, int],
+) -> torch.Tensor:
+    """Apply patch-level masking to a batch of 3D volumes.
+
+    Args:
+        x: Input tensor of shape (B, 1, Z, H, W).
+        mask: Binary mask of shape (B, n_patches) where True = masked.
+        grid_shape: (n_z, n_h, n_w) — number of patches in each dimension.
+        patch_shape: (pz, ph, pw) — patch size in each dimension.
+
+    Returns:
+        Masked volume with same shape as x (masked patches set to 0).
+    """
+    n, c, z, h, w = x.shape
+    pz, ph, pw = patch_shape
+    gz, gh, gw = grid_shape
+    n_patches = math.prod(grid_shape)
+    patch_dim = pz * ph * pw
+
+    if c != 1:
+        raise ValueError(f"expected single-channel input; got {c} channels")
+    if (z, h, w) != tuple(int(g * p) for g, p in zip(grid_shape, patch_shape)):
+        raise ValueError(
+            f"volume shape {(z, h, w)} does not match grid {grid_shape} * patch {patch_shape}"
+        )
+
+    # patchify
+    patches = x.reshape(n, c, gz, pz, gh, ph, gw, pw)
+    patches = patches.permute(0, 2, 4, 6, 1, 3, 5, 7)
+    patches = patches.reshape(n, n_patches, patch_dim)
+
+    # mask
+    patches = patches.masked_fill(mask.unsqueeze(-1), 0.0)
+
+    # unpatchify
+    patches = patches.reshape(n, gz, gh, gw, c, pz, ph, pw)
+    patches = patches.permute(0, 4, 1, 5, 2, 6, 3, 7)
+    return patches.reshape(n, c, z, h, w)
+
+
 class MaskedPatchAutoencoder(nn.Module):
     """Patch-level masked reconstruction decoder for 3D crop tensors.
 
@@ -118,17 +187,10 @@ class MaskedPatchAutoencoder(nn.Module):
         }
 
     def random_mask(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        n_mask = max(1, min(self.n_patches - 1, int(round(self.n_patches * self.mask_ratio))))
-        noise = torch.rand(batch_size, self.n_patches, device=device)
-        ids_shuffle = noise.argsort(dim=1)
-        mask = torch.zeros(batch_size, self.n_patches, dtype=torch.bool, device=device)
-        mask.scatter_(1, ids_shuffle[:, :n_mask], True)
-        return mask
+        return make_random_mask(batch_size, self.n_patches, self.mask_ratio, device)
 
     def apply_patch_mask(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        patches = self.patchify(x)
-        patches = patches.masked_fill(mask.unsqueeze(-1), 0.0)
-        return self.unpatchify(patches)
+        return apply_mask_to_volume(x, mask, self.grid_shape, self.patch_shape)
 
     def patchify(self, x: torch.Tensor) -> torch.Tensor:
         n, c, z, h, w = x.shape

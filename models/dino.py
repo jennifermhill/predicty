@@ -114,10 +114,13 @@ class StudentNet(nn.Module):
     """encoder + projector. stashes the last encoder features (no grad) so the
     training loop can compute embedding variance without a redundant forward."""
 
-    def __init__(self, encoder: nn.Module, projector: nn.Module) -> None:
+    def __init__(
+        self, encoder: nn.Module, projector: nn.Module, masking_head: Optional[nn.Module] = None
+    ) -> None:
         super().__init__()
         self.encoder = encoder
         self.projector = projector
+        self.masking_head = masking_head
         self.last_features: Optional[torch.Tensor] = None
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
@@ -151,7 +154,16 @@ class DINOWrapper(nn.Module):
             bottleneck_dim=cfg.projector_bottleneck,
             out_dim=cfg.projector_k,
         )
-        self.student = StudentNet(student_enc, student_proj)
+        student_mask_head = None
+        self.ibot_enabled = getattr(cfg, "ibot_enabled", False)
+        if self.ibot_enabled:
+            student_mask_head = DINOHead(
+                in_dim=cfg.latent_dim,
+                hidden_dim=cfg.projector_hidden,
+                bottleneck_dim=cfg.projector_bottleneck,
+                out_dim=cfg.projector_k,
+            )
+        self.student = StudentNet(student_enc, student_proj, student_mask_head)
 
         if n_datasets is None:
             n_datasets = len(cfg.zarr_paths) if cfg.zarr_paths else 1
@@ -194,7 +206,30 @@ class DINOWrapper(nn.Module):
         # buffer so it moves with `.to(device)` and is saved in checkpoints.
         self.register_buffer("center", torch.zeros(cfg.projector_k))
 
+        if self.ibot_enabled:
+            from models.mae import make_random_mask, apply_mask_to_volume
+
+            self.ibot_mask_ratio = float(getattr(cfg, "ibot_mask_ratio", 0.75))
+            self.ibot_patch_z = int(getattr(cfg, "ibot_patch_z", cfg.mae_patch_z))
+            self.ibot_patch_size = int(getattr(cfg, "ibot_patch_size", cfg.mae_patch_size))
+            self.ibot_grid_shape = (
+                cfg.z_thickness // self.ibot_patch_z,
+                cfg.global_crop_size // self.ibot_patch_size,
+                cfg.global_crop_size // self.ibot_patch_size,
+            )
+            self.ibot_n_patches = (
+                self.ibot_grid_shape[0] * self.ibot_grid_shape[1] * self.ibot_grid_shape[2]
+            )
+            self.ibot_patch_shape = (
+                self.ibot_patch_z,
+                self.ibot_patch_size,
+                self.ibot_patch_size,
+            )
+            self.register_buffer("ibot_center", torch.zeros(cfg.projector_k))
+
     def forward(self, batch: dict) -> dict:
+        from models.mae import make_random_mask, apply_mask_to_volume
+
         globals_ = batch["globals"]  # (B, 2, 1, Z, H, W)
         locals_ = batch.get("locals")  # (B, n_l, 1, Z, H, W) or None
         B = globals_.shape[0]
@@ -237,13 +272,34 @@ class DINOWrapper(nn.Module):
         if self.mae_decoder is not None:
             mae_out = self.mae_decoder(g_flat, self.student.encoder)
 
+        # iBOT student: masked globals through masking head
+        s_g_ibot = None
+        ibot_mask = None
+        if self.ibot_enabled:
+            ibot_mask = make_random_mask(
+                B * n_g, self.ibot_n_patches, self.ibot_mask_ratio, g_flat.device
+            )
+            g_flat_masked = apply_mask_to_volume(
+                g_flat, ibot_mask, self.ibot_grid_shape, self.ibot_patch_shape
+            )
+            s_g_ibot_feat = self.student.encode(g_flat_masked)
+            s_g_ibot = self.student.masking_head(s_g_ibot_feat)
+
         with torch.no_grad():
-            t_g = self.teacher(g_flat)
+            # teacher: split encode and project so masking head can reuse encoding
+            t_g_feat = self.teacher.encode(g_flat)
+            t_g = self.teacher.project(t_g_feat)
+            t_g_ibot = None
+            if self.ibot_enabled:
+                t_g_ibot = self.teacher.masking_head(t_g_feat)
 
         return {
             "student_globals": s_g,
             "student_locals": s_l,
             "teacher_globals": t_g,
+            "student_masking_globals": s_g_ibot,
+            "teacher_masking_globals": t_g_ibot,
+            "ibot_mask": ibot_mask,
             "B": B,
             "n_g": n_g,
             "n_l": n_l,
@@ -266,6 +322,16 @@ class DINOWrapper(nn.Module):
         self.center.mul_(momentum).add_(
             teacher_logits.mean(dim=0), alpha=1.0 - momentum
         )
+
+    @torch.no_grad()
+    def update_ibot_center(
+        self, teacher_masking_logits: torch.Tensor, momentum: float = 0.9
+    ) -> None:
+        """EMA the iBOT centering buffer toward this batch's teacher mean."""
+        if self.ibot_enabled:
+            self.ibot_center.mul_(momentum).add_(
+                teacher_masking_logits.mean(dim=0), alpha=1.0 - momentum
+            )
 
 
 def dino_loss(
@@ -313,6 +379,21 @@ def dino_loss(
     return total / max(n_terms, 1)
 
 
+def ibot_loss(
+    student_ibot: torch.Tensor,
+    teacher_ibot: torch.Tensor,
+    ibot_center: torch.Tensor,
+    teacher_temp: float = 0.04,
+    student_temp: float = 0.1,
+) -> torch.Tensor:
+    """cross-entropy for iBOT masking objective (same-view pairs only)."""
+    # teacher: center, sharpen, softmax, detach
+    t = ((teacher_ibot - ibot_center) / teacher_temp).softmax(dim=-1).detach()
+    # student: sharpen, log-softmax
+    s = (student_ibot / student_temp).log_softmax(dim=-1)
+    return -(t * s).sum(dim=-1).mean()
+
+
 if __name__ == "__main__":
     # smoke test with random tensors. no zarr required.
     # run from project root: python -m models.dino
@@ -324,6 +405,7 @@ if __name__ == "__main__":
     cfg.local_crop_size = 48
     cfg.dataset_adversary_enabled = True
     cfg.mae_enabled = True
+    cfg.ibot_enabled = True
 
     wrapper = DINOWrapper(cfg, n_datasets=3)
     wrapper.eval()
@@ -353,6 +435,15 @@ if __name__ == "__main__":
         f"(expected ({B * (2 + 6)}, 3))"
     )
     print(f"mae_loss: {out['mae']['loss'].item():.4f}")
+    if out["student_masking_globals"] is not None:
+        print(
+            f"student_masking_globals: {tuple(out['student_masking_globals'].shape)}  "
+            f"(expected ({B * 2}, {cfg.projector_k}))"
+        )
+        print(
+            f"teacher_masking_globals: {tuple(out['teacher_masking_globals'].shape)}  "
+            f"(expected ({B * 2}, {cfg.projector_k}))"
+        )
 
     loss = dino_loss(
         out["student_globals"],
@@ -365,6 +456,17 @@ if __name__ == "__main__":
     loss = loss + out["mae"]["loss"] + F.cross_entropy(
         out["dataset_logits"], out["dataset_targets"]
     )
+    if out["student_masking_globals"] is not None:
+        ibot_loss_val = ibot_loss(
+            out["student_masking_globals"],
+            out["teacher_masking_globals"],
+            wrapper.ibot_center,
+            cfg.teacher_temp,
+            cfg.student_temp,
+        )
+        loss = loss + ibot_loss_val
+        print(f"ibot_loss: {ibot_loss_val.item():.4f}")
+
     print(f"loss: {loss.item():.4f}")
     assert torch.isfinite(loss), "loss is not finite"
 

@@ -194,6 +194,19 @@ class Config:
     mae_norm_pix_loss: bool = True
 
     # ------------------------------------------------------------------
+    # iBOT masking-based self-supervised objective
+    # ------------------------------------------------------------------
+    # Distillation-based masking objective: student predicts teacher's soft
+    # token distribution on masked global crops. Independent of MAE, both can
+    # be active simultaneously. Uses same teacher/student architecture and
+    # centering mechanism as DINO but with masked input and cross-entropy loss.
+    ibot_enabled: bool = False
+    ibot_weight: float = 1.0
+    ibot_mask_ratio: float = 0.75
+    ibot_patch_z: int = 2
+    ibot_patch_size: int = 16
+
+    # ------------------------------------------------------------------
     # optimizer / schedule
     # ------------------------------------------------------------------
     base_lr: float = 2.5e-4
