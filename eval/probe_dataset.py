@@ -351,6 +351,9 @@ def interpret(val_acc: float, n_classes: int) -> str:
 
 def main() -> None:
     args = parse_args()
+    log_path = setup_logging(args.checkpoint)
+    print(f"[probe] logging to  : {log_path}")
+
     cfg = Config.from_yaml(args.config)
 
     device = torch.device(args.device or cfg.device)

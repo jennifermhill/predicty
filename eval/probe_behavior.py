@@ -120,6 +120,7 @@ def extract_embeddings(
     ds = load_dataset(cfg)
     n_samples = len(annotations_df)
     labels_list = sorted(list(annotations_df['label'].unique()))
+    label_to_idx = {label: idx for idx, label in enumerate(labels_list)}
 
     encoder.eval()
     embeddings: list[torch.Tensor] = []
@@ -129,7 +130,7 @@ def extract_embeddings(
     t0 = time.time()
     print_every = max(1, n_samples // (cfg.batch_size * 10))
     iters = 0
-    
+
     for i in range(len(cfg.zarr_paths)):
         zarr_df = annotations_df[annotations_df['zarr_path'] == cfg.zarr_paths[i]]
         src = ds.children[i]
@@ -137,7 +138,7 @@ def extract_embeddings(
             # globals shape: (B, 2, 1, Z, H, W). index 0 is t1.
             batch = src._annotation_tensor(row.t1, row.t2, row.z, row.global_x, row.global_y)
             g_t1 = batch["globals"][0].to(device, non_blocking=True).unsqueeze(0)
-            label_idx = torch.tensor([labels_list.index(row.label)])
+            label_idx = torch.tensor([label_to_idx[row.label]])
             meta = batch["meta"]
 
             emb = encoder(g_t1)  # (B, latent_dim)
@@ -179,7 +180,7 @@ def random_split(
     return X[:n_train], y[:n_train], X[n_train:], y[n_train:]
 
 
-def StratifiedGroupKFoldSplit(
+def stratified_group_kfold_split(
     X: torch.Tensor,
     y: torch.Tensor,
     dataset_idx: list,

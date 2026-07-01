@@ -170,6 +170,16 @@ aug_percrop_norm:
   enabled: true
   p: 1.0
 
+# random horizontal/vertical flips. semantically preserving for cell behavior.
+aug_flip:
+  enabled: false
+  p: 0.5
+
+# random 90-degree rotations. semantically preserving for cell behavior.
+aug_rotation:
+  enabled: false
+  p: 0.5
+
 # ---------------------------------------------------------------------------
 # runtime
 # ---------------------------------------------------------------------------

@@ -131,6 +131,12 @@ class Config:
     aug_percrop_norm: AugCfg = field(default_factory=lambda: AugCfg(
         enabled=True, p=1.0,
     ))
+    aug_flip: AugCfg = field(default_factory=lambda: AugCfg(
+        enabled=False, p=0.5,
+    ))
+    aug_rotation: AugCfg = field(default_factory=lambda: AugCfg(
+        enabled=False, p=0.5,
+    ))
 
     # runtime
     max_intensity: float = 10000.0

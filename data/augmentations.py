@@ -88,6 +88,30 @@ class GaussianBlur(_Aug):
         return gaussian_blur(x, kernel_size=[k, k], sigma=[sigma, sigma])
 
 
+class RandomFlip2D(_Aug):
+    """random horizontal or vertical flip of spatial dimensions (H, W)."""
+
+    def _apply(self, x: Tensor) -> Tensor:
+        # x is [1, H, W] or [1, Z, H, W]
+        dim = 3 if x.ndim == 4 else 2  # flip H dimension
+        if torch.rand(()) < 0.5:
+            x = torch.flip(x, dims=[dim])
+        else:  # flip W dimension
+            x = torch.flip(x, dims=[dim + 1])
+        return x
+
+
+class Rotation2D(_Aug):
+    """random 90-degree rotation of spatial dimensions (H, W)."""
+
+    def _apply(self, x: Tensor) -> Tensor:
+        # x is [1, H, W] or [1, Z, H, W]
+        # rotate by 90, 180, or 270 degrees
+        k = torch.randint(1, 4, ()).item()  # 1, 2, or 3 (90, 180, 270 deg)
+        spatial_dims = (2, 3) if x.ndim == 4 else (1, 2)
+        return torch.rot90(x, k=k, dims=spatial_dims)
+
+
 class PerCropNormalize(_Aug):
     """normalize one crop by its own mean and std."""
 

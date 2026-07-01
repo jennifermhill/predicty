@@ -501,17 +501,11 @@ class ZarrCellDataset(IterableDataset):
             else:  # high edge (near z_max)
                 z = rng.randrange(z_start_max - band, z_start_max + 1)
         else:
-            if cfg.z_edge_bias > 0.0 and rng.random() < cfg.z_edge_bias:
-                band = int(round(cfg.z_edge_band_frac * (z_start_max - self.z_min)))
-                if rng.random() < 0.5:  # low edge (near z_min)
-                    z = rng.randrange(self.z_min, self.z_min + band + 1)
-                else:  # high edge (near z_max)
-                    z = rng.randrange(z_start_max - band, z_start_max + 1)
-            else:
-                z = rng.randrange(self.z_min, z_start_max + 1)
-            t1 = rng.randrange(self.t1_min, self.t1_max)
-            sign = 1 if cfg.temporal_direction == "forward" else -1
-            t2 = t1 + sign * self.frame_gap
+            z = rng.randrange(self.z_min, z_start_max + 1)
+
+        t1 = rng.randrange(self.t1_min, self.t1_max)
+        sign = 1 if cfg.temporal_direction == "forward" else -1
+        t2 = t1 + sign * self.frame_gap
 
         # gate against the per-(t1, z_slab) baseline. only one (y, x) is drawn
         # since both globals share the spatial offset; the gate runs once.
@@ -620,6 +614,36 @@ class ZarrCellDataset(IterableDataset):
             sample["meta"]["local_y"] = torch.tensor([y for y, _ in local_offsets])
             sample["meta"]["local_x"] = torch.tensor([x for _, x in local_offsets])
         return sample
+
+    def _annotation_tensor(
+        self, t1: int, t2: int, z: int, global_x: int, global_y: int
+    ) -> dict[str, Any]:
+        """load a global crop pair given annotation coordinates (no augmentation)."""
+        cfg = self.cfg
+        g_size = cfg.global_crop_size
+        g_z = cfg.z_thickness
+
+        raw_t1 = self._load_crop_raw(t1, z, global_y, global_x, g_size, g_size)
+        raw_t2 = self._load_crop_raw(t2, z, global_y, global_x, g_size, g_size)
+        globals_tensor = torch.stack([
+            self._to_tensor(raw_t1),
+            self._to_tensor(raw_t2),
+        ])
+
+        return {
+            "globals": globals_tensor,
+            "meta": {
+                "t1": t1,
+                "t2": t2,
+                "z": z,
+                "z_end": z + g_z,
+                "global_y": global_y,
+                "global_x": global_x,
+                "frame_y": self.Y,
+                "frame_x": self.X,
+                "spatial_region_idx": 0,
+            },
+        }
 
     def _get_frame_mean(self, t: int, z: int) -> float:
         """mean intensity over the active z slab [z, z+z_thickness) at frame t.
