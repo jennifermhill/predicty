@@ -36,6 +36,7 @@ from train_utils import (
     get_param_groups,
     load_checkpoint,
     lr_schedule,
+    teacher_temperature_schedule,
     save_checkpoint,
 )
 
@@ -254,6 +255,8 @@ def main() -> None:
     loader_iter = iter(loader)
     t_last_log = time.time()
 
+    teach_temp = cfg.teacher_temp_start
+
     step = start_step
     for step in range(start_step, cfg.total_steps):
         # the IterableDataset is infinite, but guard against StopIteration anyway
@@ -293,7 +296,7 @@ def main() -> None:
                 out["teacher_globals"],
                 model.center,
                 out["B"], out["n_g"], out["n_l"],
-                teacher_temp=cfg.teacher_temp,
+                teacher_temp=teach_temp,
                 student_temp=cfg.student_temp,
             )
             dataset_loss = None
@@ -330,9 +333,12 @@ def main() -> None:
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
 
-        # EMA + center updates after the optimizer step.
+        # EMA + center + teacher_temp updates after the optimizer step.
         m = ema_momentum_schedule(
             step, cfg.total_steps, cfg.ema_momentum_start, cfg.ema_momentum_end
+        )
+        teach_temp = teacher_temperature_schedule(
+            step, cfg.teacher_temp_start, cfg.teacher_temp_end, cfg.teacher_temp_warmup_steps
         )
         model.update_teacher(m)
         # center is updated on the raw teacher logits (float32 for stability).
@@ -346,7 +352,7 @@ def main() -> None:
                 # teacher entropy: high at init (uniform softmax), should
                 # decrease then stabilize. crashing to 0 -> collapsed teacher.
                 t_probs = (
-                    (out["teacher_globals"] - model.center) / cfg.teacher_temp
+                    (out["teacher_globals"] - model.center) / t
                 ).softmax(dim=-1)
                 entropy = -(t_probs * t_probs.clamp(min=1e-8).log()).sum(dim=-1).mean()
                 # embedding variance: stashed from the last student forward.

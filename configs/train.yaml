@@ -23,7 +23,7 @@ zarr_paths:
   - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test44_2024-01-17/2024-01-17_ERH_23hr_ERH Red FarRed.zarr
   - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test45_2024-01-30/20240130_ERH_mixin45_wellC2_19.5hr_ERH Red FarRed.zarr
   - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test49_2024-02-08/mixin49_wellB2_24hr_ERH Red FarRed.zarr
-  # - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test52_2024-02-21/ERH_2024-02-20_mixin52_22hr_ERH Red FarRed.zarr
+  - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test52_2024-02-21/ERH_2024-02-20_mixin52_22hr_ERH Red FarRed.zarr
   - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test65_2024-04-16/NC28.1_overnight_day1/2024-04-16_ERH_mixin65_plate1_NC28.1_overnight_ERH Red FarRed.zarr
 
 # balanced batches contain floor(batch_size / dataset_count) samples from
@@ -109,8 +109,8 @@ z_frac_min: 0.0
 z_abs_min: null
 z_abs_max: null
 
-# bias the global z slab toward the lowest/highest band of valid z-start
-# positions (low/high edge chosen with equal probability). 0.0 = uniform.
+# Always sample the global z slab from the lowest or highest 5% of valid
+# z-start positions (low/high edge chosen with equal probability).
 z_edge_bias: 0.85
 z_edge_band_frac: 0.1
 
@@ -204,7 +204,9 @@ projector_k: 2048
 # student_temp:  softmax temperature for the student. asymmetry drives learning.
 # ema_momentum_*: cosine schedule for teacher EMA. starts at 0.996, ends at 1.0.
 # center_momentum: EMA on the centering buffer. prevents prototype collapse.
-teacher_temp: 0.07
+teacher_temp_start: 0.04
+teacher_temp_end: 0.07
+teacher_temp_warmup_steps: 30
 student_temp: 0.1
 ema_momentum_start: 0.996
 ema_momentum_end: 1.0

@@ -157,7 +157,9 @@ class Config:
     # DINO
     # ------------------------------------------------------------------
     # teacher softmax temperature (sharp). lower -> more confident targets.
-    teacher_temp: float = 0.04
+    teacher_temp_start: float = 0.04
+    teacher_temp_end: float = 0.07
+    teacher_temp_warmup_steps: int = 30
     # student softmax temperature (softer). asymmetry vs teacher drives learning.
     student_temp: float = 0.1
     # EMA momentum schedule for teacher weights. cosine from start to end.

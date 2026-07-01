@@ -76,6 +76,32 @@ def parse_args() -> argparse.Namespace:
     )
     return p.parse_args()
 
+def setup_logging(checkpoint_path: str) -> Path:
+    """derive a log directory from the checkpoint's parent folder name and
+    tee all stdout to both the terminal and a log file inside it."""
+    run_name = Path(checkpoint_path).parent.name
+    candidates = [p for p in Path("latent_space").glob(f"{run_name}_*") if p.is_dir()]
+
+    if candidates:
+        log_dir = max(candidates, key=lambda p: p.name)
+    else:
+        log_dir = Path("latent_space") / f"{run_name}_{time.strftime('%Y%m%d_%H%M%S')}"
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = log_dir / f"dataset_probe_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    log_file = open(log_path, "a")
+
+    class Tee:
+        def write(self, msg):
+            sys.__stdout__.write(msg)
+            log_file.write(msg)
+            log_file.flush()
+        def flush(self):
+            sys.__stdout__.flush()
+            log_file.flush()
+
+    sys.stdout = Tee()
+    return log_path
 
 def disable_augmentations(cfg: Config) -> None:
     """turn off stochastic augs so embeddings are deterministic given the
@@ -108,7 +134,6 @@ def extract_embeddings(
         batch_size=cfg.batch_size,
         num_workers=cfg.num_workers,
         worker_init_fn=worker_init_fn,
-        persistent_workers=cfg.num_workers > 0,
         pin_memory=device.type == "cuda",
         # spawn (not fork) so workers start fresh. forking after the parent has
         # initialized cuda + the zarr/blosc threadpool deadlocks on first read.

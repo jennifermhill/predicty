@@ -501,10 +501,17 @@ class ZarrCellDataset(IterableDataset):
             else:  # high edge (near z_max)
                 z = rng.randrange(z_start_max - band, z_start_max + 1)
         else:
-            z = rng.randrange(self.z_min, z_start_max + 1)
-        t1 = rng.randrange(self.t1_min, self.t1_max)
-        sign = 1 if cfg.temporal_direction == "forward" else -1
-        t2 = t1 + sign * self.frame_gap
+            if cfg.z_edge_bias > 0.0 and rng.random() < cfg.z_edge_bias:
+                band = int(round(cfg.z_edge_band_frac * (z_start_max - self.z_min)))
+                if rng.random() < 0.5:  # low edge (near z_min)
+                    z = rng.randrange(self.z_min, self.z_min + band + 1)
+                else:  # high edge (near z_max)
+                    z = rng.randrange(z_start_max - band, z_start_max + 1)
+            else:
+                z = rng.randrange(self.z_min, z_start_max + 1)
+            t1 = rng.randrange(self.t1_min, self.t1_max)
+            sign = 1 if cfg.temporal_direction == "forward" else -1
+            t2 = t1 + sign * self.frame_gap
 
         # gate against the per-(t1, z_slab) baseline. only one (y, x) is drawn
         # since both globals share the spatial offset; the gate runs once.
