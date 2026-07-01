@@ -104,6 +104,14 @@ class Config:
     z_abs_min: int | None = None
     z_abs_max: int | None = None
 
+    # bias z-slab sampling toward the top/bottom of the z range. with
+    # probability `z_edge_bias` a sample's z slab is drawn from an edge band
+    # (low or high, 50/50) instead of uniformly across the whole z range;
+    # 0.0 (default) keeps uniform sampling. `z_edge_band_frac` is each band's
+    # width as a fraction of the usable z-start span.
+    z_edge_bias: float = 0.0
+    z_edge_band_frac: float = 0.15
+
     # t1 window as a fraction of each dataset.
     t1_frac_min: float = 0.0
     t1_frac_max: float = 1.0
@@ -154,7 +162,9 @@ class Config:
     # DINO
     # ------------------------------------------------------------------
     # teacher softmax temperature (sharp). lower -> more confident targets.
-    teacher_temp: float = 0.04
+    teacher_temp_start: float = 0.04
+    teacher_temp_end: float = 0.07
+    teacher_temp_warmup_steps: int = 30
     # student softmax temperature (softer). asymmetry vs teacher drives learning.
     student_temp: float = 0.1
     # EMA momentum schedule for teacher weights. cosine from start to end.

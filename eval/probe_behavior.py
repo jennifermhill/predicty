@@ -54,6 +54,7 @@ def setup_logging(checkpoint_path: str) -> Path:
         def write(self, msg):
             sys.__stdout__.write(msg)
             log_file.write(msg)
+            log_file.flush()
         def flush(self):
             sys.__stdout__.flush()
             log_file.flush()
@@ -304,7 +305,6 @@ def main() -> None:
             df[col] = pd.to_numeric(df[col], downcast="integer")
         except (ValueError, TypeError):
             pass
-
     cfg.zarr_paths = list(df['zarr_path'].unique())
 
     device = torch.device(args.device or cfg.device)
@@ -398,7 +398,7 @@ def main() -> None:
     print("#" * 70)
     print(f"  train_acc : {train_mean*100:6.2f}%  ± {train_std*100:.2f}  (per-fold: {[f'{a*100:.1f}' for a in fold_train_accs]})")
     print(f"  val_acc   : {val_mean*100:6.2f}%  ± {val_std*100:.2f}  (per-fold: {[f'{a*100:.1f}' for a in fold_val_accs]})")
-    print(f"  val_acc - chance : {(val_mean - 1.0/n_classes)*100:+6.2f} percentage points")
+    print(f"  val_acc - chance : {(val_mean - 1.0/df['label'].value_counts().max())*100:+6.2f} percentage points")
     print()
     print("  pooled confusion matrix (summed across all folds):")
     print_confusion_matrix(cm_total, sorted(df['label'].unique()))

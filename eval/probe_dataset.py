@@ -95,6 +95,7 @@ def setup_logging(checkpoint_path: str) -> Path:
         def write(self, msg):
             sys.__stdout__.write(msg)
             log_file.write(msg)
+            log_file.flush()
         def flush(self):
             sys.__stdout__.flush()
             log_file.flush()
@@ -133,7 +134,6 @@ def extract_embeddings(
         batch_size=cfg.batch_size,
         num_workers=cfg.num_workers,
         worker_init_fn=worker_init_fn,
-        persistent_workers=cfg.num_workers > 0,
         pin_memory=device.type == "cuda",
     )
 
