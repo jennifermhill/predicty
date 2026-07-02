@@ -76,14 +76,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--probe-weight-decay", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=42, help="seed for sampling + train/val split")
     p.add_argument("--n_splits", type=int, default=5, help="Folds for stratified k fold splitting")
-    """
-    p.add_argument(
-        "--val-frac",
-        type=float,
-        default=0.2,
-        help="validation percentage",
-    )
-    """
     return p.parse_args()
 
 
@@ -92,7 +84,7 @@ def disable_augmentations(cfg: Config) -> None:
     sampled (t, z, y, x). per-crop norm stays on since that's how the encoder
     was trained to receive its input.
     """
-    for name in ("aug_intensity", "aug_gamma", "aug_noise", "aug_blur"):
+    for name in ("aug_intensity", "aug_gamma", "aug_noise", "aug_blur", "aug_flip", "aug_rotation"):
         getattr(cfg, name).enabled = False
     # aug_percrop_norm stays enabled; it's the input convention the encoder learned.
 
@@ -218,7 +210,7 @@ def train_probe(
     y_val = y_val.to(device)
 
     n = X_train.size(0)
-    gen = torch.Generator(device=device).manual_seed(0)
+    gen = torch.Generator(device=device).manual_seed(42)
 
     for step in range(probe_steps):
         idx = torch.randint(0, n, (batch_size,), device=device, generator=gen)
@@ -351,7 +343,7 @@ def main() -> None:
 
     fold_train_accs, fold_val_accs, fold_cms = [], [], []
 
-    for fold_idx, (X_train, y_train, X_val, y_val) in enumerate(StratifiedGroupKFoldSplit(X, y, list(df['dataset_idx']), args.seed, args.n_splits)):
+    for fold_idx, (X_train, y_train, X_val, y_val) in enumerate(stratified_group_kfold_split(X, y, list(df['dataset_idx']), args.seed, args.n_splits)):
         print(f"[probe] fold {fold_idx+1}/{args.n_splits}  (grouped by zarr volume, stratified by label)")
         print(f"[probe] train n={X_train.size(0)}  counts={torch.bincount(y_train, minlength=n_classes).tolist()}")
         print(f"[probe] val   n={X_val.size(0)}  counts={torch.bincount(y_val,   minlength=n_classes).tolist()}")

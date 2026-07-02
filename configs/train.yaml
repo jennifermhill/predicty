@@ -254,6 +254,14 @@ mae_decoder_depth: 2
 mae_norm_pix_loss: true
 
 # ---------------------------------------------------------------------------
+# image BERT (iBOT) masked image modeling
+# ---------------------------------------------------------------------------
+# auxiliary global-crop reconstruction with different masking strategy than MAE.
+# uses block-wise masking instead of patch-wise for more spatial coherence.
+ibot_weight: 0.1
+ibot_mask_ratio: 0.75
+
+# ---------------------------------------------------------------------------
 # optimizer / LR schedule
 # ---------------------------------------------------------------------------
 # base_lr:        peak LR after warmup. scale linearly with batch_size if changed.
