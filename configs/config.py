@@ -31,6 +31,16 @@ class Config:
     # differ by at most one when batch_size is not divisible by dataset count.
     balance_datasets: bool = True
 
+    # path to jsonl file with behavior/dataset annotations for probes.
+    annotation_path: str | None = None
+
+    # oversample minority behavior classes during probe training.
+    overrepresent_classes: bool = False
+
+    # strength of class oversampling when overrepresent_classes is true.
+    # higher = stronger oversampling of rare classes.
+    rep_alpha: float = 0.5
+
     channel: int = 0
     z_thickness: int = 10
 
