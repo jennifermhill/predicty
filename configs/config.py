@@ -136,6 +136,12 @@ class Config:
     aug_percrop_norm: AugCfg = field(default_factory=lambda: AugCfg(
         enabled=True, p=1.0,
     ))
+    aug_flip: AugCfg = field(default_factory=lambda: AugCfg(
+        enabled=False, p=0.5,
+    ))
+    aug_rotation: AugCfg = field(default_factory=lambda: AugCfg(
+        enabled=False, p=0.5,
+    ))
 
     # runtime
     max_intensity: float = 10000.0
@@ -164,7 +170,11 @@ class Config:
     # teacher softmax temperature (sharp). lower -> more confident targets.
     teacher_temp_start: float = 0.04
     teacher_temp_end: float = 0.07
+<<<<<<< HEAD
     temp_warmup_frac: float = 0.3
+=======
+    teacher_temp_warmup_steps: int = 30
+>>>>>>> origin/ibot
     # student softmax temperature (softer). asymmetry vs teacher drives learning.
     student_temp: float = 0.1
     # EMA momentum schedule for teacher weights. cosine from start to end.
@@ -199,6 +209,19 @@ class Config:
     mae_decoder_hidden: int = 512
     mae_decoder_depth: int = 2
     mae_norm_pix_loss: bool = True
+
+    # ------------------------------------------------------------------
+    # iBOT masking-based self-supervised objective
+    # ------------------------------------------------------------------
+    # Distillation-based masking objective: student predicts teacher's soft
+    # token distribution on masked global crops. Independent of MAE, both can
+    # be active simultaneously. Uses same teacher/student architecture and
+    # centering mechanism as DINO but with masked input and cross-entropy loss.
+    ibot_enabled: bool = False
+    ibot_weight: float = 1.0
+    ibot_mask_ratio: float = 0.75
+    ibot_patch_z: int = 2
+    ibot_patch_size: int = 16
 
     # ------------------------------------------------------------------
     # optimizer / schedule

@@ -29,7 +29,7 @@ from torch.utils.tensorboard import SummaryWriter
 from configs.config import Config
 from data.dataset import MultiZarrDataset, ZarrCellDataset, worker_init_fn
 from data.picker import pick_zarr_path
-from models.dino import DINOWrapper, dino_loss
+from models.dino import DINOWrapper, dino_loss, ibot_loss
 from train_utils import (
     batch_to_device,
     ema_momentum_schedule,
@@ -205,6 +205,14 @@ def main() -> None:
         )
     else:
         print("[train] masked autoencoder: disabled")
+    if model.ibot_enabled:
+        print(
+            f"[train] iBOT masking: enabled "
+            f"(patch=({cfg.ibot_patch_z}, {cfg.ibot_patch_size}, {cfg.ibot_patch_size}), "
+            f"mask_ratio={cfg.ibot_mask_ratio}, weight={cfg.ibot_weight})"
+        )
+    else:
+        print("[train] iBOT masking: disabled")
     # confirms .to(device) actually moved the model. if this prints 'cpu'
     # while device says 'cuda', training will silently run on cpu.
     print(f"[train] student params live on: {next(model.student.parameters()).device}")
@@ -249,6 +257,9 @@ def main() -> None:
 
     step = start_step
     for step in range(start_step, cfg.total_steps):
+        teach_temp = teacher_temperature_schedule(
+            step, cfg.teacher_temp_start, cfg.teacher_temp_end, cfg.teacher_temp_warmup_steps
+        )
         # the IterableDataset is infinite, but guard against StopIteration anyway
         # so a worker restart doesn't kill training.
         try:
@@ -299,12 +310,23 @@ def main() -> None:
                     out["dataset_logits"], out["dataset_targets"]
                 )
             mae_loss = out["mae"]["loss"] if out["mae"] is not None else None
+            ibot_loss_val = None
+            if out["student_masking_globals"] is not None:
+                ibot_loss_val = ibot_loss(
+                    out["student_masking_globals"],
+                    out["teacher_masking_globals"],
+                    model.ibot_center,
+                    teacher_temp=teach_temp,
+                    student_temp=cfg.student_temp,
+                )
 
             loss = dino
             if dataset_loss is not None:
                 loss = loss + cfg.dataset_adversary_weight * dataset_loss
             if mae_loss is not None:
                 loss = loss + cfg.mae_weight * mae_loss
+            if ibot_loss_val is not None:
+                loss = loss + cfg.ibot_weight * ibot_loss_val
 
         # backward, unscale grads to apply clipping in fp32, step + update.
         scaler.scale(loss).backward()
@@ -323,6 +345,8 @@ def main() -> None:
         model.update_teacher(m)
         # center is updated on the raw teacher logits (float32 for stability).
         model.update_center(out["teacher_globals"].float(), cfg.center_momentum)
+        if out["teacher_masking_globals"] is not None:
+            model.update_ibot_center(out["teacher_masking_globals"].float(), cfg.center_momentum)
 
         # ---- logging ----
         if step % cfg.log_interval == 0:
@@ -376,6 +400,8 @@ def main() -> None:
             if mae_loss is not None and mae_mask_ratio is not None:
                 writer.add_scalar("mae/loss", mae_loss.item(), step)
                 writer.add_scalar("mae/mask_ratio", mae_mask_ratio.item(), step)
+            if ibot_loss_val is not None:
+                writer.add_scalar("ibot/loss", ibot_loss_val.item(), step)
 
             msg = (
                 f"step {step:06d}  loss={loss.item():.4f}  lr={lr:.2e}  "
@@ -390,6 +416,8 @@ def main() -> None:
                 )
             if mae_loss is not None:
                 msg += f"  mae_loss={mae_loss.item():.4f}"
+            if ibot_loss_val is not None:
+                msg += f"  ibot_loss={ibot_loss_val.item():.4f}"
             print(msg)
 
         # ---- checkpoint ----

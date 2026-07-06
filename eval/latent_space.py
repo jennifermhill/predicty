@@ -134,6 +134,9 @@ def extract_embeddings(
         worker_init_fn=worker_init_fn,
         persistent_workers=cfg.num_workers > 0,
         pin_memory=device.type == "cuda",
+        # spawn (not fork) so workers start fresh. forking after the parent has
+        # initialized cuda + the zarr/blosc threadpool deadlocks on first read.
+        multiprocessing_context="spawn" if cfg.num_workers > 0 else None,
     )
 
     encoder.eval()

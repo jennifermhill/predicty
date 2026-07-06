@@ -40,6 +40,10 @@ rep_alpha: 0.15
 # the previous usable-t1-range-weighted random sampling.
 balance_datasets: true
 
+annotation_path: /groups/sgro/sgrolab/Aran/predicty/index.jsonl
+overrepresent_classes: false
+rep_alpha: 0.5
+
 channel: 0              # which channel to read from the (t, c, z, y, x) array.
 z_thickness: 10         # number of z slices per global crop (depth of the 3d sub-volume).
 local_z_thickness: 5    # number of z slices per local; contiguous sub-slab of the global window.
@@ -59,7 +63,7 @@ local_crop_size: 96
 # minimum crop intensity, as a fraction of the mean intensity over the active
 # z slab at t1. a global crop is accepted only if its mean is at least
 # intensity_min_frac * slab_mean. cached per worker, keyed by (t1, z).
-intensity_min_frac: 0.95
+intensity_min_frac: 0.85
 # fail clearly instead of hanging forever if no sampled crop passes the gate.
 intensity_max_attempts: 1000
 
@@ -179,6 +183,16 @@ aug_percrop_norm:
   enabled: true
   p: 1.0
 
+# random horizontal/vertical flips. semantically preserving for cell behavior.
+aug_flip:
+  enabled: false
+  p: 0.5
+
+# random 90-degree rotations. semantically preserving for cell behavior.
+aug_rotation:
+  enabled: false
+  p: 0.5
+
 # ---------------------------------------------------------------------------
 # runtime
 # ---------------------------------------------------------------------------
@@ -186,7 +200,11 @@ aug_percrop_norm:
 # to fetch crops in parallel. each worker reopens its own zarr handle and
 # pulls samples independently, then hands batches back to the main process.
 # 0 means "load in the main process" (slower but easier to debug).
+<<<<<<< HEAD
 num_workers: 2
+=======
+num_workers: 6
+>>>>>>> origin/ibot
 
 # seed: base integer used to make sampling reproducible. each worker derives
 # its own rng from (seed + worker_id), and numpy/torch are seeded the same way.
@@ -216,7 +234,11 @@ projector_k: 2048
 # center_momentum: EMA on the centering buffer. prevents prototype collapse.
 teacher_temp_start: 0.04
 teacher_temp_end: 0.07
+<<<<<<< HEAD
 temp_warmup_frac: 0.3 #same as DINO paper 
+=======
+teacher_temp_warmup_steps: 30
+>>>>>>> origin/ibot
 student_temp: 0.1
 ema_momentum_start: 0.996
 ema_momentum_end: 1.0
@@ -252,6 +274,14 @@ mae_patch_size: 16
 mae_decoder_hidden: 512
 mae_decoder_depth: 2
 mae_norm_pix_loss: true
+
+# ---------------------------------------------------------------------------
+# image BERT (iBOT) masked image modeling
+# ---------------------------------------------------------------------------
+# auxiliary global-crop reconstruction with different masking strategy than MAE.
+# uses block-wise masking instead of patch-wise for more spatial coherence.
+ibot_weight: 0.1
+ibot_mask_ratio: 0.75
 
 # ---------------------------------------------------------------------------
 # optimizer / LR schedule

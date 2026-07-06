@@ -250,6 +250,15 @@ class ZarrCellDataset(IterableDataset):
                 f"{self.z_max - self.z_min} slices, but z_thickness={cfg.z_thickness}"
             )
 
+        if not 0.0 <= cfg.z_edge_bias <= 1.0:
+            raise ValueError(
+                f"z_edge_bias must be in [0, 1]; got {cfg.z_edge_bias}"
+            )
+        if not 0.0 <= cfg.z_edge_band_frac <= 1.0:
+            raise ValueError(
+                f"z_edge_band_frac must be in [0, 1]; got {cfg.z_edge_band_frac}"
+            )
+
         # absolute t bounds are only for pinning a known dataset.
         if cfg.t1_abs_min is not None and cfg.t1_abs_max is not None:
             self.t1_min = cfg.t1_abs_min
@@ -473,9 +482,15 @@ class ZarrCellDataset(IterableDataset):
             f"target_gap_minutes={self.cfg.target_gap_minutes} -> "
             f"frame_gap={self.frame_gap} ({self.cfg.temporal_direction})"
         )
+        edge = ""
+        if self.cfg.z_edge_bias > 0.0:
+            edge = (
+                f"; z_edge_bias={self.cfg.z_edge_bias} "
+                f"(band_frac={self.cfg.z_edge_band_frac})"
+            )
         print(
             f"[ZarrCellDataset] Z={self.Z}; z range resolved to "
-            f"[{self.z_min}, {self.z_max}) slices, thickness={self.cfg.z_thickness}"
+            f"[{self.z_min}, {self.z_max}) slices, thickness={self.cfg.z_thickness}{edge}"
         )
         print(
             f"[ZarrCellDataset] t1 range resolved to "
@@ -605,6 +620,7 @@ class ZarrCellDataset(IterableDataset):
         g_z = cfg.z_thickness
         l_z = cfg.local_z_thickness
 
+<<<<<<< HEAD
         raw_t1, raw_t2 = None, None
         z_start_max = self.z_max - g_z
 
@@ -635,6 +651,60 @@ class ZarrCellDataset(IterableDataset):
                 cfg.global_crop_size,
                 cfg.spatial_region_grid_y,
                 cfg.spatial_region_grid_x,
+=======
+        # one global z slab shared by both globals and constrained for locals.
+        # optionally bias the slab start toward the low/high edges of the z
+        # range (where the behaviors of interest tend to sit).
+        z_start_max = self.z_max - g_z
+        if cfg.z_edge_bias > 0.0 and rng.random() < cfg.z_edge_bias:
+            band = int(round(cfg.z_edge_band_frac * (z_start_max - self.z_min)))
+            if rng.random() < 0.5:  # low edge (near z_min)
+                z = rng.randrange(self.z_min, self.z_min + band + 1)
+            else:  # high edge (near z_max)
+                z = rng.randrange(z_start_max - band, z_start_max + 1)
+        else:
+            z = rng.randrange(self.z_min, z_start_max + 1)
+
+        t1 = rng.randrange(self.t1_min, self.t1_max)
+        sign = 1 if cfg.temporal_direction == "forward" else -1
+        t2 = t1 + sign * self.frame_gap
+
+        # gate against the per-(t1, z_slab) baseline. only one (y, x) is drawn
+        # since both globals share the spatial offset; the gate runs once.
+        threshold = cfg.intensity_min_frac * self._get_frame_mean(t1, z)
+        best_mean = float("-inf")
+        for attempt in range(cfg.intensity_max_attempts):
+            y_off, x_off, region_idx = self._sample_global_offset(rng)
+            raw_t1 = self._load_crop_raw(t1, z, y_off, x_off, g_size, g_size)
+            crop_mean = float(raw_t1.mean())
+            best_mean = max(best_mean, crop_mean)
+            if crop_mean >= threshold:
+                # debug: flag crops that only passed after a lot of retries.
+                if attempt >= 50:
+                    print(
+                        f"[gate] dataset_idx={dataset_idx} t1={t1} z={z} "
+                        f"passed after {attempt + 1} attempts "
+                        f"(threshold={threshold:.4g}, crop_mean={crop_mean:.4g})",
+                        flush=True,
+                    )
+                break
+            # debug: if this floods the log, the gate is cycling on a near-empty
+            # slab (same t1/z, only y/x changing). prints every 100 retries.
+            if (attempt + 1) % 100 == 0:
+                print(
+                    f"[gate] dataset_idx={dataset_idx} t1={t1} z={z} still retrying "
+                    f"{attempt + 1}/{cfg.intensity_max_attempts} "
+                    f"(threshold={threshold:.4g}, best_mean={best_mean:.4g})",
+                    flush=True,
+                )
+        else:
+            raise RuntimeError(
+                "could not sample a global crop that passes the intensity gate "
+                f"after {cfg.intensity_max_attempts} attempts: dataset={cfg.zarr_path!r}, "
+                f"t1={t1}, z={z}, threshold={threshold:.6g}, "
+                f"best_crop_mean={best_mean:.6g}. Lower intensity_min_frac or "
+                "inspect this dataset for empty regions."
+>>>>>>> origin/ibot
             )
 
         else:
@@ -740,6 +810,36 @@ class ZarrCellDataset(IterableDataset):
             sample["meta"]["local_y"] = torch.tensor([y for y, _ in local_offsets])
             sample["meta"]["local_x"] = torch.tensor([x for _, x in local_offsets])
         return sample
+
+    def _annotation_tensor(
+        self, t1: int, t2: int, z: int, global_x: int, global_y: int
+    ) -> dict[str, Any]:
+        """load a global crop pair given annotation coordinates (no augmentation)."""
+        cfg = self.cfg
+        g_size = cfg.global_crop_size
+        g_z = cfg.z_thickness
+
+        raw_t1 = self._load_crop_raw(t1, z, global_y, global_x, g_size, g_size)
+        raw_t2 = self._load_crop_raw(t2, z, global_y, global_x, g_size, g_size)
+        globals_tensor = torch.stack([
+            self._to_tensor(raw_t1),
+            self._to_tensor(raw_t2),
+        ])
+
+        return {
+            "globals": globals_tensor,
+            "meta": {
+                "t1": t1,
+                "t2": t2,
+                "z": z,
+                "z_end": z + g_z,
+                "global_y": global_y,
+                "global_x": global_x,
+                "frame_y": self.Y,
+                "frame_x": self.X,
+                "spatial_region_idx": 0,
+            },
+        }
 
     def _get_frame_mean(self, t: int, z: int) -> float:
         """mean intensity over the active z slab [z, z+z_thickness) at frame t.
