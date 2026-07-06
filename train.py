@@ -258,7 +258,7 @@ def main() -> None:
     step = start_step
     for step in range(start_step, cfg.total_steps):
         teach_temp = teacher_temperature_schedule(
-            step, cfg.teacher_temp_start, cfg.teacher_temp_end, cfg.teacher_temp_warmup_steps
+            step, cfg.teacher_temp_start, cfg.teacher_temp_end, cfg.teacher_temp_warmup_frac
         )
         # the IterableDataset is infinite, but guard against StopIteration anyway
         # so a worker restart doesn't kill training.

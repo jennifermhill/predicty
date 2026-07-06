@@ -76,17 +76,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--probe-weight-decay", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=42, help="seed for sampling + train/val split")
     p.add_argument("--n_splits", type=int, default=5, help="Folds for stratified k fold splitting")
-<<<<<<< HEAD
-    """
-    p.add_argument(
-        "--val-frac",
-        type=float,
-        default=0.2,
-        help="validation percentage",
-    )
-    """
-=======
->>>>>>> origin/ibot
     return p.parse_args()
 
 
@@ -95,11 +84,7 @@ def disable_augmentations(cfg: Config) -> None:
     sampled (t, z, y, x). per-crop norm stays on since that's how the encoder
     was trained to receive its input.
     """
-<<<<<<< HEAD
-    for name in ("aug_intensity", "aug_gamma", "aug_noise", "aug_blur"):
-=======
     for name in ("aug_intensity", "aug_gamma", "aug_noise", "aug_blur", "aug_flip", "aug_rotation"):
->>>>>>> origin/ibot
         getattr(cfg, name).enabled = False
     # aug_percrop_norm stays enabled; it's the input convention the encoder learned.
 
@@ -127,10 +112,7 @@ def extract_embeddings(
     ds = load_dataset(cfg)
     n_samples = len(annotations_df)
     labels_list = sorted(list(annotations_df['label'].unique()))
-<<<<<<< HEAD
-=======
     label_to_idx = {label: idx for idx, label in enumerate(labels_list)}
->>>>>>> origin/ibot
 
     encoder.eval()
     embeddings: list[torch.Tensor] = []
@@ -140,11 +122,6 @@ def extract_embeddings(
     t0 = time.time()
     print_every = max(1, n_samples // (cfg.batch_size * 10))
     iters = 0
-<<<<<<< HEAD
-    
-=======
-
->>>>>>> origin/ibot
     for i in range(len(cfg.zarr_paths)):
         zarr_df = annotations_df[annotations_df['zarr_path'] == cfg.zarr_paths[i]]
         src = ds.children[i]
@@ -152,11 +129,7 @@ def extract_embeddings(
             # globals shape: (B, 2, 1, Z, H, W). index 0 is t1.
             batch = src._annotation_tensor(row.t1, row.t2, row.z, row.global_x, row.global_y)
             g_t1 = batch["globals"][0].to(device, non_blocking=True).unsqueeze(0)
-<<<<<<< HEAD
-            label_idx = torch.tensor([labels_list.index(row.label)])
-=======
             label_idx = torch.tensor([label_to_idx[row.label]])
->>>>>>> origin/ibot
             meta = batch["meta"]
 
             emb = encoder(g_t1)  # (B, latent_dim)
@@ -198,11 +171,7 @@ def random_split(
     return X[:n_train], y[:n_train], X[n_train:], y[n_train:]
 
 
-<<<<<<< HEAD
-def StratifiedGroupKFoldSplit(
-=======
 def stratified_group_kfold_split(
->>>>>>> origin/ibot
     X: torch.Tensor,
     y: torch.Tensor,
     dataset_idx: list,
@@ -240,11 +209,7 @@ def train_probe(
     y_val = y_val.to(device)
 
     n = X_train.size(0)
-<<<<<<< HEAD
-    gen = torch.Generator(device=device).manual_seed(0)
-=======
     gen = torch.Generator(device=device).manual_seed(42)
->>>>>>> origin/ibot
 
     for step in range(probe_steps):
         idx = torch.randint(0, n, (batch_size,), device=device, generator=gen)
@@ -376,14 +341,9 @@ def main() -> None:
     print()
 
     fold_train_accs, fold_val_accs, fold_cms = [], [], []
-<<<<<<< HEAD
-
-    for fold_idx, (X_train, y_train, X_val, y_val) in enumerate(StratifiedGroupKFoldSplit(X, y, list(df['dataset_idx']), args.seed, args.n_splits)):
-=======
     fold_heads = []  # Store trained heads for later
 
     for fold_idx, (X_train, y_train, X_val, y_val) in enumerate(stratified_group_kfold_split(X, y, list(df['dataset_idx']), args.seed, args.n_splits)):
->>>>>>> origin/ibot
         print(f"[probe] fold {fold_idx+1}/{args.n_splits}  (grouped by zarr volume, stratified by label)")
         print(f"[probe] train n={X_train.size(0)}  counts={torch.bincount(y_train, minlength=n_classes).tolist()}")
         print(f"[probe] val   n={X_val.size(0)}  counts={torch.bincount(y_val,   minlength=n_classes).tolist()}")
@@ -404,8 +364,6 @@ def main() -> None:
         fold_val_accs.append(va_acc)
         fold_cms.append(cm)
 
-<<<<<<< HEAD
-=======
         # Save the trained head for this fold
         head = nn.Linear(cfg.latent_dim, n_classes).to(device)
         opt = torch.optim.AdamW(head.parameters(), lr=args.probe_lr, weight_decay=args.probe_weight_decay)
@@ -422,7 +380,6 @@ def main() -> None:
             opt.step()
         fold_heads.append((head.cpu(), va_acc))
 
->>>>>>> origin/ibot
         # --- fold-specific report ---
         print()
         print("=" * 70)
@@ -458,8 +415,6 @@ def main() -> None:
     print(f"  interpretation: {interpret(val_mean, n_classes)}")
     print("#" * 70)
 
-<<<<<<< HEAD
-=======
     # Save best fold's linear head for Grad-CAM
     best_fold_idx = fold_val_accs.index(max(fold_val_accs))
     best_head, best_va_acc = fold_heads[best_fold_idx]
@@ -480,7 +435,6 @@ def main() -> None:
     print()
     print(f"[probe] saved best fold (fold {best_fold_idx+1}) linear head to {ckpt_path}")
 
->>>>>>> origin/ibot
 
 if __name__ == "__main__":
     main()

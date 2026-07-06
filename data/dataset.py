@@ -620,7 +620,6 @@ class ZarrCellDataset(IterableDataset):
         g_z = cfg.z_thickness
         l_z = cfg.local_z_thickness
 
-<<<<<<< HEAD
         raw_t1, raw_t2 = None, None
         z_start_max = self.z_max - g_z
 
@@ -651,60 +650,6 @@ class ZarrCellDataset(IterableDataset):
                 cfg.global_crop_size,
                 cfg.spatial_region_grid_y,
                 cfg.spatial_region_grid_x,
-=======
-        # one global z slab shared by both globals and constrained for locals.
-        # optionally bias the slab start toward the low/high edges of the z
-        # range (where the behaviors of interest tend to sit).
-        z_start_max = self.z_max - g_z
-        if cfg.z_edge_bias > 0.0 and rng.random() < cfg.z_edge_bias:
-            band = int(round(cfg.z_edge_band_frac * (z_start_max - self.z_min)))
-            if rng.random() < 0.5:  # low edge (near z_min)
-                z = rng.randrange(self.z_min, self.z_min + band + 1)
-            else:  # high edge (near z_max)
-                z = rng.randrange(z_start_max - band, z_start_max + 1)
-        else:
-            z = rng.randrange(self.z_min, z_start_max + 1)
-
-        t1 = rng.randrange(self.t1_min, self.t1_max)
-        sign = 1 if cfg.temporal_direction == "forward" else -1
-        t2 = t1 + sign * self.frame_gap
-
-        # gate against the per-(t1, z_slab) baseline. only one (y, x) is drawn
-        # since both globals share the spatial offset; the gate runs once.
-        threshold = cfg.intensity_min_frac * self._get_frame_mean(t1, z)
-        best_mean = float("-inf")
-        for attempt in range(cfg.intensity_max_attempts):
-            y_off, x_off, region_idx = self._sample_global_offset(rng)
-            raw_t1 = self._load_crop_raw(t1, z, y_off, x_off, g_size, g_size)
-            crop_mean = float(raw_t1.mean())
-            best_mean = max(best_mean, crop_mean)
-            if crop_mean >= threshold:
-                # debug: flag crops that only passed after a lot of retries.
-                if attempt >= 50:
-                    print(
-                        f"[gate] dataset_idx={dataset_idx} t1={t1} z={z} "
-                        f"passed after {attempt + 1} attempts "
-                        f"(threshold={threshold:.4g}, crop_mean={crop_mean:.4g})",
-                        flush=True,
-                    )
-                break
-            # debug: if this floods the log, the gate is cycling on a near-empty
-            # slab (same t1/z, only y/x changing). prints every 100 retries.
-            if (attempt + 1) % 100 == 0:
-                print(
-                    f"[gate] dataset_idx={dataset_idx} t1={t1} z={z} still retrying "
-                    f"{attempt + 1}/{cfg.intensity_max_attempts} "
-                    f"(threshold={threshold:.4g}, best_mean={best_mean:.4g})",
-                    flush=True,
-                )
-        else:
-            raise RuntimeError(
-                "could not sample a global crop that passes the intensity gate "
-                f"after {cfg.intensity_max_attempts} attempts: dataset={cfg.zarr_path!r}, "
-                f"t1={t1}, z={z}, threshold={threshold:.6g}, "
-                f"best_crop_mean={best_mean:.6g}. Lower intensity_min_frac or "
-                "inspect this dataset for empty regions."
->>>>>>> origin/ibot
             )
 
         else:

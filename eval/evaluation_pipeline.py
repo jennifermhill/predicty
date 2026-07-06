@@ -11,7 +11,7 @@ Can check if evaluation scripts have previously been run for individual models
 to prevent redundant evaluation.
 
 Usage:
-    python eval/evaluation_pipeline.py --config configs/train.yaml --run_names 0626-NoClassBalancing 06261422
+    python eval/evaluation_pipeline.py --config checkpoints/<run_name>/config.yaml --run_names 0626-NoClassBalancing 06261422
 
 """
 
