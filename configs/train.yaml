@@ -31,6 +31,10 @@ zarr_paths:
 # the previous usable-t1-range-weighted random sampling.
 balance_datasets: true
 
+annotation_path: /groups/sgro/sgrolab/Aran/predicty/index.jsonl
+overrepresent_classes: false
+rep_alpha: 0.5
+
 channel: 0              # which channel to read from the (t, c, z, y, x) array.
 z_thickness: 10         # number of z slices per global crop (depth of the 3d sub-volume).
 local_z_thickness: 5    # number of z slices per local; contiguous sub-slab of the global window.
