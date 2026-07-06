@@ -342,6 +342,7 @@ def main() -> None:
     print()
 
     fold_train_accs, fold_val_accs, fold_cms = [], [], []
+    fold_heads = []  # Store trained heads for later
 
     for fold_idx, (X_train, y_train, X_val, y_val) in enumerate(stratified_group_kfold_split(X, y, list(df['dataset_idx']), args.seed, args.n_splits)):
         print(f"[probe] fold {fold_idx+1}/{args.n_splits}  (grouped by zarr volume, stratified by label)")
@@ -363,6 +364,22 @@ def main() -> None:
         fold_train_accs.append(tr_acc)
         fold_val_accs.append(va_acc)
         fold_cms.append(cm)
+
+        # Save the trained head for this fold
+        head = nn.Linear(cfg.latent_dim, n_classes).to(device)
+        opt = torch.optim.AdamW(head.parameters(), lr=args.probe_lr, weight_decay=args.probe_weight_decay)
+        ce = nn.CrossEntropyLoss()
+        X_train, y_train = X_train.to(device), y_train.to(device)
+        n = X_train.size(0)
+        gen = torch.Generator(device=device).manual_seed(42)
+        for step in range(args.probe_steps):
+            idx = torch.randint(0, n, (args.probe_batch_size,), device=device, generator=gen)
+            logits = head(X_train[idx])
+            loss = ce(logits, y_train[idx])
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+        fold_heads.append((head.cpu(), va_acc))
 
         # --- fold-specific report ---
         print()
@@ -398,6 +415,26 @@ def main() -> None:
     print()
     print(f"  interpretation: {interpret(val_mean, n_classes)}")
     print("#" * 70)
+
+    # Save best fold's linear head for Grad-CAM
+    best_fold_idx = fold_val_accs.index(max(fold_val_accs))
+    best_head, best_va_acc = fold_heads[best_fold_idx]
+
+    log_dir = Path(log_path).parent
+    checkpoint = {
+        "head_state_dict": best_head.state_dict(),
+        "input_dim": cfg.latent_dim,
+        "output_dim": n_classes,
+        "class_names": sorted(df['label'].unique()).tolist(),
+        "val_acc": best_va_acc,
+        "fold_idx": best_fold_idx,
+        "args": vars(args),
+    }
+
+    ckpt_path = log_dir / "behavior_probe.pt"
+    torch.save(checkpoint, ckpt_path)
+    print()
+    print(f"[probe] saved best fold (fold {best_fold_idx+1}) linear head to {ckpt_path}")
 
 
 if __name__ == "__main__":

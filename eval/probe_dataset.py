@@ -434,15 +434,44 @@ def main() -> None:
 
     # --- train probe ---
     print(f"[probe] training linear head (in_dim={cfg.latent_dim}, out_dim={n_datasets})...")
-    tr_acc, va_acc, cm = train_probe(
-        X_train, y_train, X_val, y_val,
-        n_classes=n_datasets,
-        probe_steps=args.probe_steps,
-        lr=args.probe_lr,
-        batch_size=args.probe_batch_size,
-        weight_decay=args.probe_weight_decay,
-        device=device,
-    )
+
+    # Train and save the head
+    head = nn.Linear(cfg.latent_dim, n_datasets).to(device)
+    opt = torch.optim.AdamW(head.parameters(), lr=args.probe_lr, weight_decay=args.probe_weight_decay)
+    ce = nn.CrossEntropyLoss()
+
+    X_train = X_train.to(device)
+    y_train = y_train.to(device)
+    X_val = X_val.to(device)
+    y_val = y_val.to(device)
+
+    n = X_train.size(0)
+    gen = torch.Generator(device=device).manual_seed(0)
+
+    for step in range(args.probe_steps):
+        idx = torch.randint(0, n, (args.probe_batch_size,), device=device, generator=gen)
+        logits = head(X_train[idx])
+        loss = ce(logits, y_train[idx])
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+        if step == 0 or (step + 1) % max(1, args.probe_steps // 10) == 0:
+            with torch.no_grad():
+                tr_acc = (head(X_train).argmax(1) == y_train).float().mean().item()
+                va_acc = (head(X_val).argmax(1) == y_val).float().mean().item()
+            print(
+                f"  [probe] step {step+1:4d}/{args.probe_steps}  "
+                f"loss={loss.item():.4f}  train_acc={tr_acc:.3f}  val_acc={va_acc:.3f}"
+            )
+
+    with torch.no_grad():
+        tr_acc = (head(X_train).argmax(1) == y_train).float().mean().item()
+        preds = head(X_val).argmax(1)
+        va_acc = (preds == y_val).float().mean().item()
+        cm = torch.zeros(n_datasets, n_datasets, dtype=torch.long)
+        for t, p in zip(y_val.cpu().tolist(), preds.cpu().tolist()):
+            cm[t, p] += 1
 
     # --- report ---
     print()
@@ -456,6 +485,22 @@ def main() -> None:
     print()
     print(f"  interpretation: {interpret(va_acc, n_datasets)}")
     print("=" * 70)
+
+    # Save the trained linear head for Grad-CAM
+    log_dir = Path(log_path).parent
+    checkpoint = {
+        "head_state_dict": head.cpu().state_dict(),
+        "input_dim": cfg.latent_dim,
+        "output_dim": n_datasets,
+        "dataset_names": cfg.zarr_paths,
+        "val_acc": va_acc,
+        "args": vars(args),
+    }
+
+    ckpt_path = log_dir / "dataset_probe.pt"
+    torch.save(checkpoint, ckpt_path)
+    print()
+    print(f"[probe] saved linear head to {ckpt_path}")
 
 
 if __name__ == "__main__":
