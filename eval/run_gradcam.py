@@ -145,8 +145,9 @@ def extract_sample_crops(
         ds = ZarrCellDataset(cfg)
 
     samples = []
-    for i in range(min(n_samples, len(ds))):
-        sample = ds[i]
+    for sample in ds:
+        if len(samples) >= n_samples:
+            break
         samples.append(
             {
                 "crop": sample["globals"][0],  # (1, Z, H, W) - use t1 global
