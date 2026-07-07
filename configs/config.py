@@ -23,6 +23,11 @@ class Config:
     # left null so the file picker / --zarr-path flag can fill it at runtime.
     zarr_path: str | None = None
 
+    #when True, training data compensates for class imbalance using annotated examples
+    annotation_path: str | None = None
+    overrepresent_classes: bool = False
+    rep_alpha: float = 0.5
+
     # multi-zarr training. when non-null, the dataloader mixes pairs from
     # every listed zarr in each batch and `zarr_path` is ignored.
     zarr_paths: list[str] | None = None
@@ -175,7 +180,7 @@ class Config:
     # teacher softmax temperature (sharp). lower -> more confident targets.
     teacher_temp_start: float = 0.04
     teacher_temp_end: float = 0.07
-    teacher_temp_warmup_steps: int = 30
+    temp_warmup_frac: float = 0.3
     # student softmax temperature (softer). asymmetry vs teacher drives learning.
     student_temp: float = 0.1
     # EMA momentum schedule for teacher weights. cosine from start to end.
@@ -192,6 +197,7 @@ class Config:
     # encoder. This discourages dataset identity leakage in the representation.
     dataset_adversary_enabled: bool = False
     dataset_adversary_weight: float = 0.1
+    dataset_adversary_grl_start: float = 0.0
     dataset_adversary_grl_scale: float = 1.0
     dataset_adversary_hidden: int = 256
     dataset_adversary_dropout: float = 0.1

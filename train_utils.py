@@ -45,14 +45,14 @@ def ema_momentum_schedule(
     progress = min(step / max(1, total_steps), 1.0)
     return start + (end - start) * 0.5 * (1.0 - math.cos(math.pi * progress))
 
-def teacher_temperature_schedule(
-    step: int, start: float, end: float, warmup_steps: int
+def linear_frac_schedule(
+    step: int, total_steps: int, start: float, end: float, warmup_frac: float
 ) -> float:
-    """linear warmup from `start` to `end` over `warmup_steps`, then constant."""
+    """linear warmup from `start` to `end` over `warmup_frac` of steps, then constant."""
+    warmup_steps = max(1, int(total_steps * warmup_frac))
     if step < warmup_steps:
-        return start + (end - start) * step / max(1, warmup_steps)
+        return start + (end - start) * step / warmup_steps
     return end
-
 
 def get_param_groups(model: torch.nn.Module, weight_decay: float) -> list[dict]:
     """split parameters into wd / no-wd groups.

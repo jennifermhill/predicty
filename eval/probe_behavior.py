@@ -122,7 +122,6 @@ def extract_embeddings(
     t0 = time.time()
     print_every = max(1, n_samples // (cfg.batch_size * 10))
     iters = 0
-
     for i in range(len(cfg.zarr_paths)):
         zarr_df = annotations_df[annotations_df['zarr_path'] == cfg.zarr_paths[i]]
         src = ds.children[i]
@@ -295,7 +294,7 @@ def main() -> None:
     df = df.drop(columns = ['timestamp'])
     for col in df.columns:
         try:
-            df[col] = pd.to_numeric(df[col], downcast="integer")
+            df[col] = pd.to_numeric(df[col])
         except (ValueError, TypeError):
             pass
     cfg.zarr_paths = list(df['zarr_path'].unique())

@@ -36,7 +36,7 @@ from train_utils import (
     get_param_groups,
     load_checkpoint,
     lr_schedule,
-    teacher_temperature_schedule,
+    linear_frac_schedule,
     save_checkpoint,
 )
 
@@ -178,7 +178,7 @@ def main() -> None:
         worker_init_fn=worker_init_fn,
         persistent_workers=cfg.num_workers > 0,
         pin_memory=device.type == "cuda",
-        multiprocessing_context = "spawn" if cfg.num_workers > 0 else None
+        multiprocessing_context="spawn" if cfg.num_workers > 0 else None,
     )
 
     # ---- model ----
@@ -191,7 +191,7 @@ def main() -> None:
             f"[train] dataset adversary: enabled "
             f"(classes={n_datasets}, params={n_adv_params:,}, "
             f"weight={cfg.dataset_adversary_weight}, "
-            f"grl_scale={cfg.dataset_adversary_grl_scale})"
+            f"grl_scale={model.dataset_adversary_grl_scale})"
         )
     else:
         print("[train] dataset adversary: disabled")
@@ -257,9 +257,12 @@ def main() -> None:
 
     step = start_step
     for step in range(start_step, cfg.total_steps):
-        teach_temp = teacher_temperature_schedule(
-            step, cfg.teacher_temp_start, cfg.teacher_temp_end, cfg.teacher_temp_warmup_steps
+        teach_temp = linear_frac_schedule(
+            step, cfg.total_steps, cfg.teacher_temp_start, cfg.teacher_temp_end, cfg.temp_warmup_frac
         )
+        model.dataset_adversary_grl_scale = linear_frac_schedule(
+            step, cfg.total_steps, cfg.dataset_adversary_grl_start, cfg.dataset_adversary_grl_scale, cfg.temp_warmup_frac
+        ) # using same warmup fraction as teacher temperature for now, can separate if needed
         # the IterableDataset is infinite, but guard against StopIteration anyway
         # so a worker restart doesn't kill training.
         try:
@@ -334,7 +337,7 @@ def main() -> None:
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
 
-        # EMA + center updates after the optimizer step.
+        # EMA + center + teacher_temp updates after the optimizer step.
         m = ema_momentum_schedule(
             step, cfg.total_steps, cfg.ema_momentum_start, cfg.ema_momentum_end
         )
@@ -384,6 +387,8 @@ def main() -> None:
             writer.add_scalar("loss/dino", dino.item(), step)
             writer.add_scalar("lr", lr, step)
             writer.add_scalar("ema_momentum", m, step)
+            writer.add_scalar("warmups/teacher_temp", teach_temp, step)
+            writer.add_scalar("warmups/dataset_adversary_grl_scale", model.dataset_adversary_grl_scale, step)
             writer.add_scalar("grad_norm", grad_norm.item(), step)
             writer.add_scalar("collapse/teacher_entropy", entropy.item(), step)
             writer.add_scalar("collapse/embedding_var", emb_var.item(), step)
@@ -400,6 +405,7 @@ def main() -> None:
 
             msg = (
                 f"step {step:06d}  loss={loss.item():.4f}  lr={lr:.2e}  "
+                f"teach_temp={teach_temp:.4f}  "
                 f"ent={entropy.item():.3f}  emb_var={emb_var.item():.4f}  "
                 f"center_norm={center_norm.item():.3f}  {steps_per_sec:.2f} step/s"
             )

@@ -33,10 +33,14 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+
+import torch.multiprocessing as mp
+mp.set_start_method("spawn", force=True)
 
 from configs.config import Config
 from data.dataset import MultiZarrDataset, ZarrCellDataset, worker_init_fn
@@ -123,91 +127,208 @@ def extract_embeddings(
     n_crops: int,
     views: str,
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
-    ds = build_dataset(cfg)
-    loader = DataLoader(
-        ds,
-        batch_size=cfg.batch_size,
-        num_workers=cfg.num_workers,
-        worker_init_fn=worker_init_fn,
-        persistent_workers=cfg.num_workers > 0,
-        pin_memory=device.type == "cuda",
-        # spawn (not fork) so workers start fresh. forking after the parent has
-        # initialized cuda + the zarr/blosc threadpool deadlocks on first read.
-        multiprocessing_context="spawn" if cfg.num_workers > 0 else None,
-    )
-
     encoder.eval()
     embeddings: list[torch.Tensor] = []
     rows: list[dict[str, Any]] = []
     selected_views = view_indices(views)
 
+    ds = build_dataset(cfg)
     if isinstance(ds, MultiZarrDataset):
         n_datasets = len(ds.children)
         zarr_paths = [child.cfg.zarr_path or "" for child in ds.children]
+        children = ds.children
+        assert zarr_paths == list(cfg.zarr_paths), (
+            "ds.children order doesn't match cfg.zarr_paths -- annotation "
+            "dataset_idx remapping would silently pull the wrong zarr file."
+        )
     else:
         n_datasets = 1
         zarr_paths = [cfg.zarr_path or ""]
-    seen = 0
-    t0 = time.time()
+        children = [ds]
 
-    for step, batch in enumerate(loader):
-        globals_ = batch["globals"]  # (B, 2, 1, Z, H, W)
-        weak_label = batch["weak_label"]
-        meta = batch["meta"]
-        batch_size = globals_.size(0)
 
+    ann_df = pd.read_json(cfg.annotation_path, lines=True)
+    ann_df = ann_df[ann_df["label"] != "empty"]
+    ann_df = ann_df[ann_df["zarr_path"].isin(cfg.zarr_paths)]
+    ann_df = ann_df.drop(columns=["timestamp"]).reset_index(drop=True)
+
+    zarr_path_to_idx = {p: i for i, p in enumerate(cfg.zarr_paths)}
+    ann_df["dataset_idx"] = ann_df["zarr_path"].map(zarr_path_to_idx)
+
+    for col in ann_df.columns:
+        try:
+            ann_df[col] = pd.to_numeric(ann_df[col], downcast="integer")
+        except (ValueError, TypeError):
+            pass
+
+    ann_batch_size = cfg.batch_size
+    ann_globals: list[torch.Tensor] = []
+    ann_metas: list[dict[str, Any]] = []
+    ann_labels: list[Any] = []
+    ann_uids: list[Any] = []
+
+    def flush_annotation_batch() -> None:
+        if not ann_globals:
+            return
+        globals_ = torch.stack(ann_globals)  # (b, 2, 1, Z, H, W)
+        b = globals_.size(0)
         crops = torch.cat([globals_[:, i] for i in selected_views], dim=0).to(
             device, non_blocking=True
         )
         emb = encoder(crops).cpu()
-
         for offset, view_idx in enumerate(selected_views):
-            start = offset * batch_size
-            end = start + batch_size
-            embeddings.append(emb[start:end])
-
-            dataset_idx = as_numpy_1d(weak_label[:, 0], batch_size)
-            frame_gap = as_numpy_1d(weak_label[:, 1], batch_size)
-            t = as_numpy_1d(meta["t1" if view_idx == 0 else "t2"], batch_size)
-            z = as_numpy_1d(meta["z"], batch_size)
-            z_end = as_numpy_1d(meta["z_end"], batch_size)
-            y = as_numpy_1d(meta["global_y"], batch_size)
-            x = as_numpy_1d(meta["global_x"], batch_size)
-            frame_y = as_numpy_1d(meta["frame_y"], batch_size)
-            frame_x = as_numpy_1d(meta["frame_x"], batch_size)
-            spatial_region_idx = as_numpy_1d(meta["spatial_region_idx"], batch_size)
-
-            for i in range(batch_size):
-                ds_idx = int(dataset_idx[i])
+            s, e = offset * b, offset * b + b
+            embeddings.append(emb[s:e])
+            for i in range(b):
+                meta = ann_metas[i]
                 rows.append({
                     "point_idx": len(rows),
-                    "dataset_idx": ds_idx,
-                    "dataset_name": Path(zarr_paths[ds_idx]).name if ds_idx < len(zarr_paths) else "",
+                    "uid": ann_uids[i],
+                    "dataset_idx": int(meta["dataset_idx"]),
+                    "dataset_name": Path(zarr_paths[meta["dataset_idx"]]).name,
                     "n_datasets": n_datasets,
                     "view": "t1" if view_idx == 0 else "t2",
                     "view_idx": int(view_idx),
-                    "t": int(t[i]),
-                    "z": int(z[i]),
-                    "z_end": int(z_end[i]),
-                    "global_y": int(y[i]),
-                    "global_x": int(x[i]),
-                    "frame_y": int(frame_y[i]),
-                    "frame_x": int(frame_x[i]),
-                    "spatial_region_idx": int(spatial_region_idx[i]),
-                    "frame_gap": int(frame_gap[i]),
+                    "t": int(meta["t1"] if view_idx == 0 else meta["t2"]),
+                    "z": int(meta["z"]),
+                    "z_end": int(meta["z_end"]),
+                    "global_y": int(meta["global_y"]),
+                    "global_x": int(meta["global_x"]),
+                    "frame_y": int(meta["frame_y"]),
+                    "frame_x": int(meta["frame_x"]),
+                    "spatial_region_idx": int(meta["spatial_region_idx"]),
+                    "frame_gap": int(meta["frame_gap"]),
+                    "label": ann_labels[i],
                 })
+        ann_globals.clear()
+        ann_metas.clear()
+        ann_labels.clear()
+        ann_uids.clear()
 
-        seen = len(rows)
-        if step == 0 or seen >= n_crops or step % 10 == 0:
-            elapsed = time.time() - t0
-            rate = seen / max(elapsed, 1e-6)
-            print(f"  [extract] {min(seen, n_crops)}/{n_crops} crops  ({rate:.1f} crops/s)")
-        if seen >= n_crops:
+    n_skipped = 0
+    for _, r in ann_df.iterrows():
+        if len(rows) + len(ann_globals) >= n_crops:
             break
+        ds_idx = int(r["dataset_idx"])
+        child = children[ds_idx]
+        sample = child._annotation_tensor(
+            t1=int(r["t1"]),
+            t2=int(r["t2"]),
+            z=int(r["z"]),
+            x_off=int(r["global_x"]),
+            y_off=int(r["global_y"]),
+            dataset_idx=ds_idx,
+        )
+        ann_globals.append(sample["globals"])
+        ann_metas.append(sample["meta"])
+        ann_labels.append(r["label"])
+        ann_uids.append(r["uid"])
+        if len(ann_globals) >= ann_batch_size:
+            flush_annotation_batch()
+            print(f"  [extract-annotated] {len(rows)}/{n_crops} crops")
+    flush_annotation_batch()
+
+    if n_skipped:
+        print(f"[extract] WARNING: skipped {n_skipped} annotation rows with dataset_idx/zarr_path mismatch")
+
+    n_annotated = len(rows)
+    print(f"[extract] embedded {n_annotated} crops from annotations")
+
+    if len(rows) < n_crops:
+        loader = DataLoader(
+            ds,
+            batch_size=cfg.batch_size,
+            num_workers=cfg.num_workers,
+            worker_init_fn=worker_init_fn,
+            persistent_workers=cfg.num_workers > 0,
+            pin_memory=device.type == "cuda",
+        )
+
+        t0 = time.time()
+
+        for step, batch in enumerate(loader):
+            globals_ = batch["globals"]  # (B, 2, 1, Z, H, W)
+            weak_label = batch["weak_label"]
+            meta = batch["meta"]
+            batch_size = globals_.size(0)
+
+            crops = torch.cat([globals_[:, i] for i in selected_views], dim=0).to(
+                device, non_blocking=True
+            )
+            emb = encoder(crops).cpu()
+
+            for offset, view_idx in enumerate(selected_views):
+                start = offset * batch_size
+                end = start + batch_size
+                embeddings.append(emb[start:end])
+
+                dataset_idx = as_numpy_1d(weak_label[:, 0], batch_size)
+                frame_gap = as_numpy_1d(weak_label[:, 1], batch_size)
+                t = as_numpy_1d(meta["t1" if view_idx == 0 else "t2"], batch_size)
+                z = as_numpy_1d(meta["z"], batch_size)
+                z_end = as_numpy_1d(meta["z_end"], batch_size)
+                y = as_numpy_1d(meta["global_y"], batch_size)
+                x = as_numpy_1d(meta["global_x"], batch_size)
+                frame_y = as_numpy_1d(meta["frame_y"], batch_size)
+                frame_x = as_numpy_1d(meta["frame_x"], batch_size)
+                spatial_region_idx = as_numpy_1d(meta["spatial_region_idx"], batch_size)
+
+                for i in range(batch_size):
+                    ds_idx = int(dataset_idx[i])
+                    rows.append({
+                        "point_idx": len(rows),
+                        "uid": "",
+                        "dataset_idx": ds_idx,
+                        "dataset_name": Path(zarr_paths[ds_idx]).name if ds_idx < len(zarr_paths) else "",
+                        "n_datasets": n_datasets,
+                        "view": "t1" if view_idx == 0 else "t2",
+                        "view_idx": int(view_idx),
+                        "t": int(t[i]),
+                        "z": int(z[i]),
+                        "z_end": int(z_end[i]),
+                        "global_y": int(y[i]),
+                        "global_x": int(x[i]),
+                        "frame_y": int(frame_y[i]),
+                        "frame_x": int(frame_x[i]),
+                        "spatial_region_idx": int(spatial_region_idx[i]),
+                        "frame_gap": int(frame_gap[i]),
+                        "label": None,
+                    })
+
+            seen = len(rows)
+            if step == 0 or seen >= n_crops or step % 10 == 0:
+                elapsed = time.time() - t0
+                rate = (seen - n_annotated) / max(elapsed, 1e-6)
+                print(f"  [extract-random] {min(seen, n_crops)}/{n_crops} crops  ({rate:.1f} crops/s)")
+            if seen >= n_crops:
+                break
 
     X = torch.cat(embeddings, dim=0).numpy()[:n_crops]
     return X, rows[:n_crops]
 
+def load_cached_embeddings(path: Path, cfg: Config) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    data = np.load(path, allow_pickle=False)
+    X = data["embeddings"]
+    n = X.shape[0]
+
+    zarr_paths = list(cfg.zarr_paths) if cfg.zarr_paths else [cfg.zarr_path or ""]
+
+    rows: list[dict[str, Any]] = []
+    for i in range(n):
+        ds_idx = int(data["dataset_idx"][i])
+        view_idx = int(data["view_idx"][i])
+        label = str(data["label"][i])
+        rows.append({
+            "point_idx": i,
+            "dataset_idx": ds_idx,
+            "dataset_name": Path(zarr_paths[ds_idx]).name if ds_idx < len(zarr_paths) else "",
+            "view": "t1" if view_idx == 0 else "t2",
+            "view_idx": view_idx,
+            "t": int(data["t"][i]),
+            "z": int(data["z"][i]),
+            "label": label if label else None,
+        })
+    return X, rows
 
 def pca_project(X: np.ndarray, n_components: int = 2) -> tuple[np.ndarray, np.ndarray]:
     X_t = torch.from_numpy(X).float()
@@ -359,16 +480,20 @@ def save_npz(
     coords_by_method: dict[str, np.ndarray],
     rows: list[dict[str, Any]],
 ) -> None:
-    labels = np.asarray([r["dataset_idx"] for r in rows], dtype=np.int64)
+    dataset_idx_arr = np.asarray([r["dataset_idx"] for r in rows], dtype=np.int64)
     t = np.asarray([r["t"] for r in rows], dtype=np.int64)
     z = np.asarray([r["z"] for r in rows], dtype=np.int64)
     view_idx = np.asarray([r["view_idx"] for r in rows], dtype=np.int64)
+    # "" for points with no annotation (e.g. randomly-sampled crops in
+    # extract_embeddings where row["label"] is None).
+    label = np.asarray(["" if r.get("label") is None else str(r["label"]) for r in rows])
     arrays: dict[str, np.ndarray] = {
         "embeddings": X.astype(np.float32),
-        "dataset_idx": labels,
+        "dataset_idx": dataset_idx_arr,
         "t": t,
         "z": z,
         "view_idx": view_idx,
+        "label": label,
     }
     # one coords_<method> array per projection so downstream tools can load
     # any view from a single file.
@@ -436,6 +561,36 @@ def plot_continuous(
     fig.savefig(out_path)
     plt.close(fig)
 
+def plot_annotations_pca(
+    X_projected: np.ndarray,
+    rows: list[dict[str, Any]],
+    out_dir: Path,
+    plot_size: float,
+) -> None:
+    """PCA fit on just the annotated (labeled) crops, colored by label. This
+    is a separate 2D projection from the main pca/ output -- fit only on the
+    labeled subset so category structure isn't washed out by the much larger
+    random-crop population."""
+    ann_idx = [i for i, r in enumerate(rows) if r.get("label")]
+    if len(ann_idx) < 3:
+        print(f"[annotations] only {len(ann_idx)} labeled points; skipping annotations PCA plot")
+        return
+    X_ann = X_projected[ann_idx]
+    labels = [rows[i]["label"] for i in ann_idx]
+    coords, explained = pca_project(X_ann, 2)
+    print(
+        f"[annotations] PCA on {len(ann_idx)} labeled crops, "
+        f"explained variance in 2D: {explained.sum()*100:.1f}%"
+    )
+    plot_categorical(
+        coords,
+        labels,
+        f"Annotated crops PCA colored by label (n={len(ann_idx)})",
+        out_dir / "annotations_pca_by_label.png",
+        plot_size,
+        "PCA 1",
+        "PCA 2",
+    )
 
 def save_plots(
     coords: np.ndarray,
@@ -449,7 +604,6 @@ def save_plots(
     view = [r["view"] for r in rows]
     t = np.asarray([r["t"] for r in rows])
     z = np.asarray([r["z"] for r in rows])
-    frame_gap = np.asarray([r["frame_gap"] for r in rows])
 
     if method == "pca":
         x_label, y_label = "PCA 1", "PCA 2"
@@ -461,7 +615,12 @@ def save_plots(
     plot_categorical(coords, view, "Latent space colored by global view", out_dir / "latent_by_view.png", plot_size, x_label, y_label)
     plot_continuous(coords, t, "Latent space colored by time", out_dir / "latent_by_time.png", plot_size, x_label, y_label)
     plot_continuous(coords, z, "Latent space colored by z", out_dir / "latent_by_z.png", plot_size, x_label, y_label)
-    plot_continuous(coords, frame_gap, "Latent space colored by frame_gap", out_dir / "latent_by_frame_gap.png", plot_size, x_label, y_label)
+
+    if "frame_gap" in rows[0]:
+        frame_gap = np.asarray([r["frame_gap"] for r in rows])
+        plot_continuous(coords, frame_gap, "Latent space colored by frame_gap", out_dir / "latent_by_frame_gap.png", plot_size, x_label, y_label)
+    else:
+        print("[plots] frame_gap not available (loaded from cached embeddings.npz); skipping latent_by_frame_gap.png")
 
 
 def maybe_print_cluster_metrics(coords: np.ndarray, rows: list[dict[str, Any]]) -> None:
@@ -478,6 +637,18 @@ def maybe_print_cluster_metrics(coords: np.ndarray, rows: list[dict[str, Any]]) 
     print(f"[metrics] silhouette by dataset_idx on 2D projection: {score:.3f}")
     print("[metrics] near 0 means mixed/overlapping datasets; high positive means dataset-separated islands")
 
+def find_cached_run(checkpoint: str) -> Path | None:
+    base = Path("latent_space")
+    if not base.is_dir():
+        return None
+    prefix = f"{Path(checkpoint).parent.name}_"
+    candidates = [
+        d for d in base.iterdir()
+        if d.is_dir() and d.name.startswith(prefix) and (d / "embeddings.npz").exists()
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda d: (d / "embeddings.npz").stat().st_mtime)
 
 def main() -> None:
     args = parse_args()
@@ -490,11 +661,15 @@ def main() -> None:
     disable_augmentations(cfg)
 
     device = torch.device(args.device or cfg.device)
-    out_dir = (
-        Path(args.out_dir)
-        if args.out_dir
-        else Path("latent_space") / f"{Path(args.checkpoint).stem}_{time.strftime('%Y%m%d_%H%M%S')}"
-    )
+    if args.out_dir:
+        out_dir = Path(args.out_dir)
+    else:
+        cached_dir = find_cached_run(args.checkpoint)
+        if cached_dir is not None:
+            out_dir = cached_dir
+            print(f"[latent] no --out-dir given; found cached run at {out_dir}")
+        else:
+            out_dir = Path("latent_space") / f"{Path(args.checkpoint).parent.name}_{time.strftime('%Y%m%d_%H%M%S')}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[latent] device     : {device}")
@@ -504,20 +679,27 @@ def main() -> None:
     print(f"[latent] n_crops    : {args.n_crops}")
     print(f"[latent] views      : {args.views}")
 
-    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-    print(f"[latent] checkpoint step: {ckpt.get('step', 'unknown')}")
-    encoder = HybridEncoder(
-        stem_channels=cfg.stem_channels,
-        latent_dim=cfg.latent_dim,
-    ).to(device)
-    encoder.load_state_dict(ckpt["encoder_state_dict"])
-    for p in encoder.parameters():
-        p.requires_grad = False
-    encoder.eval()
+    cache_path = out_dir / "embeddings.npz"
+    if cache_path.exists():
+        print(f"[latent] found existing {cache_path} -- loading cached embeddings instead of re-running the encoder")
+        X, rows = load_cached_embeddings(cache_path, cfg)
+        print(f"[latent] loaded cached embeddings: {X.shape}")
+    else:
+        ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+        print(f"[latent] checkpoint step: {ckpt.get('step', 'unknown')}")
+        encoder = HybridEncoder(
+            stem_channels=cfg.stem_channels,
+            latent_dim=cfg.latent_dim,
+        ).to(device)
+        encoder.load_state_dict(ckpt["encoder_state_dict"])
+        for p in encoder.parameters():
+            p.requires_grad = False
+        encoder.eval()
 
-    t0 = time.time()
-    X, rows = extract_embeddings(cfg, encoder, device, args.n_crops, args.views)
-    print(f"[latent] extracted embeddings: {X.shape} in {time.time() - t0:.1f}s")
+        t0 = time.time()
+        X, rows = extract_embeddings(cfg, encoder, device, args.n_crops, args.views)
+        print(f"[latent] extracted embeddings: {X.shape} in {time.time() - t0:.1f}s")
+
     X_projected = preprocess_embeddings(X, args.embedding_preprocess)
     print(f"[latent] embedding preprocess: {args.embedding_preprocess}")
     print_embedding_diagnostics(X, X_projected)
@@ -525,8 +707,6 @@ def main() -> None:
     methods = resolve_methods(args.method)
     print(f"[latent] projection methods: {', '.join(methods)}")
 
-    # each method gets its own subdirectory of plots + csv; the shared npz
-    # collects every method's coords next to the raw embeddings.
     coords_by_method: dict[str, np.ndarray] = {}
     for method in methods:
         coords = project_single(args, X_projected, method)
@@ -540,6 +720,8 @@ def main() -> None:
         maybe_print_cluster_metrics(coords, rows)
 
     save_npz(out_dir / "embeddings.npz", X, coords_by_method, rows)
+
+    plot_annotations_pca(X_projected, rows, out_dir, args.plot_size)
 
     print("[latent] wrote:")
     for path in sorted(p for p in out_dir.rglob("*") if p.is_file()):

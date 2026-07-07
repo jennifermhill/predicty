@@ -33,6 +33,7 @@ zarr handles are reopened in each worker so dask handles stay process-local.
 
 from __future__ import annotations
 
+from cProfile import label
 import random
 from dataclasses import replace
 from typing import Any, Iterator
@@ -41,6 +42,8 @@ import dask.array as da
 import numpy as np
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
+
+import pandas as pd
 
 from configs.config import Config
 from data.augmentations import build_augmentations
@@ -68,6 +71,9 @@ class ZarrCellDataset(IterableDataset):
         self._resolve_ranges()
         self._log_open()
 
+        if cfg.overrepresent_classes:
+            self._load_annotations(self.cfg.zarr_path)
+
         # augmentations are stateless across workers.
         self._augment = build_augmentations(cfg)
 
@@ -84,13 +90,44 @@ class ZarrCellDataset(IterableDataset):
         self.T, self.C, self.Z, self.Y, self.X = self.arr.shape
         if self.T < 2:
             raise ValueError(f"need at least 2 timepoints; got T={self.T}")
+    
+    def _load_annotations(self, zarr_path: str) -> None:
+        cfg = self.cfg
+        if cfg.annotation_path is None:
+            raise ValueError("cfg.annotation_path must be set to load annotations.")
+        df = pd.read_json(cfg.annotation_path, lines=True)
 
+        df = df[df['label'] != 'empty']
+        if df.empty:
+            raise ValueError(
+                f"No annotations found for usable zarrs in {cfg.annotation_path}"
+            )
+        df = df[df['zarr_path'].isin([zarr_path])]
+
+        excluded = {"single_cells", "clumps"}
+        all_classes = set(df["label"].unique())
+        self.minority_classes = list(all_classes - excluded)
+        df = df[df['label'].isin(self.minority_classes)]
+        if df.empty:
+            print(f"No minority class annotations found for zarrs in {zarr_path}. Proceeding without annotations.")
+        else:
+            df = df.drop(columns = ['timestamp'])
+            for col in df.columns:
+                try:
+                    df[col] = pd.to_numeric(df[col])
+                except (ValueError, TypeError):
+                    pass
+        self.by_label = {}
+        for label in df["label"].unique():
+            self.by_label[label] = df[df["label"] == label]
+        
     def _resolve_ranges(self) -> None:
         cfg = self.cfg
 
         self._check_fraction("z_frac_min", cfg.z_frac_min)
         self._check_fraction("t1_frac_min", cfg.t1_frac_min)
         self._check_fraction("t1_frac_max", cfg.t1_frac_max)
+        self._check_fraction("representation_alpha", cfg.rep_alpha)
         self._check_order("t1_frac", cfg.t1_frac_min, cfg.t1_frac_max)
         self._check_spatial_region_config()
 
@@ -481,8 +518,101 @@ class ZarrCellDataset(IterableDataset):
         while True:
             yield self._sample_pair(rng)
 
+    def _annotation_tensor(self, t1: int, t2: int, z: int, x_off: int, y_off: int, dataset_idx: int = 0
+    ) -> dict[str, Any]:
+        cfg = self.cfg
+        g_size = cfg.global_crop_size
+        l_size = cfg.local_crop_size
+        g_z = cfg.z_thickness
+        l_z = cfg.local_z_thickness
+        rng = random.Random()
+
+        raw_t1 = self._load_crop_raw(t1, z, y_off, x_off, g_size, g_size)
+        raw_t2 = self._load_crop_raw(t2, z, y_off, x_off, g_size, g_size)
+
+        region_idx = region_index_for_top_left(
+                y_off,
+                x_off,
+                self.Y,
+                self.X,
+                cfg.global_crop_size,
+                cfg.spatial_region_grid_y,
+                cfg.spatial_region_grid_x,
+        )
+
+        # global index 0 is at t1, index 1 is at t2.
+        globals_tensor = torch.stack([
+            self._augment(self._to_tensor(raw_t1)),
+            self._augment(self._to_tensor(raw_t2)),
+        ])
+
+        # locals split evenly between the two global parents. since both
+        # globals share (y, x), spatial nesting collapses to the same window;
+        # the parent index is still recorded so the loss can pair each local
+        # with the correct teacher target. each local picks its own time in
+        # [t1, t2] and its own contiguous l_z-deep sub-slab inside the global
+        # z window.
+        n_local = cfg.n_local_crops
+        n_per = n_local // 2
+        local_parents: list[int] = [0] * n_per + [1] * (n_local - n_per)
+
+        t_lo, t_hi = (t1, t2) if t1 <= t2 else (t2, t1)
+        lz_start_max = z + g_z - l_z  # inclusive upper bound
+
+        local_ts: list[int] = []
+        local_zs: list[int] = []
+        local_offsets: list[tuple[int, int]] = []
+        locals_: list[torch.Tensor] = []
+        for _parent in local_parents:
+            t_local = rng.randrange(t_lo, t_hi + 1)
+            lz = rng.randrange(z, lz_start_max + 1)
+            ly = rng.randrange(y_off, y_off + g_size - l_size + 1)
+            lx = rng.randrange(x_off, x_off + g_size - l_size + 1)
+            raw_l = self._load_crop_raw(
+                t_local, lz, ly, lx, l_size, l_size, z_thickness=l_z
+            )
+            local_ts.append(t_local)
+            local_zs.append(lz)
+            local_offsets.append((ly, lx))
+            locals_.append(self._augment(self._to_tensor(raw_l)))
+
+        sample: dict[str, Any] = {
+            # (2, 1, z_thickness, g_size, g_size); index 0 is t1, index 1 is t2.
+            "globals": globals_tensor,
+            # WS-DINO weak label: (dataset_idx, frame_gap). dataset_idx is 0 for
+            # a single-zarr dataset; MultiZarrDataset passes the child index it
+            # drew. frame_gap is the per-dataset integer frame spacing.
+            "weak_label": torch.tensor(
+                [dataset_idx, self.frame_gap], dtype=torch.long
+            ),
+            "meta": {
+                "t1": t1,
+                "t2": t2,
+                "z": z,
+                "z_end": z + g_z,
+                "dataset_idx": dataset_idx,
+                "frame_gap": self.frame_gap,
+                "global_t": torch.tensor([t1, t2]),
+                "global_y": y_off,
+                "global_x": x_off,
+                "frame_y": self.Y,
+                "frame_x": self.X,
+                "spatial_region_idx": region_idx,
+            },
+        }
+        if locals_:
+            sample["locals"] = torch.stack(locals_)
+            sample["meta"]["local_parent"] = torch.tensor(local_parents)
+            sample["meta"]["local_t"] = torch.tensor(local_ts)
+            sample["meta"]["local_z"] = torch.tensor(local_zs)
+            sample["meta"]["local_z_end"] = torch.tensor([lz + l_z for lz in local_zs])
+            sample["meta"]["local_y"] = torch.tensor([y for y, _ in local_offsets])
+            sample["meta"]["local_x"] = torch.tensor([x for _, x in local_offsets])
+        return sample
+        
+
     def _sample_pair(
-        self, rng: random.Random, dataset_idx: int = 0
+        self, rng: random.Random, dataset_idx: int = 0,
     ) -> dict[str, Any]:
         cfg = self.cfg
         g_size = cfg.global_crop_size
@@ -490,60 +620,71 @@ class ZarrCellDataset(IterableDataset):
         g_z = cfg.z_thickness
         l_z = cfg.local_z_thickness
 
+        raw_t1, raw_t2 = None, None
+        z_start_max = self.z_max - g_z
+
         # one global z slab shared by both globals and constrained for locals.
         # optionally bias the slab start toward the low/high edges of the z
         # range (where the behaviors of interest tend to sit).
-        z_start_max = self.z_max - g_z
-        if cfg.z_edge_bias > 0.0 and rng.random() < cfg.z_edge_bias:
-            band = int(round(cfg.z_edge_band_frac * (z_start_max - self.z_min)))
-            if rng.random() < 0.5:  # low edge (near z_min)
-                z = rng.randrange(self.z_min, self.z_min + band + 1)
-            else:  # high edge (near z_max)
-                z = rng.randrange(z_start_max - band, z_start_max + 1)
-        else:
-            z = rng.randrange(self.z_min, z_start_max + 1)
 
-        t1 = rng.randrange(self.t1_min, self.t1_max)
-        sign = 1 if cfg.temporal_direction == "forward" else -1
-        t2 = t1 + sign * self.frame_gap
+        if cfg.overrepresent_classes and rng.random() < cfg.rep_alpha and self.minority_classes: 
+            #3-part check - if overrepresenting classes is enabled, if random value below threshold
+            #and if there are minority classes to sample from in this dataset
+            label = self.minority_classes[rng.randrange(len(self.minority_classes))]
+            df = self.by_label[label]
+            row = df.iloc[rng.randrange(len(df))]
+            t1 = row['t1']
+            t2 = row['t2']
+            z = row['z']
+            y_off = row['global_y']
+            x_off = row['global_x']
 
-        # gate against the per-(t1, z_slab) baseline. only one (y, x) is drawn
-        # since both globals share the spatial offset; the gate runs once.
-        threshold = cfg.intensity_min_frac * self._get_frame_mean(t1, z)
-        best_mean = float("-inf")
-        for attempt in range(cfg.intensity_max_attempts):
-            y_off, x_off, region_idx = self._sample_global_offset(rng)
             raw_t1 = self._load_crop_raw(t1, z, y_off, x_off, g_size, g_size)
-            crop_mean = float(raw_t1.mean())
-            best_mean = max(best_mean, crop_mean)
-            if crop_mean >= threshold:
-                # debug: flag crops that only passed after a lot of retries.
-                if attempt >= 50:
-                    print(
-                        f"[gate] dataset_idx={dataset_idx} t1={t1} z={z} "
-                        f"passed after {attempt + 1} attempts "
-                        f"(threshold={threshold:.4g}, crop_mean={crop_mean:.4g})",
-                        flush=True,
-                    )
-                break
-            # debug: if this floods the log, the gate is cycling on a near-empty
-            # slab (same t1/z, only y/x changing). prints every 100 retries.
-            if (attempt + 1) % 100 == 0:
-                print(
-                    f"[gate] dataset_idx={dataset_idx} t1={t1} z={z} still retrying "
-                    f"{attempt + 1}/{cfg.intensity_max_attempts} "
-                    f"(threshold={threshold:.4g}, best_mean={best_mean:.4g})",
-                    flush=True,
-                )
-        else:
-            raise RuntimeError(
-                "could not sample a global crop that passes the intensity gate "
-                f"after {cfg.intensity_max_attempts} attempts: dataset={cfg.zarr_path!r}, "
-                f"t1={t1}, z={z}, threshold={threshold:.6g}, "
-                f"best_crop_mean={best_mean:.6g}. Lower intensity_min_frac or "
-                "inspect this dataset for empty regions."
+            raw_t2 = self._load_crop_raw(t2, z, y_off, x_off, g_size, g_size)
+
+            region_idx = region_index_for_top_left(
+                y_off,
+                x_off,
+                self.Y,
+                self.X,
+                cfg.global_crop_size,
+                cfg.spatial_region_grid_y,
+                cfg.spatial_region_grid_x,
             )
-        raw_t2 = self._load_crop_raw(t2, z, y_off, x_off, g_size, g_size)
+
+        else:
+            if cfg.z_edge_bias > 0.0 and rng.random() < cfg.z_edge_bias:
+                band = int(round(cfg.z_edge_band_frac * (z_start_max - self.z_min)))
+                if rng.random() < 0.5:  # low edge (near z_min)
+                    z = rng.randrange(self.z_min, self.z_min + band + 1)
+                else:  # high edge (near z_max)
+                    z = rng.randrange(z_start_max - band, z_start_max + 1)
+            else:
+                z = rng.randrange(self.z_min, z_start_max + 1)
+            t1 = rng.randrange(self.t1_min, self.t1_max)
+            sign = 1 if cfg.temporal_direction == "forward" else -1
+            t2 = t1 + sign * self.frame_gap
+
+            # gate against the per-(t1, z_slab) baseline. only one (y, x) is drawn
+            # since both globals share the spatial offset; the gate runs once.
+            threshold = cfg.intensity_min_frac * self._get_frame_mean(t1, z)
+            best_mean = float("-inf")
+            for _ in range(cfg.intensity_max_attempts):
+                y_off, x_off, region_idx = self._sample_global_offset(rng)
+                raw_t1 = self._load_crop_raw(t1, z, y_off, x_off, g_size, g_size)
+                crop_mean = float(raw_t1.mean())
+                best_mean = max(best_mean, crop_mean)
+                if crop_mean >= threshold:
+                    break
+            else:
+                raise RuntimeError(
+                    "could not sample a global crop that passes the intensity gate "
+                    f"after {cfg.intensity_max_attempts} attempts: dataset={cfg.zarr_path!r}, "
+                    f"t1={t1}, z={z}, threshold={threshold:.6g}, "
+                    f"best_crop_mean={best_mean:.6g}. Lower intensity_min_frac or "
+                    "inspect this dataset for empty regions."
+                )
+            raw_t2 = self._load_crop_raw(t2, z, y_off, x_off, g_size, g_size)
 
         # global index 0 is at t1, index 1 is at t2.
         globals_tensor = torch.stack([

@@ -26,14 +26,19 @@ zarr_paths:
   - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test52_2024-02-21/ERH_2024-02-20_mixin52_22hr_ERH Red FarRed.zarr
   - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test65_2024-04-16/NC28.1_overnight_day1/2024-04-16_ERH_mixin65_plate1_NC28.1_overnight_ERH Red FarRed.zarr
 
+# to provide model training with a balanced representation of every dataset, using
+# annotated examples and overrepresenting underrpresented classes, assuming the datasets
+# have the same class distribution as the annotated examples.   
+
+annotation_path: /groups/sgro/sgrolab/Aran/predicty/index.jsonl
+overrepresent_classes: true
+rep_alpha: 0.15
+
+
 # balanced batches contain floor(batch_size / dataset_count) samples from
 # every usable zarr. remainder slots rotate across batches. set false to use
 # the previous usable-t1-range-weighted random sampling.
 balance_datasets: true
-
-annotation_path: /groups/sgro/sgrolab/Aran/predicty/index.jsonl
-overrepresent_classes: false
-rep_alpha: 0.5
 
 channel: 0              # which channel to read from the (t, c, z, y, x) array.
 z_thickness: 10         # number of z slices per global crop (depth of the 3d sub-volume).
@@ -153,7 +158,7 @@ aug_intensity:
 aug_gamma:
   enabled: true
   p: 0.9
-  gamma_range: [0.3, 3.0]
+  gamma_range: [0.7, 1.5]
 
 # additive gaussian noise with sigma sampled uniformly from sigma_range.
 aug_noise:
@@ -215,12 +220,13 @@ projector_k: 2048
 # DINO loss + EMA
 # ---------------------------------------------------------------------------
 # teacher_temp:  softmax temperature for the teacher. lower -> sharper target.
+# linear warmup from 0.04 to 0.07
 # student_temp:  softmax temperature for the student. asymmetry drives learning.
 # ema_momentum_*: cosine schedule for teacher EMA. starts at 0.996, ends at 1.0.
 # center_momentum: EMA on the centering buffer. prevents prototype collapse.
 teacher_temp_start: 0.04
 teacher_temp_end: 0.07
-teacher_temp_warmup_steps: 30
+temp_warmup_frac: 0.3 #same as DINO paper 
 student_temp: 0.1
 ema_momentum_start: 0.996
 ema_momentum_end: 1.0
@@ -239,7 +245,8 @@ center_momentum: 0.9
 # (1/n_datasets) and collapse/embedding_var staying off the floor.
 dataset_adversary_enabled: true
 dataset_adversary_weight: 0.1
-dataset_adversary_grl_scale: 2.0
+dataset_adversary_grl_start: 0.0
+dataset_adversary_grl_scale: 3.0
 dataset_adversary_hidden: 256
 dataset_adversary_dropout: 0.1
 
@@ -287,7 +294,7 @@ warmup_frac: 0.1
 #                plus a `latest.pt` symlink-style copy.
 # device:        'cuda' for HPC GPU, 'cpu' for local smoke tests.
 # use_amp:       fp16 autocast on cuda. silently disabled on cpu.
-batch_size: 16
+batch_size: 40
 total_steps: 5000
 log_interval: 50
 ckpt_interval: 500

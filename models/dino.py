@@ -178,7 +178,8 @@ class DINOWrapper(nn.Module):
             if cfg.dataset_adversary_enabled and self.n_datasets > 1
             else None
         )
-        self.dataset_adversary_grl_scale = float(cfg.dataset_adversary_grl_scale)
+        #initializes grl scale to starting value
+        self.dataset_adversary_grl_scale = cfg.dataset_adversary_grl_start
         self.mae_decoder = (
             MaskedPatchAutoencoder(
                 latent_dim=cfg.latent_dim,
@@ -451,7 +452,7 @@ if __name__ == "__main__":
         out["teacher_globals"],
         wrapper.center,
         out["B"], out["n_g"], out["n_l"],
-        cfg.teacher_temp, cfg.student_temp,
+        cfg.teacher_temp_end, cfg.student_temp,
     )
     loss = loss + out["mae"]["loss"] + F.cross_entropy(
         out["dataset_logits"], out["dataset_targets"]
