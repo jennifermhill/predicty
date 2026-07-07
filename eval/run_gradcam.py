@@ -181,11 +181,11 @@ def run_behavior_gradcam(
     for sample_idx, sample in enumerate(samples):
         crop = sample["crop"]  # (1, Z, H, W)
 
-        # Ensure batch dimension
-        if crop.dim() == 3:
+        # Ensure 5D: (batch, channels, depth, height, width)
+        if crop.dim() == 4:
             crop = crop.unsqueeze(0)  # (1, 1, Z, H, W)
-        elif crop.dim() == 4 and crop.shape[0] != 1:
-            crop = crop[: 1]  # Take first sample
+        elif crop.dim() == 3:
+            crop = crop.unsqueeze(0).unsqueeze(0)  # (1, 1, Z, H, W)
 
         crop = crop.to(device)
 
@@ -243,11 +243,11 @@ def run_dataset_gradcam(
     for sample_idx, sample in enumerate(samples):
         crop = sample["crop"]  # (1, Z, H, W)
 
-        # Ensure batch dimension
-        if crop.dim() == 3:
+        # Ensure 5D: (batch, channels, depth, height, width)
+        if crop.dim() == 4:
             crop = crop.unsqueeze(0)  # (1, 1, Z, H, W)
-        elif crop.dim() == 4 and crop.shape[0] != 1:
-            crop = crop[: 1]
+        elif crop.dim() == 3:
+            crop = crop.unsqueeze(0).unsqueeze(0)  # (1, 1, Z, H, W)
 
         crop = crop.to(device)
 
