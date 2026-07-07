@@ -307,12 +307,21 @@ def main() -> None:
 
     print(f"[gradcam] encoder loaded from step {ckpt['step']}")
 
-    # Auto-detect probe checkpoints from encoder directory
-    encoder_dir = Path(args.checkpoint).parent
+    # Auto-detect probe checkpoints from latent_space directory
     if args.behavior_probe is None:
-        args.behavior_probe = encoder_dir / "behavior_probe.pt"
+        # Look for most recent behavior probe
+        latent_dir = Path("latent_space")
+        if latent_dir.exists():
+            behavior_probes = sorted(latent_dir.glob("*/behavior_probe.pt"), reverse=True)
+            if behavior_probes:
+                args.behavior_probe = behavior_probes[0]
     if args.dataset_probe is None:
-        args.dataset_probe = encoder_dir / "dataset_probe.pt"
+        # Look for most recent dataset probe
+        latent_dir = Path("latent_space")
+        if latent_dir.exists():
+            dataset_probes = sorted(latent_dir.glob("*/dataset_probe.pt"), reverse=True)
+            if dataset_probes:
+                args.dataset_probe = dataset_probes[0]
 
     # Load probes
     behavior_head = None
