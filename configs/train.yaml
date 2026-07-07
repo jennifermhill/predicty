@@ -294,7 +294,7 @@ warmup_frac: 0.1
 #                plus a `latest.pt` symlink-style copy.
 # device:        'cuda' for HPC GPU, 'cpu' for local smoke tests.
 # use_amp:       fp16 autocast on cuda. silently disabled on cpu.
-batch_size: 16
+batch_size: 40
 total_steps: 5000
 log_interval: 50
 ckpt_interval: 500

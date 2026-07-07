@@ -190,7 +190,7 @@ def run_behavior_gradcam(
     samples_df = samples_df.drop(columns = ['timestamp'])
     for col in samples_df.columns:
         try:
-            samples_df[col] = pd.to_numeric(samples_df[col], downcast="integer")
+            samples_df[col] = pd.to_numeric(samples_df[col])
         except (ValueError, TypeError):
             pass
     for sample_idx in range(n_samples):

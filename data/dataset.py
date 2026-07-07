@@ -114,7 +114,7 @@ class ZarrCellDataset(IterableDataset):
             df = df.drop(columns = ['timestamp'])
             for col in df.columns:
                 try:
-                    df[col] = pd.to_numeric(df[col], downcast="integer")
+                    df[col] = pd.to_numeric(df[col])
                 except (ValueError, TypeError):
                     pass
         self.by_label = {}
