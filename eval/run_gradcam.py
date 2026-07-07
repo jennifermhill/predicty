@@ -138,7 +138,11 @@ def extract_sample_crops(
         List of dicts with keys: 'crop', 'metadata'
     """
     cfg.seed = seed
-    ds = ZarrCellDataset(cfg)
+    # Use MultiZarrDataset for multi-zarr configs, else single ZarrCellDataset
+    if cfg.zarr_paths is not None:
+        ds = MultiZarrDataset(cfg)
+    else:
+        ds = ZarrCellDataset(cfg)
 
     samples = []
     for i in range(min(n_samples, len(ds))):
