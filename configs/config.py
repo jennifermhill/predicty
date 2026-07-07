@@ -187,6 +187,7 @@ class Config:
     # encoder. This discourages dataset identity leakage in the representation.
     dataset_adversary_enabled: bool = False
     dataset_adversary_weight: float = 0.1
+    dataset_adversary_grl_start: float = 0.0
     dataset_adversary_grl_scale: float = 1.0
     dataset_adversary_hidden: int = 256
     dataset_adversary_dropout: float = 0.1

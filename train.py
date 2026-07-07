@@ -36,7 +36,7 @@ from train_utils import (
     get_param_groups,
     load_checkpoint,
     lr_schedule,
-    teacher_temperature_schedule,
+    linear_frac_schedule,
     save_checkpoint,
 )
 
@@ -191,7 +191,7 @@ def main() -> None:
             f"[train] dataset adversary: enabled "
             f"(classes={n_datasets}, params={n_adv_params:,}, "
             f"weight={cfg.dataset_adversary_weight}, "
-            f"grl_scale={cfg.dataset_adversary_grl_scale})"
+            f"grl_scale={model.dataset_adversary_grl_scale})"
         )
     else:
         print("[train] dataset adversary: disabled")
@@ -257,9 +257,12 @@ def main() -> None:
 
     step = start_step
     for step in range(start_step, cfg.total_steps):
-        teach_temp = teacher_temperature_schedule(
-            step, cfg.teacher_temp_start, cfg.teacher_temp_end, cfg.teacher_temp_warmup_frac
+        teach_temp = linear_frac_schedule(
+            step, cfg.total_steps, cfg.teacher_temp_start, cfg.teacher_temp_end, cfg.temp_warmup_frac
         )
+        model.dataset_adversary_grl_scale = linear_frac_schedule(
+            step, cfg.total_steps, cfg.dataset_adversary_grl_start, cfg.dataset_adversary_grl_scale, cfg.temp_warmup_frac
+        ) # using same warmup fraction as teacher temperature for now, can separate if needed
         # the IterableDataset is infinite, but guard against StopIteration anyway
         # so a worker restart doesn't kill training.
         try:
@@ -287,10 +290,6 @@ def main() -> None:
         lr = lr_schedule(step, cfg.total_steps, cfg.base_lr, cfg.warmup_frac)
         for g in optimizer.param_groups:
             g["lr"] = lr
-        
-        teach_temp = teacher_temperature_schedule(
-            step, cfg.total_steps, cfg.teacher_temp_start, cfg.teacher_temp_end, cfg.temp_warmup_frac
-        )
 
         # forward + loss under autocast (fp16 ops on cuda).
         with autocast(device.type, dtype=torch.float16, enabled=use_amp):
@@ -388,7 +387,8 @@ def main() -> None:
             writer.add_scalar("loss/dino", dino.item(), step)
             writer.add_scalar("lr", lr, step)
             writer.add_scalar("ema_momentum", m, step)
-            writer.add_scalar("teacher_temp", teach_temp, step)
+            writer.add_scalar("warmups/teacher_temp", teach_temp, step)
+            writer.add_scalar("warmups/dataset_adversary_grl_scale", model.dataset_adversary_grl_scale, step)
             writer.add_scalar("grad_norm", grad_norm.item(), step)
             writer.add_scalar("collapse/teacher_entropy", entropy.item(), step)
             writer.add_scalar("collapse/embedding_var", emb_var.item(), step)

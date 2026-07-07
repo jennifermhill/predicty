@@ -128,6 +128,7 @@ def create_dummy_probes(
 
 def extract_sample_crops(
     cfg: Config,
+    ds: MultiZarrDataset,
     n_samples: int = 10,
     seed: int = 42,
 ) -> list[dict[str, Any]]:
@@ -138,26 +139,36 @@ def extract_sample_crops(
         List of dicts with keys: 'crop', 'metadata'
     """
     cfg.seed = seed
-    ds = ZarrCellDataset(cfg)
+
+    # MultiZarrDataset has no __len__/indexing -- it's meant to be iterated
+    # via DataLoader, which also works fine for ZarrCellDataset.
+    loader = DataLoader(
+        ds,
+        batch_size=1,
+        num_workers=0,
+        worker_init_fn=worker_init_fn,
+    )
 
     samples = []
-    for i in range(min(n_samples, len(ds))):
-        sample = ds[i]
+    for batch in loader:
         samples.append(
             {
-                "crop": sample["globals"][0],  # (1, Z, H, W) - use t1 global
-                "metadata": sample["meta"],
+                "crop": batch["globals"][0, 0],  # (1, Z, H, W) - use t1 global
+                "metadata": {k: v[0] for k, v in batch["meta"].items()},
             }
         )
-
+        if len(samples) >= n_samples:
+            break
     return samples
 
 
 def run_behavior_gradcam(
+    cfg: Config,
+    ds: MultiZarrDataset,
     encoder: HybridEncoder,
     behavior_head: nn.Linear,
     behavior_names: list[str],
-    samples: list[dict],
+    n_samples: int,
     device: torch.device,
     output_dir: Path,
 ) -> None:
@@ -173,19 +184,34 @@ def run_behavior_gradcam(
     target_layer = get_final_conv_layer(encoder)
     gradcam = GradCAM(encoder, behavior_head, target_layer, device)
 
-    for sample_idx, sample in enumerate(samples):
-        crop = sample["crop"]  # (1, Z, H, W)
+    samples_df = pd.read_json(cfg.annotation_path, lines=True)
+    samples_df = samples_df[samples_df['label'].isin(behavior_names)]
+    samples_df = samples_df[samples_df['zarr_path'].isin(cfg.zarr_paths)]
+    samples_df = samples_df.drop(columns = ['timestamp'])
+    for col in samples_df.columns:
+        try:
+            samples_df[col] = pd.to_numeric(samples_df[col], downcast="integer")
+        except (ValueError, TypeError):
+            pass
+    for sample_idx in range(n_samples):
+        behavior_idx = sample_idx % len(behavior_names)
+        behavior_name = behavior_names[behavior_idx]
+        sample = samples_df[samples_df['label'] == behavior_name].sample(n=1, random_state=cfg.seed + sample_idx).iloc[0]
+        zarr_index = cfg.zarr_paths.index(sample['zarr_path'])
+        src = ds.children[zarr_index]
+        batch = src._annotation_tensor(
+            t1=sample["t1"], 
+            t2=sample["t2"], 
+            z=sample["z"], 
+            global_x=sample["global_x"], 
+            global_y=sample["global_y"],
+        )
 
-        # Ensure batch dimension
-        if crop.dim() == 3:
-            crop = crop.unsqueeze(0)  # (1, 1, Z, H, W)
-        elif crop.dim() == 4 and crop.shape[0] != 1:
-            crop = crop[: 1]  # Take first sample
-
-        crop = crop.to(device)
+        crop = batch["globals"][0]  # (C=1, Z, H, W), no batch dim
+        crop = crop.unsqueeze(0).to(device)  # (1, 1, Z, H, W) = (B, C, Z, H, W)
 
         # Generate Grad-CAM for all behaviors
-        print(f"\nSample {sample_idx + 1}/{len(samples)}")
+        print(f"\nSample {sample_idx + 1}/{n_samples}")
         gradcams = gradcam.generate_gradcam_multiclass(
             crop,
             len(behavior_names),
@@ -208,7 +234,7 @@ def run_behavior_gradcam(
             crop_2d,
             gradcams_np,
             behavior_names,
-            title=f"Behavior Grad-CAM - Sample {sample_idx + 1}",
+            title=f"Behavior Grad-CAM - Sample {sample_idx + 1} - Behavior {behavior_name}",
             save_path=str(output_dir / f"behavior_gradcam_{sample_idx:03d}.png"),
         )
 
@@ -234,17 +260,9 @@ def run_dataset_gradcam(
     # Setup Grad-CAM
     target_layer = get_final_conv_layer(encoder)
     gradcam = GradCAM(encoder, dataset_head, target_layer, device)
-
     for sample_idx, sample in enumerate(samples):
-        crop = sample["crop"]  # (1, Z, H, W)
-
-        # Ensure batch dimension
-        if crop.dim() == 3:
-            crop = crop.unsqueeze(0)  # (1, 1, Z, H, W)
-        elif crop.dim() == 4 and crop.shape[0] != 1:
-            crop = crop[: 1]
-
-        crop = crop.to(device)
+        crop = sample["crop"]  # (C=1, Z, H, W), no batch dim
+        crop = crop.unsqueeze(0).to(device)  # (1, 1, Z, H, W) = (B, C, Z, H, W)
 
         # Generate Grad-CAM for all datasets (expensive - sample a few)
         print(f"\nSample {sample_idx + 1}/{len(samples)}")
@@ -268,6 +286,9 @@ def run_dataset_gradcam(
 
         gradcams_np = {k: v.cpu().numpy() for k, v in gradcams_upsampled.items()}
         dataset_names_subset = dataset_names[:n_datasets_to_show]
+        for i in range(len(dataset_names_subset)):
+            dataset_names_subset[i] = dataset_names_subset[i][dataset_names_subset[i].rindex("/") + 1:]
+            # strips path for better visualization
 
         visualize_gradcam_multiclass(
             crop_2d,
@@ -339,8 +360,9 @@ def main() -> None:
             print(f"[gradcam] dataset classes: {len(dataset_names)} datasets")
 
     # Extract sample crops
+    ds = MultiZarrDataset(cfg)
     print(f"[gradcam] extracting {args.n_samples} sample crops...")
-    samples = extract_sample_crops(cfg, args.n_samples, args.seed)
+    samples = extract_sample_crops(cfg, ds, args.n_samples, args.seed)
     print(f"[gradcam] extracted {len(samples)} samples")
 
     # Output directory
@@ -349,10 +371,12 @@ def main() -> None:
     # Run Grad-CAM
     if args.mode in ["behavior", "both"] and behavior_head is not None:
         run_behavior_gradcam(
+            cfg,
+            ds,
             encoder,
             behavior_head,
             behavior_names,
-            samples,
+            args.n_samples,
             device,
             output_dir,
         )

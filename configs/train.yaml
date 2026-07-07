@@ -245,6 +245,7 @@ center_momentum: 0.9
 # (1/n_datasets) and collapse/embedding_var staying off the floor.
 dataset_adversary_enabled: true
 dataset_adversary_weight: 0.1
+dataset_adversary_grl_start: 0.0
 dataset_adversary_grl_scale: 3.0
 dataset_adversary_hidden: 256
 dataset_adversary_dropout: 0.1
