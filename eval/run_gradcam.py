@@ -25,7 +25,6 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
 
 from configs.config import Config
 from data.dataset import MultiZarrDataset, ZarrCellDataset, worker_init_fn
@@ -71,11 +70,15 @@ def parse_args() -> argparse.Namespace:
 
 def load_behavior_probe(
     checkpoint_path: str,
-    latent_dim: int,
     device: torch.device,
 ) -> tuple[nn.Linear, list[str]]:
     """Load behavior classifier from probe checkpoint."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+
+    required_keys = ["input_dim", "output_dim", "class_names", "head_state_dict"]
+    missing = [k for k in required_keys if k not in ckpt]
+    if missing:
+        raise ValueError(f"Probe checkpoint missing keys: {missing}")
 
     input_dim = ckpt["input_dim"]
     output_dim = ckpt["output_dim"]
@@ -83,17 +86,22 @@ def load_behavior_probe(
 
     head = nn.Linear(input_dim, output_dim).to(device)
     head.load_state_dict(ckpt["head_state_dict"])
+    head.eval()
 
     return head, class_names
 
 
 def load_dataset_probe(
     checkpoint_path: str,
-    latent_dim: int,
     device: torch.device,
 ) -> tuple[nn.Linear, list[str]]:
     """Load dataset discriminator from probe checkpoint."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+
+    required_keys = ["input_dim", "output_dim", "dataset_names", "head_state_dict"]
+    missing = [k for k in required_keys if k not in ckpt]
+    if missing:
+        raise ValueError(f"Probe checkpoint missing keys: {missing}")
 
     input_dim = ckpt["input_dim"]
     output_dim = ckpt["output_dim"]
@@ -101,6 +109,7 @@ def load_dataset_probe(
 
     head = nn.Linear(input_dim, output_dim).to(device)
     head.load_state_dict(ckpt["head_state_dict"])
+    head.eval()
 
     return head, dataset_names
 
@@ -118,7 +127,9 @@ def create_dummy_probes(
     n_datasets = 20  # Number of zarr datasets
 
     behavior_head = nn.Linear(latent_dim, n_behaviors).to(device)
+    behavior_head.eval()
     dataset_head = nn.Linear(latent_dim, n_datasets).to(device)
+    dataset_head.eval()
 
     behavior_names = ["streaming", "slugs", "aggregation", "empty"]
     dataset_names = [f"dataset_{i}" for i in range(n_datasets)]
@@ -204,7 +215,7 @@ def run_behavior_gradcam(
         }
 
         # Convert crop to numpy for visualization
-        crop_np = crop[0].cpu().numpy()  # (1, Z, H, W)
+        crop_np = crop[0, 0].cpu().numpy()  # (Z, H, W)
         crop_2d = max_project_3d(crop_np)  # (H, W)
 
         # Visualize
@@ -268,8 +279,8 @@ def run_dataset_gradcam(
         }
 
         # Visualize
-        crop_np = crop[0].cpu().numpy()
-        crop_2d = max_project_3d(crop_np)
+        crop_np = crop[0, 0].cpu().numpy()  # (Z, H, W)
+        crop_2d = max_project_3d(crop_np)  # (H, W)
 
         gradcams_np = {k: v.cpu().numpy() for k, v in gradcams_upsampled.items()}
         dataset_names_subset = dataset_names[:n_datasets_to_show]
@@ -299,6 +310,10 @@ def main() -> None:
 
     # Load encoder
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+    if "encoder_state_dict" not in ckpt:
+        print(f"[gradcam] ERROR: checkpoint missing 'encoder_state_dict'. invalid checkpoint format.")
+        return
+
     encoder = HybridEncoder(
         stem_channels=cfg.stem_channels,
         latent_dim=cfg.latent_dim,
@@ -306,7 +321,7 @@ def main() -> None:
     encoder.load_state_dict(ckpt["encoder_state_dict"])
     encoder.eval()
 
-    print(f"[gradcam] encoder loaded from step {ckpt['step']}")
+    print(f"[gradcam] encoder loaded from step {ckpt.get('step', 'unknown')}")
 
     # Auto-detect probe checkpoints from latent_space directory
     if args.behavior_probe is None:
@@ -331,24 +346,24 @@ def main() -> None:
     dataset_names = None
 
     if args.mode in ["behavior", "both"]:
-        if not Path(args.behavior_probe).exists():
+        if args.behavior_probe is None or not Path(args.behavior_probe).exists():
             print(f"[gradcam] WARNING: behavior probe not found at {args.behavior_probe}")
             print(f"[gradcam] Run: python eval/probe_behavior.py --config {args.config} --checkpoint {args.checkpoint}")
         else:
             print(f"[gradcam] loading behavior probe from {args.behavior_probe}")
             behavior_head, behavior_names = load_behavior_probe(
-                str(args.behavior_probe), cfg.latent_dim, device
+                str(args.behavior_probe), device
             )
             print(f"[gradcam] behavior classes: {behavior_names}")
 
     if args.mode in ["dataset", "both"]:
-        if not Path(args.dataset_probe).exists():
+        if args.dataset_probe is None or not Path(args.dataset_probe).exists():
             print(f"[gradcam] WARNING: dataset probe not found at {args.dataset_probe}")
             print(f"[gradcam] Run: python eval/probe_dataset.py --config {args.config} --checkpoint {args.checkpoint}")
         else:
             print(f"[gradcam] loading dataset probe from {args.dataset_probe}")
             dataset_head, dataset_names = load_dataset_probe(
-                str(args.dataset_probe), cfg.latent_dim, device
+                str(args.dataset_probe), device
             )
             print(f"[gradcam] dataset classes: {len(dataset_names)} datasets")
 
@@ -357,8 +372,13 @@ def main() -> None:
     samples = extract_sample_crops(cfg, args.n_samples, args.seed)
     print(f"[gradcam] extracted {len(samples)} samples")
 
+    if not samples:
+        print("[gradcam] WARNING: no samples extracted. check dataset configuration or zarr paths.")
+        return
+
     # Output directory
     output_dir = Path("latent_space") / f"gradcam_{time.strftime('%Y%m%d_%H%M%S')}"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Run Grad-CAM
     if args.mode in ["behavior", "both"] and behavior_head is not None:
