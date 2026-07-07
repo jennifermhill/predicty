@@ -425,7 +425,7 @@ def main() -> None:
         "head_state_dict": best_head.state_dict(),
         "input_dim": cfg.latent_dim,
         "output_dim": n_classes,
-        "class_names": sorted(df['label'].unique()).tolist(),
+        "class_names": sorted(set(df['label']) if isinstance(df['label'], list) else df['label'].unique()),
         "val_acc": best_va_acc,
         "fold_idx": best_fold_idx,
         "args": vars(args),
