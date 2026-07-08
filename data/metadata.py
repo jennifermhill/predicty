@@ -1,13 +1,18 @@
 """metadata lookup for zarr datasets.
 
-each experiment has a row (or several) in training_data_index.xlsx. the
-critical field for temporal sampling is `interval_minutes`, the wall-clock
-spacing between frames.
+each experiment has one or more rows in training_data_index.xlsx, one per
+strain. callers pass a zarr_path containing a mixin token (e.g.
+".../cryolite_mixin_test65_..."). the spreadsheet `expt` column uses the
+compact form `mixin65`; we normalize between the two.
 
-callers pass a zarr_path containing a mixin token. on disk the folder names
-look like `cryolite_mixin_test41_2024-01-09`, while the spreadsheet `expt`
-column uses the compact form `mixin41`. we accept both spellings (mixin41,
-mixin_test41, mixin-test-41, ...) and normalize to the compact form.
+when a mixin has multiple rows (e.g. mixin65 has strains NC28.1 and WS205),
+we disambiguate by looking for the row's `strain` value as a substring of
+the zarr_path. paths produced by Jennifer's pipeline include the strain name
+in a parent folder and/or the filename (".../NC28.1_overnight_day1/...").
+
+if a mixin has exactly one row, we don't need to match the strain — the row
+is unambiguous on its own. this is the common case for mixins where only one
+strain was recorded.
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ import re
 import xml.etree.ElementTree as et
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 # tolerate any non-digit junk between "mixin" and the digit suffix, so paths
 # like ".../cryolite_mixin_test41_..." resolve to "mixin41".
@@ -33,46 +39,110 @@ def extract_mixin_id(zarr_path: str) -> str:
 
 
 def get_interval_minutes(zarr_path: str, index_path: str | Path) -> float:
-    """return the unique interval_minutes for the experiment in `zarr_path`."""
-    mixin_id = extract_mixin_id(zarr_path)
-    return _interval_for_mixin(mixin_id, str(index_path))
+    """return interval_minutes for the (mixin, strain) row matching zarr_path."""
+    row = _resolve_row(zarr_path, str(index_path))
+    val = row["interval_minutes"]
+    if _is_blank(val):
+        raise ValueError(
+            f"interval_minutes is missing for {extract_mixin_id(zarr_path)!r} "
+            f"(strain={row.get('strain')!r}) in {index_path}"
+        )
+    return float(val)
+
+
+def get_z_limit(zarr_path: str, index_path: str | Path) -> int | None:
+    """return the per-experiment z cap for the (mixin, strain) row matching
+    zarr_path. 1-indexed inclusive max == 0-indexed exclusive upper bound.
+    a blank cell means the row is marked not-for-training; returns None.
+    """
+    row = _resolve_row(zarr_path, str(index_path))
+    val = row["z_limit"]
+    if _is_blank(val):
+        return None
+    return int(val)
 
 
 @lru_cache(maxsize=8)
-def _interval_for_mixin(mixin_id: str, index_path: str) -> float:
-    """cached lookup keyed by (mixin_id, index_path)."""
+def _load_index(index_path: str) -> Any:
+    """cached spreadsheet load. one read per (index_path) per process."""
     import pandas as pd
 
     if not Path(index_path).exists():
         raise FileNotFoundError(
             f"training_data_index spreadsheet not found at {index_path}"
         )
-    df = pd.read_excel(index_path)
-    if "expt" not in df.columns or "interval_minutes" not in df.columns:
+    return pd.read_excel(index_path)
+
+
+def _is_blank(val: Any) -> bool:
+    import pandas as pd
+
+    return val is None or (isinstance(val, float) and pd.isna(val)) or pd.isna(val)
+
+
+def _resolve_row(zarr_path: str, index_path: str) -> Any:
+    """pick the spreadsheet row matching zarr_path. disambiguates multi-strain
+    mixins by substring-matching the spreadsheet `strain` value against
+    zarr_path. returns a single pandas Series.
+    """
+    mixin_id = extract_mixin_id(zarr_path)
+    df = _load_index(index_path)
+
+    required = {"expt", "strain", "interval_minutes", "z_limit"}
+    missing = required - set(df.columns)
+    if missing:
         raise ValueError(
-            f"{index_path} is missing required columns 'expt' and/or 'interval_minutes'"
+            f"{index_path} is missing required columns: {sorted(missing)}"
         )
 
     expt_series = df["expt"].astype(str).str.strip().str.lower()
     rows = df[expt_series == mixin_id]
     if rows.empty:
-        raise ValueError(
-            f"no rows in {index_path} for experiment {mixin_id!r}"
-        )
+        raise ValueError(f"no rows in {index_path} for experiment {mixin_id!r}")
+    if len(rows) == 1:
+        return rows.iloc[0]
 
-    intervals = rows["interval_minutes"].dropna().unique().tolist()
-    if not intervals:
+    # multi-row case: try to match strain against the zarr path.
+    path_lower = zarr_path.lower()
+    strains = rows["strain"].astype(str).str.strip()
+    valid = strains[strains.str.lower() != "nan"]
+    matches = rows.loc[
+        valid.index[[s.lower() in path_lower for s in valid]]
+    ]
+
+    if matches.empty:
+        # strain disambiguation failed; fall back to well column (e.g. "B2"
+        # appears in a path like ".../Field_B2/...").
+        if "well" in rows.columns:
+            wells = rows["well"].astype(str).str.strip()
+            valid_wells = wells[wells.str.lower() != "nan"]
+            well_matches = rows.loc[
+                valid_wells.index[[w.lower() in path_lower for w in valid_wells]]
+            ]
+            if len(well_matches) == 1:
+                return well_matches.iloc[0]
         raise ValueError(
-            f"interval_minutes is missing for experiment {mixin_id!r} in {index_path}"
+            f"{mixin_id!r} has {len(rows)} rows (strains {strains.tolist()}) "
+            f"but none of those strain tokens appear in zarr_path: {zarr_path}"
         )
-    if len(intervals) > 1:
+    if len(matches) == 1:
+        return matches.iloc[0]
+
+    # multiple strains substring-match (e.g. 'NC28' and 'NC28.1' both fit).
+    # prefer the most specific match: longest strain string.
+    lengths = matches["strain"].astype(str).str.len()
+    best = matches[lengths == lengths.max()]
+    if len(best) > 1:
         raise ValueError(
-            f"inconsistent interval_minutes for {mixin_id!r}: {intervals}"
+            f"ambiguous strain match for {mixin_id!r} in {zarr_path}; "
+            f"tied strains: {best['strain'].tolist()}"
         )
-    return float(intervals[0])
+    return best.iloc[0]
 
 def get_voxel_dims(zarr_path, res_lvl=0):
     xml_file = Path(zarr_path) / "OME" / "METADATA.ome.xml"
+    if not xml_file.exists():
+        raise FileNotFoundError(f"OME metadata file not found at {xml_file}")
     XML_tree = et.parse(xml_file)
     XML_root = XML_tree.getroot()
 
@@ -83,8 +153,14 @@ def get_voxel_dims(zarr_path, res_lvl=0):
         res_lvl = 0
 
     pixels = images[res_lvl].find('ome:Pixels', namespaces)
+    if pixels is None:
+        raise ValueError(f"OME Pixels element not found at resolution level {res_lvl}")
 
-    pixel_size_x = float(pixels.get('PhysicalSizeX'))
-    pixel_size_y = float(pixels.get('PhysicalSizeY'))
-    pixel_size_z = float(pixels.get('PhysicalSizeZ'))
-    return pixel_size_x, pixel_size_y, pixel_size_z
+    pixel_size_x = pixels.get('PhysicalSizeX')
+    pixel_size_y = pixels.get('PhysicalSizeY')
+    pixel_size_z = pixels.get('PhysicalSizeZ')
+
+    if pixel_size_x is None or pixel_size_y is None or pixel_size_z is None:
+        raise ValueError(f"Physical pixel size attributes missing in OME metadata")
+
+    return float(pixel_size_x), float(pixel_size_y), float(pixel_size_z)

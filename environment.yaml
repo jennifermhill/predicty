@@ -118,6 +118,7 @@ dependencies:
       - stack-data==0.6.3
       - sympy==1.13.1
       - terminado==0.18.1
+      - tensorboard==2.18.0
       - tinycss2==1.4.0
       - toolz==1.1.0
       - tornado==6.5.5

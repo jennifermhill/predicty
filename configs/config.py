@@ -27,6 +27,20 @@ class Config:
     # every listed zarr in each batch and `zarr_path` is ignored.
     zarr_paths: list[str] | None = None
 
+    # give every usable zarr equal representation within each batch. counts
+    # differ by at most one when batch_size is not divisible by dataset count.
+    balance_datasets: bool = True
+
+    # path to jsonl file with behavior/dataset annotations for probes.
+    annotation_path: str | None = None
+
+    # oversample minority behavior classes during probe training.
+    overrepresent_classes: bool = False
+
+    # strength of class oversampling when overrepresent_classes is true.
+    # higher = stronger oversampling of rare classes.
+    rep_alpha: float = 0.5
+
     channel: int = 0
     z_thickness: int = 10
 
@@ -47,6 +61,32 @@ class Config:
     # accept a global crop only if its mean is at least this fraction of the
     # mean intensity over the active z slab at t1. lower values are more permissive.
     intensity_min_frac: float = 0.95
+    # Stop retrying an impossible intensity gate forever. A bad threshold or
+    # empty field should fail with context instead of hanging a DataLoader.
+    intensity_max_attempts: int = 1000
+
+    # Spatial region holdout for leakage-controlled probes. Regions are a
+    # row-major grid over legal global-crop top-left positions. DINO training
+    # should use "exclude_holdout"; the dataset-ID probe can override this to
+    # "holdout" so it only sees regions the encoder did not.
+    spatial_region_grid_y: int = 3
+    spatial_region_grid_x: int = 3
+    # Backward-compatible single manual holdout region.
+    spatial_holdout_region: int | None = None
+    # Preferred manual form for multiple held-out regions.
+    spatial_holdout_regions: list[int] | None = None
+    spatial_region_mode: str = "all"
+    # "manual" uses spatial_holdout_regions/spatial_holdout_region. "content"
+    # scores tiles per dataset and selects high-content, non-adjacent regions.
+    spatial_holdout_selection: str = "manual"
+    spatial_holdout_region_count: int = 3
+    spatial_holdout_nonadjacent_gap: int = 1
+    spatial_holdout_min_content: float = 0.95
+    spatial_holdout_content_samples_per_region: int = 8
+    spatial_holdout_seed: int = 0
+    # Internal override used by MultiZarrDataset after aggregating content
+    # scores across datasets, so every dataset holds out the same tile indices.
+    spatial_holdout_resolved_regions: list[int] | None = None
 
     # spreadsheet that maps experiment id -> interval_minutes.
     training_data_index_path: str = "training_data_index.xlsx"
@@ -59,13 +99,23 @@ class Config:
     # "forward" -> t2 = t1 + frame_gap; "backward" -> t2 = t1 - frame_gap.
     temporal_direction: str = "forward"
 
-    # z window as a fraction of each dataset.
+    # z lower bound as a fraction of each dataset. the upper bound is taken
+    # from the per-experiment `z_limit` column in training_data_index.xlsx
+    # (1-indexed inclusive, equivalent to a 0-indexed exclusive cap).
     z_frac_min: float = 0.0
-    z_frac_max: float = 1.0
 
-    # absolute z override for one known dataset.
+    # optional absolute z overrides. z_abs_max is clamped to the spreadsheet
+    # z_limit (it can only narrow the window, never extend past z_limit).
     z_abs_min: int | None = None
     z_abs_max: int | None = None
+
+    # bias z-slab sampling toward the top/bottom of the z range. with
+    # probability `z_edge_bias` a sample's z slab is drawn from an edge band
+    # (low or high, 50/50) instead of uniformly across the whole z range;
+    # 0.0 (default) keeps uniform sampling. `z_edge_band_frac` is each band's
+    # width as a fraction of the usable z-start span.
+    z_edge_bias: float = 0.0
+    z_edge_band_frac: float = 0.15
 
     # t1 window as a fraction of each dataset.
     t1_frac_min: float = 0.0
@@ -91,11 +141,121 @@ class Config:
     aug_percrop_norm: AugCfg = field(default_factory=lambda: AugCfg(
         enabled=True, p=1.0,
     ))
+    aug_flip: AugCfg = field(default_factory=lambda: AugCfg(
+        enabled=False, p=0.5,
+    ))
+    aug_rotation: AugCfg = field(default_factory=lambda: AugCfg(
+        enabled=False, p=0.5,
+    ))
 
     # runtime
     max_intensity: float = 10000.0
     num_workers: int = 4
     seed: int = 0
+
+    # ------------------------------------------------------------------
+    # model
+    # ------------------------------------------------------------------
+    # hybrid encoder: small 3D stem collapses z, then 2D ResNet-50.
+    # stem_channels is the channel count handed to the ResNet's first conv
+    # (ResNet's default 3-channel conv is replaced).
+    stem_channels: int = 64
+    # ResNet-50's pre-classifier output dim, the encoder's representation size.
+    latent_dim: int = 2048
+
+    # projector (DINO head) discarded after training. K is the prototype count
+    # the cross-entropy operates over.
+    projector_hidden: int = 512
+    projector_bottleneck: int = 256
+    projector_k: int = 512
+
+    # ------------------------------------------------------------------
+    # DINO
+    # ------------------------------------------------------------------
+    # teacher softmax temperature (sharp). lower -> more confident targets.
+    teacher_temp_start: float = 0.04
+    teacher_temp_end: float = 0.07
+    temp_warmup_frac: float = 0.3
+    # student softmax temperature (softer). asymmetry vs teacher drives learning.
+    student_temp: float = 0.1
+    # EMA momentum schedule for teacher weights. cosine from start to end.
+    ema_momentum_start: float = 0.996
+    ema_momentum_end: float = 1.0
+    # center buffer momentum. prevents one prototype from dominating.
+    center_momentum: float = 0.9
+
+    # ------------------------------------------------------------------
+    # adversarial dataset classifier
+    # ------------------------------------------------------------------
+    # Trains a small classifier to predict dataset_idx from encoder features,
+    # while a gradient reversal layer sends the opposite gradient into the
+    # encoder. This discourages dataset identity leakage in the representation.
+    dataset_adversary_enabled: bool = False
+    dataset_adversary_weight: float = 0.1
+    dataset_adversary_grl_start: float = 0.0
+    dataset_adversary_grl_scale: float = 1.0
+    dataset_adversary_hidden: int = 256
+    dataset_adversary_dropout: float = 0.1
+
+    # ------------------------------------------------------------------
+    # masked patch autoencoder
+    # ------------------------------------------------------------------
+    # Auxiliary reconstruction loss on global crops. The student encoder sees
+    # a patch-masked crop; the training-only decoder predicts only masked
+    # patch contents. The encoder is still what ships downstream.
+    mae_enabled: bool = False
+    mae_weight: float = 0.05
+    mae_mask_ratio: float = 0.75
+    mae_patch_z: int = 2
+    mae_patch_size: int = 16
+    mae_decoder_hidden: int = 512
+    mae_decoder_depth: int = 2
+    mae_norm_pix_loss: bool = True
+
+    # ------------------------------------------------------------------
+    # iBOT masking-based self-supervised objective
+    # ------------------------------------------------------------------
+    # Distillation-based masking objective: student predicts teacher's soft
+    # token distribution on masked global crops. Independent of MAE, both can
+    # be active simultaneously. Uses same teacher/student architecture and
+    # centering mechanism as DINO but with masked input and cross-entropy loss.
+    ibot_enabled: bool = False
+    ibot_weight: float = 1.0
+    ibot_mask_ratio: float = 0.75
+    ibot_patch_z: int = 2
+    ibot_patch_size: int = 16
+
+    # ------------------------------------------------------------------
+    # optimizer / schedule
+    # ------------------------------------------------------------------
+    base_lr: float = 2.5e-4
+    weight_decay: float = 0.04
+    grad_clip_norm: float = 1.0
+    # fraction of total_steps spent in linear warmup. rest is cosine decay.
+    warmup_frac: float = 0.15
+
+    # ------------------------------------------------------------------
+    # training loop
+    # ------------------------------------------------------------------
+    batch_size: int = 64
+    total_steps: int = 100_000
+    log_interval: int = 50
+    ckpt_interval: int = 2000
+    device: str = "cuda"
+    use_amp: bool = True
+
+    # ------------------------------------------------------------------
+    # io
+    # ------------------------------------------------------------------
+    checkpoint_dir: str = "checkpoints"
+    log_dir: str = "logs"
+
+    # launch a tensorboard server alongside training so a run is viewable
+    # without a separate `tensorboard --logdir ...` invocation. it serves the
+    # root log_dir (all runs), binds all interfaces so it's reachable from the
+    # compute node, and is torn down when training exits.
+    tensorboard_enabled: bool = True
+    tensorboard_port: int = 6006
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "Config":

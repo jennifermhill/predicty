@@ -8,16 +8,37 @@
 #   - zarr_path: single-zarr training. leave null to fall back to the file
 #     picker (or --zarr-path on the cli).
 #   - zarr_paths: multi-zarr training. every batch mixes pairs from each
-#     listed zarr, weighted by usable t1 range. pairs themselves never cross
-#     experiment boundaries. interval_minutes is looked up per-zarr from
+#     listed zarr with equal representation by default. pairs themselves
+#     never cross experiment boundaries. interval_minutes is looked up per-zarr from
 #     `training_data_index_path`, so heterogeneous frame rates handle
 #     themselves. if both are set, zarr_paths wins.
-zarr_path: null
+
 # example multi-zarr setup:
 zarr_paths:
-- /Volumes/sgrolab/jennifer/cryolite/cryolite_mixin_test65_2024-04-16/NC28.1_overnight_day1/2024-04-16_ERH_mixin65_plate1_NC28.1_overnight_ERH Red FarRed.zarr
-- /Volumes/sgrolab/jennifer/cryolite/cryolite_mixin_test44_2024-01-17/2024-01-17_ERH_23hr_ERH Red FarRed.zarr
-- /Volumes/sgrolab/jennifer/cryolite/cryolite_mixin_test49_2024-02-08/mixin49_wellB2_24hr_ERH Red FarRed.zarr
+  - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test42_2024-01-12/Field_B2/2024-01-12_ERH_66hrs_ERH Red FarRed_Field_B2.zarr
+  - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test42_2024-01-12/Field_B3/2024-01-12_ERH_66hrs Red FarRed.zarr
+  - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test41_2024-01-09/Field_B3/2024-01-09_ERH_42hr_ERH Red FarRed Field_B3.zarr
+  - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test41_2024-01-09/Field_B2/2024-01-09_ERH_42hr_ERH Red FarRed_Field_B2.zarr
+  - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test43_2024-01-16/2024-01-16_ERH_24hr_ERH Red FarRed.zarr
+  - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test44_2024-01-17/2024-01-17_ERH_23hr_ERH Red FarRed.zarr
+  - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test45_2024-01-30/20240130_ERH_mixin45_wellC2_19.5hr_ERH Red FarRed.zarr
+  - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test49_2024-02-08/mixin49_wellB2_24hr_ERH Red FarRed.zarr
+  - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test52_2024-02-21/ERH_2024-02-20_mixin52_22hr_ERH Red FarRed.zarr
+  - /groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test65_2024-04-16/NC28.1_overnight_day1/2024-04-16_ERH_mixin65_plate1_NC28.1_overnight_ERH Red FarRed.zarr
+
+# to provide model training with a balanced representation of every dataset, using
+# annotated examples and overrepresenting underrpresented classes, assuming the datasets
+# have the same class distribution as the annotated examples.   
+
+annotation_path: /groups/sgro/sgrolab/Aran/predicty/index.jsonl
+overrepresent_classes: true
+rep_alpha: 0.15
+
+
+# balanced batches contain floor(batch_size / dataset_count) samples from
+# every usable zarr. remainder slots rotate across batches. set false to use
+# the previous usable-t1-range-weighted random sampling.
+balance_datasets: true
 
 channel: 0              # which channel to read from the (t, c, z, y, x) array.
 z_thickness: 10         # number of z slices per global crop (depth of the 3d sub-volume).
@@ -38,7 +59,32 @@ local_crop_size: 96
 # minimum crop intensity, as a fraction of the mean intensity over the active
 # z slab at t1. a global crop is accepted only if its mean is at least
 # intensity_min_frac * slab_mean. cached per worker, keyed by (t1, z).
-intensity_min_frac: 0.95
+intensity_min_frac: 0.85
+# fail clearly instead of hanging forever if no sampled crop passes the gate.
+intensity_max_attempts: 1000
+
+# ---------------------------------------------------------------------------
+# spatial holdout
+# ---------------------------------------------------------------------------
+# Regions are defined as a row-major grid over legal global-crop top-left
+# positions in each dataset. For this 3x3 grid, content-based selection scores
+# each tile by crop intensity relative to its frame/slab mean. In multi-zarr
+# runs, scores are aggregated across datasets and the same three high-content,
+# non-adjacent tile indices are held out everywhere. DINO training excludes
+# those selected tiles. The dataset-ID probe overrides spatial_region_mode to
+# "holdout", samples only those selected tiles from every dataset, then splits
+# each held-out tile spatially into probe train/val.
+spatial_region_grid_y: 3
+spatial_region_grid_x: 3
+spatial_holdout_region: null
+spatial_holdout_regions: null
+spatial_region_mode: exclude_holdout
+spatial_holdout_selection: content
+spatial_holdout_region_count: 3
+spatial_holdout_nonadjacent_gap: 1
+spatial_holdout_min_content: 0.95
+spatial_holdout_content_samples_per_region: 8
+spatial_holdout_seed: 0
 
 # ---------------------------------------------------------------------------
 # metadata lookup
@@ -61,14 +107,21 @@ temporal_direction: forward
 # ---------------------------------------------------------------------------
 # z window
 # ---------------------------------------------------------------------------
-# fraction of the z axis to sample anchors from. 0..1 covers the full stack.
+# z lower bound as a fraction of the z axis (0..1). the upper bound is read
+# per-experiment from the `z_limit` column of training_data_index.xlsx
+# (1-indexed inclusive, equivalent to a 0-indexed exclusive cap). a blank
+# z_limit excludes that experiment from training entirely.
 z_frac_min: 0.0
-z_frac_max: 1.0
 
-# absolute z bounds override the fractional window when both are set.
-# leave null to use z_frac_min / z_frac_max.
+# optional absolute overrides. z_abs_max is clamped to the spreadsheet z_limit
+# (it can only narrow the window, never extend past it). leave null to skip.
 z_abs_min: null
 z_abs_max: null
+
+# Always sample the global z slab from the lowest or highest 5% of valid
+# z-start positions (low/high edge chosen with equal probability).
+z_edge_bias: 0.85
+z_edge_band_frac: 0.1
 
 # ---------------------------------------------------------------------------
 # t1 window
@@ -98,26 +151,26 @@ max_intensity: 10000.0
 # random global brightness/contrast shift; `strength` controls magnitude.
 aug_intensity:
   enabled: true
-  p: 0.8
-  strength: 0.4
+  p: 0.9
+  strength: 0.6
 
 # random gamma correction sampled uniformly from gamma_range.
 aug_gamma:
   enabled: true
-  p: 0.8
-  gamma_range: [0.5, 2.0]
+  p: 0.9
+  gamma_range: [0.7, 1.5]
 
 # additive gaussian noise with sigma sampled uniformly from sigma_range.
 aug_noise:
   enabled: true
-  p: 0.5
-  sigma_range: [0.0, 0.05]
+  p: 0.7
+  sigma_range: [0.0, 0.1]
 
 # gaussian blur with sigma sampled uniformly from sigma_range.
 aug_blur:
   enabled: true
-  p: 0.5
-  sigma_range: [0.1, 2.0]
+  p: 0.7
+  sigma_range: [0.1, 3.0]
   kernel_size: 5
 
 # per-crop z-score normalization. applied last so each crop has zero mean,
@@ -126,6 +179,16 @@ aug_percrop_norm:
   enabled: true
   p: 1.0
 
+# random horizontal/vertical flips. semantically preserving for cell behavior.
+aug_flip:
+  enabled: false
+  p: 0.5
+
+# random 90-degree rotations. semantically preserving for cell behavior.
+aug_rotation:
+  enabled: false
+  p: 0.5
+
 # ---------------------------------------------------------------------------
 # runtime
 # ---------------------------------------------------------------------------
@@ -133,9 +196,115 @@ aug_percrop_norm:
 # to fetch crops in parallel. each worker reopens its own zarr handle and
 # pulls samples independently, then hands batches back to the main process.
 # 0 means "load in the main process" (slower but easier to debug).
-num_workers: 4
+num_workers: 6
 
 # seed: base integer used to make sampling reproducible. each worker derives
 # its own rng from (seed + worker_id), and numpy/torch are seeded the same way.
 # change this to get a different stream of crops without touching anything else.
 seed: 0
+
+# ---------------------------------------------------------------------------
+# model (encoder + projector)
+# ---------------------------------------------------------------------------
+# stem_channels: channels handed from the 3D stem into the 2D ResNet-50.
+# latent_dim:    ResNet-50 pre-classifier output (the encoder representation).
+# projector_*:   DINO head sitting on top of the encoder during training.
+#                discarded after training; only the encoder ships.
+stem_channels: 64
+latent_dim: 2048
+projector_hidden: 512
+projector_bottleneck: 256
+projector_k: 2048
+
+# ---------------------------------------------------------------------------
+# DINO loss + EMA
+# ---------------------------------------------------------------------------
+# teacher_temp:  softmax temperature for the teacher. lower -> sharper target.
+# linear warmup from 0.04 to 0.07
+# student_temp:  softmax temperature for the student. asymmetry drives learning.
+# ema_momentum_*: cosine schedule for teacher EMA. starts at 0.996, ends at 1.0.
+# center_momentum: EMA on the centering buffer. prevents prototype collapse.
+teacher_temp_start: 0.04
+teacher_temp_end: 0.07
+temp_warmup_frac: 0.3 #same as DINO paper 
+student_temp: 0.1
+ema_momentum_start: 0.996
+ema_momentum_end: 1.0
+center_momentum: 0.9
+
+# ---------------------------------------------------------------------------
+# adversarial dataset classifier
+# ---------------------------------------------------------------------------
+# predicts dataset_idx from encoder features while gradient reversal pushes the
+# encoder to remove dataset identity. automatically inactive for single-zarr
+# runs because there is no multi-class dataset signal.
+# effective pressure on the encoder ~ weight * grl_scale. grl_scale bumped
+# 1.0 -> 2.0 to push harder on dataset leakage while keeping weight at 0.1, so
+# the experiment changes one lever (reversed-gradient strength) and stays
+# interpretable. watch dataset_adversary/acc trending toward chance
+# (1/n_datasets) and collapse/embedding_var staying off the floor.
+dataset_adversary_enabled: true
+dataset_adversary_weight: 0.1
+dataset_adversary_grl_start: 0.0
+dataset_adversary_grl_scale: 3.0
+dataset_adversary_hidden: 256
+dataset_adversary_dropout: 0.1
+
+# ---------------------------------------------------------------------------
+# masked patch autoencoder
+# ---------------------------------------------------------------------------
+# auxiliary global-crop reconstruction. the shared encoder sees patch-masked
+# crops; the training-only decoder predicts masked voxel patches.
+mae_enabled: true
+mae_weight: 0.05
+mae_mask_ratio: 0.75
+mae_patch_z: 2
+mae_patch_size: 16
+mae_decoder_hidden: 512
+mae_decoder_depth: 2
+mae_norm_pix_loss: true
+
+# ---------------------------------------------------------------------------
+# image BERT (iBOT) masked image modeling
+# ---------------------------------------------------------------------------
+# auxiliary global-crop reconstruction with different masking strategy than MAE.
+# uses block-wise masking instead of patch-wise for more spatial coherence.
+ibot_weight: 0.1
+ibot_mask_ratio: 0.75
+
+# ---------------------------------------------------------------------------
+# optimizer / LR schedule
+# ---------------------------------------------------------------------------
+# base_lr:        peak LR after warmup. scale linearly with batch_size if changed.
+# weight_decay:   applied to weight matrices only (biases / norm scales excluded).
+# grad_clip_norm: clip gradient L2 norm to this value before each optimizer step.
+# warmup_frac:    fraction of total_steps spent in linear warmup. cosine after.
+base_lr: 1.25e-4
+weight_decay: 0.04
+grad_clip_norm: 1.0
+warmup_frac: 0.1
+
+# ---------------------------------------------------------------------------
+# training loop
+# ---------------------------------------------------------------------------
+# batch_size:    samples per step (each yields 2 globals + n_local_crops locals).
+# total_steps:   total training steps. 100k is a reasonable starting point.
+# log_interval:  steps between tensorboard scalars + console lines.
+# ckpt_interval: steps between checkpoint saves. each saves to step_NNNNNN.pt
+#                plus a `latest.pt` symlink-style copy.
+# device:        'cuda' for HPC GPU, 'cpu' for local smoke tests.
+# use_amp:       fp16 autocast on cuda. silently disabled on cpu.
+batch_size: 40
+total_steps: 5000
+log_interval: 50
+ckpt_interval: 500
+device: cuda
+use_amp: true
+
+# ---------------------------------------------------------------------------
+# io
+# ---------------------------------------------------------------------------
+# checkpoint_dir: where checkpoint files land. relative paths resolve from cwd.
+# log_dir:        tensorboard event files. view with `tensorboard --logdir logs`.
+checkpoint_dir: checkpoints
+log_dir: logs
