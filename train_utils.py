@@ -98,6 +98,7 @@ def save_checkpoint(path, model, optimizer, scaler, step: int) -> None:
         "optimizer_state_dict": optimizer.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
         "center": model.center.detach().cpu(),
+        "ibot_center": model.ibot_center.detach().cpu() if hasattr(model, "ibot_center") else None,
         "step": int(step),
     }
     if getattr(model, "dataset_classifier", None) is not None:
@@ -145,14 +146,22 @@ def load_checkpoint(
                 "starting MAE decoder from initialization"
             )
     model.center.copy_(state["center"].to(model.center.device))
+    if "ibot_center" in state and state["ibot_center"] is not None:
+        if hasattr(model, "ibot_center"):
+            model.ibot_center.copy_(state["ibot_center"].to(model.ibot_center.device))
     if optimizer is not None:
         try:
             optimizer.load_state_dict(state["optimizer_state_dict"])
         except ValueError as e:
             print(
                 "[checkpoint] optimizer state is incompatible with the current "
-                f"trainable modules; continuing with a fresh optimizer ({e})"
+                f"trainable modules; resetting optimizer ({e})"
             )
+            # re-initialize optimizer state to avoid stale momentum buffers
+            for group in optimizer.param_groups:
+                for p in group["params"]:
+                    param_state = optimizer.state[p]
+                    param_state.clear()
     if scaler is not None:
         scaler.load_state_dict(state["scaler_state_dict"])
     return int(state["step"])

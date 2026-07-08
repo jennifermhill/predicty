@@ -141,6 +141,8 @@ def _resolve_row(zarr_path: str, index_path: str) -> Any:
 
 def get_voxel_dims(zarr_path, res_lvl=0):
     xml_file = Path(zarr_path) / "OME" / "METADATA.ome.xml"
+    if not xml_file.exists():
+        raise FileNotFoundError(f"OME metadata file not found at {xml_file}")
     XML_tree = et.parse(xml_file)
     XML_root = XML_tree.getroot()
 
@@ -151,8 +153,14 @@ def get_voxel_dims(zarr_path, res_lvl=0):
         res_lvl = 0
 
     pixels = images[res_lvl].find('ome:Pixels', namespaces)
+    if pixels is None:
+        raise ValueError(f"OME Pixels element not found at resolution level {res_lvl}")
 
-    pixel_size_x = float(pixels.get('PhysicalSizeX'))
-    pixel_size_y = float(pixels.get('PhysicalSizeY'))
-    pixel_size_z = float(pixels.get('PhysicalSizeZ'))
-    return pixel_size_x, pixel_size_y, pixel_size_z
+    pixel_size_x = pixels.get('PhysicalSizeX')
+    pixel_size_y = pixels.get('PhysicalSizeY')
+    pixel_size_z = pixels.get('PhysicalSizeZ')
+
+    if pixel_size_x is None or pixel_size_y is None or pixel_size_z is None:
+        raise ValueError(f"Physical pixel size attributes missing in OME metadata")
+
+    return float(pixel_size_x), float(pixel_size_y), float(pixel_size_z)

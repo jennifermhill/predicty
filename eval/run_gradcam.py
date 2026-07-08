@@ -162,12 +162,10 @@ def extract_sample_crops(
             break
         samples.append(
             {
-                "crop": batch["globals"][0, 0],  # (1, Z, H, W) - use t1 global
-                "metadata": {k: v[0] for k, v in batch["meta"].items()},
+                "crop": sample["globals"][0],  # (1, Z, H, W) - use t1 global
+                "metadata": sample["meta"],
             }
         )
-        if len(samples) >= n_samples:
-            break
     return samples
 
 
@@ -195,7 +193,11 @@ def run_behavior_gradcam(
 
     samples_df = pd.read_json(cfg.annotation_path, lines=True)
     samples_df = samples_df[samples_df['label'].isin(behavior_names)]
+    if cfg.zarr_paths is None:
+        raise ValueError("cfg.zarr_paths must be set for behavior Grad-CAM with annotations")
     samples_df = samples_df[samples_df['zarr_path'].isin(cfg.zarr_paths)]
+    if len(samples_df) == 0:
+        raise ValueError("No annotated samples found matching behavior names and zarr paths")
     samples_df = samples_df.drop(columns = ['timestamp'])
     for col in samples_df.columns:
         try:
@@ -296,8 +298,9 @@ def run_dataset_gradcam(
         gradcams_np = {k: v.cpu().numpy() for k, v in gradcams_upsampled.items()}
         dataset_names_subset = dataset_names[:n_datasets_to_show]
         for i in range(len(dataset_names_subset)):
-            dataset_names_subset[i] = dataset_names_subset[i][dataset_names_subset[i].rindex("/") + 1:]
             # strips path for better visualization
+            if "/" in dataset_names_subset[i]:
+                dataset_names_subset[i] = dataset_names_subset[i][dataset_names_subset[i].rindex("/") + 1:]
 
         visualize_gradcam_multiclass(
             crop_2d,

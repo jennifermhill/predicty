@@ -23,11 +23,6 @@ class Config:
     # left null so the file picker / --zarr-path flag can fill it at runtime.
     zarr_path: str | None = None
 
-    #when True, training data compensates for class imbalance using annotated examples
-    annotation_path: str | None = None
-    overrepresent_classes: bool = False
-    rep_alpha: float = 0.5
-
     # multi-zarr training. when non-null, the dataloader mixes pairs from
     # every listed zarr in each batch and `zarr_path` is ignored.
     zarr_paths: list[str] | None = None

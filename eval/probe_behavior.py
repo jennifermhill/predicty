@@ -195,9 +195,9 @@ def train_probe(
     batch_size: int,
     weight_decay: float,
     device: torch.device,
-) -> tuple[float, float, torch.Tensor]:
+) -> tuple[float, float, torch.Tensor, nn.Linear]:
     """train a single nn.Linear with AdamW + cross-entropy; return train_acc,
-    val_acc, and the val-set confusion matrix.
+    val_acc, confusion matrix, and the trained head.
     """
     head = nn.Linear(X_train.size(1), n_classes).to(device)
     opt = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=weight_decay)
@@ -236,7 +236,7 @@ def train_probe(
         for t, p in zip(y_val.cpu().tolist(), preds.cpu().tolist()):
             cm[t, p] += 1
 
-    return tr_acc, va_acc, cm
+    return tr_acc, va_acc, cm, head
 
 
 def print_confusion_matrix(cm: torch.Tensor, classes: list[str]) -> None:
@@ -298,6 +298,9 @@ def main() -> None:
         except (ValueError, TypeError):
             pass
     cfg.zarr_paths = list(df['zarr_path'].unique())
+    # Create dataset_idx mapping for stratified k-fold splitting
+    zarr_path_to_idx = {p: i for i, p in enumerate(cfg.zarr_paths)}
+    df['dataset_idx'] = df['zarr_path'].map(zarr_path_to_idx)
 
     device = torch.device(args.device or cfg.device)
     print(f"[probe] device      : {device}")
@@ -314,7 +317,8 @@ def main() -> None:
 
     # --- load encoder ---
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-    print(f"[probe] checkpoint saved at training step {ckpt['step']}")
+    step = ckpt.get("step", "unknown")
+    print(f"[probe] checkpoint saved at training step {step}")
     encoder = HybridEncoder(
         stem_channels=cfg.stem_channels,
         latent_dim=cfg.latent_dim,
@@ -351,7 +355,7 @@ def main() -> None:
 
         # --- train probe ---
         print(f"[probe] training linear head (in_dim={cfg.latent_dim}, out_dim={n_classes})...")
-        tr_acc, va_acc, cm = train_probe(
+        tr_acc, va_acc, cm, head = train_probe(
             X_train, y_train, X_val, y_val,
             n_classes=n_classes,
             probe_steps=args.probe_steps,
@@ -363,27 +367,12 @@ def main() -> None:
         fold_train_accs.append(tr_acc)
         fold_val_accs.append(va_acc)
         fold_cms.append(cm)
-
-        # Save the trained head for this fold
-        head = nn.Linear(cfg.latent_dim, n_classes).to(device)
-        opt = torch.optim.AdamW(head.parameters(), lr=args.probe_lr, weight_decay=args.probe_weight_decay)
-        ce = nn.CrossEntropyLoss()
-        X_train, y_train = X_train.to(device), y_train.to(device)
-        n = X_train.size(0)
-        gen = torch.Generator(device=device).manual_seed(42)
-        for step in range(args.probe_steps):
-            idx = torch.randint(0, n, (args.probe_batch_size,), device=device, generator=gen)
-            logits = head(X_train[idx])
-            loss = ce(logits, y_train[idx])
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
         fold_heads.append((head.cpu(), va_acc))
 
         # --- fold-specific report ---
         print()
         print("=" * 70)
-        print(f"  FOLD {fold_idx+1}/{args.n_splits} RESULT @ training step {ckpt['step']}")
+        print(f"  FOLD {fold_idx+1}/{args.n_splits} RESULT @ training step {step}")
         print("=" * 70)
         print(f"  train_acc        : {tr_acc*100:6.2f}%")
         print(f"  val_acc          : {va_acc*100:6.2f}%   (chance = {chance_pct:.1f}%)")

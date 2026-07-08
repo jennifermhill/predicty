@@ -200,6 +200,7 @@ class DINOWrapper(nn.Module):
 
         # teacher: frozen deep-copy of the student. EMA-updated each step.
         self.teacher = copy.deepcopy(self.student)
+        self.teacher.eval()
         for p in self.teacher.parameters():
             p.requires_grad = False
 

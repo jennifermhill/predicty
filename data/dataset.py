@@ -518,14 +518,15 @@ class ZarrCellDataset(IterableDataset):
         while True:
             yield self._sample_pair(rng)
 
-    def _annotation_tensor(self, t1: int, t2: int, z: int, x_off: int, y_off: int, dataset_idx: int = 0
+    def _annotation_tensor_with_augmentation(self, t1: int, t2: int, z: int, x_off: int, y_off: int, dataset_idx: int = 0
     ) -> dict[str, Any]:
         cfg = self.cfg
         g_size = cfg.global_crop_size
         l_size = cfg.local_crop_size
         g_z = cfg.z_thickness
         l_z = cfg.local_z_thickness
-        rng = random.Random()
+        # seed RNG for reproducibility based on sample coordinates
+        rng = random.Random((t1, t2, z, x_off, y_off, dataset_idx))
 
         raw_t1 = self._load_crop_raw(t1, z, y_off, x_off, g_size, g_size)
         raw_t2 = self._load_crop_raw(t2, z, y_off, x_off, g_size, g_size)

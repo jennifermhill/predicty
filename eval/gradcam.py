@@ -86,6 +86,8 @@ class GradCAM:
 
         # Forward pass
         input_tensor = input_tensor.to(self.device).requires_grad_(True)
+        if input_tensor.size(0) != 1:
+            raise ValueError(f"Expected batch size 1, got {input_tensor.size(0)}")
         with torch.enable_grad():
             embedding = self.encoder(input_tensor)
             logits = self.classifier(embedding)

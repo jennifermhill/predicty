@@ -250,61 +250,6 @@ def spatial_holdout_split(
     return X_train, y_train, X_val, y_val
 
 
-def train_probe(
-    X_train: torch.Tensor,
-    y_train: torch.Tensor,
-    X_val: torch.Tensor,
-    y_val: torch.Tensor,
-    n_classes: int,
-    probe_steps: int,
-    lr: float,
-    batch_size: int,
-    weight_decay: float,
-    device: torch.device,
-) -> tuple[float, float, torch.Tensor]:
-    """train a single nn.Linear with AdamW + cross-entropy; return train_acc,
-    val_acc, and the val-set confusion matrix.
-    """
-    head = nn.Linear(X_train.size(1), n_classes).to(device)
-    opt = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=weight_decay)
-    ce = nn.CrossEntropyLoss()
-
-    X_train = X_train.to(device)
-    y_train = y_train.to(device)
-    X_val = X_val.to(device)
-    y_val = y_val.to(device)
-
-    n = X_train.size(0)
-    gen = torch.Generator(device=device).manual_seed(0)
-
-    for step in range(probe_steps):
-        idx = torch.randint(0, n, (batch_size,), device=device, generator=gen)
-        logits = head(X_train[idx])
-        loss = ce(logits, y_train[idx])
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-
-        if step == 0 or (step + 1) % max(1, probe_steps // 10) == 0:
-            with torch.no_grad():
-                tr_acc = (head(X_train).argmax(1) == y_train).float().mean().item()
-                va_acc = (head(X_val).argmax(1) == y_val).float().mean().item()
-            print(
-                f"  [probe] step {step+1:4d}/{probe_steps}  "
-                f"loss={loss.item():.4f}  train_acc={tr_acc:.3f}  val_acc={va_acc:.3f}"
-            )
-
-    with torch.no_grad():
-        tr_acc = (head(X_train).argmax(1) == y_train).float().mean().item()
-        preds = head(X_val).argmax(1)
-        va_acc = (preds == y_val).float().mean().item()
-        cm = torch.zeros(n_classes, n_classes, dtype=torch.long)
-        for t, p in zip(y_val.cpu().tolist(), preds.cpu().tolist()):
-            cm[t, p] += 1
-
-    return tr_acc, va_acc, cm
-
-
 def print_confusion_matrix(cm: torch.Tensor, zarr_paths: list[str]) -> None:
     """print a labeled confusion matrix and per-class accuracy."""
     n = cm.size(0)

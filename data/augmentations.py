@@ -93,11 +93,11 @@ class RandomFlip2D(_Aug):
 
     def _apply(self, x: Tensor) -> Tensor:
         # x is [1, H, W] or [1, Z, H, W]
-        dim = 3 if x.ndim == 4 else 2  # flip H dimension
+        # flip H or W dimension (last two spatial dims)
         if torch.rand(()) < 0.5:
-            x = torch.flip(x, dims=[dim])
-        else:  # flip W dimension
-            x = torch.flip(x, dims=[dim + 1])
+            x = torch.flip(x, dims=[-2])  # flip H (second-to-last)
+        else:
+            x = torch.flip(x, dims=[-1])  # flip W (last)
         return x
 
 

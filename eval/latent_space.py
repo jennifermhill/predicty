@@ -147,8 +147,13 @@ def extract_embeddings(
         children = [ds]
 
 
+    if cfg.annotation_path is None:
+        raise ValueError("cfg.annotation_path must be set for latent space extraction")
     ann_df = pd.read_json(cfg.annotation_path, lines=True)
     ann_df = ann_df[ann_df["label"] != "empty"]
+
+    if cfg.zarr_paths is None:
+        raise ValueError("cfg.zarr_paths must be set for latent space extraction")
     ann_df = ann_df[ann_df["zarr_path"].isin(cfg.zarr_paths)]
     ann_df = ann_df.drop(columns=["timestamp"]).reset_index(drop=True)
 
@@ -307,11 +312,16 @@ def extract_embeddings(
     return X, rows[:n_crops]
 
 def load_cached_embeddings(path: Path, cfg: Config) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Cached embeddings file not found at {path}")
     data = np.load(path, allow_pickle=False)
     X = data["embeddings"]
     n = X.shape[0]
 
     zarr_paths = list(cfg.zarr_paths) if cfg.zarr_paths else [cfg.zarr_path or ""]
+    if not zarr_paths or all(p == "" for p in zarr_paths):
+        raise ValueError("No zarr paths configured for loading embeddings")
 
     rows: list[dict[str, Any]] = []
     for i in range(n):
