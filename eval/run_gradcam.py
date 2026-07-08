@@ -221,6 +221,14 @@ def run_behavior_gradcam(
         crop = batch["globals"][0]  # (C=1, Z, H, W), no batch dim
         crop = crop.unsqueeze(0).to(device)  # (1, 1, Z, H, W) = (B, C, Z, H, W)
 
+        # predicted class + probabilities for this crop, so the plot can flag
+        # what the model actually decided alongside where it looked.
+        with torch.no_grad():
+            logits = behavior_head(encoder(crop))
+            prob_vec = torch.softmax(logits, dim=-1)[0]
+            pred_class = int(prob_vec.argmax().item())
+            probs = {i: float(prob_vec[i].item()) for i in range(len(behavior_names))}
+
         # Generate Grad-CAM for all behaviors
         print(f"\nSample {sample_idx + 1}/{n_samples}")
         gradcams = gradcam.generate_gradcam_multiclass(
@@ -245,8 +253,13 @@ def run_behavior_gradcam(
             crop_2d,
             gradcams_np,
             behavior_names,
-            title=f"Behavior Grad-CAM - Sample {sample_idx + 1} - Behavior {behavior_name}",
+            title=(
+                f"Behavior Grad-CAM - Sample {sample_idx + 1} - "
+                f"true: {behavior_name} - pred: {behavior_names[pred_class]}"
+            ),
             save_path=str(output_dir / f"behavior_gradcam_{sample_idx:03d}.png"),
+            pred_class=pred_class,
+            probs=probs,
         )
 
         print(f"  Saved: behavior_gradcam_{sample_idx:03d}.png")

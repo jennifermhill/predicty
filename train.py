@@ -29,7 +29,12 @@ from torch.utils.tensorboard import SummaryWriter
 from configs.config import Config
 from data.dataset import MultiZarrDataset, ZarrCellDataset, worker_init_fn
 from data.picker import pick_zarr_path
-from models.dino import DINOWrapper, dino_loss, ibot_loss
+from models.dino import (
+    DINOWrapper,
+    dino_loss,
+    ibot_loss,
+    ibot_reconstruction_accuracy,
+)
 from train_utils import (
     batch_to_device,
     ema_momentum_schedule,
@@ -379,6 +384,15 @@ def main() -> None:
                 mae_mask_ratio = (
                     out["mae"]["mask_ratio"] if out["mae"] is not None else None
                 )
+                # iBOT prototype-recovery accuracy: how well the masked student
+                # matches the teacher's assignment on the full crop.
+                ibot_acc = None
+                if out["student_masking_globals"] is not None:
+                    ibot_acc = ibot_reconstruction_accuracy(
+                        out["student_masking_globals"],
+                        out["teacher_masking_globals"],
+                        model.ibot_center,
+                    )
 
             dt = time.time() - t_last_log
             t_last_log = time.time()
@@ -401,8 +415,14 @@ def main() -> None:
             if mae_loss is not None and mae_mask_ratio is not None:
                 writer.add_scalar("mae/loss", mae_loss.item(), step)
                 writer.add_scalar("mae/mask_ratio", mae_mask_ratio.item(), step)
+                writer.add_scalar("mae/recon_r2", out["mae"]["recon_r2"].item(), step)
+                writer.add_scalar("mae/recon_corr", out["mae"]["recon_corr"].item(), step)
+                writer.add_scalar("mae/recon_rel_l2", out["mae"]["recon_rel_l2"].item(), step)
             if ibot_loss_val is not None:
                 writer.add_scalar("ibot/loss", ibot_loss_val.item(), step)
+                if ibot_acc is not None:
+                    writer.add_scalar("ibot/recon_acc_top1", ibot_acc["top1"].item(), step)
+                    writer.add_scalar("ibot/recon_acc_top5", ibot_acc["topk"].item(), step)
 
             msg = (
                 f"step {step:06d}  loss={loss.item():.4f}  lr={lr:.2e}  "
@@ -416,9 +436,17 @@ def main() -> None:
                     f"ds_acc={dataset_acc.item():.3f}"
                 )
             if mae_loss is not None:
-                msg += f"  mae_loss={mae_loss.item():.4f}"
+                msg += (
+                    f"  mae_loss={mae_loss.item():.4f} "
+                    f"mae_r2={out['mae']['recon_r2'].item():.3f}"
+                )
             if ibot_loss_val is not None:
                 msg += f"  ibot_loss={ibot_loss_val.item():.4f}"
+                if ibot_acc is not None:
+                    msg += (
+                        f" ibot_acc@1={ibot_acc['top1'].item():.3f} "
+                        f"ibot_acc@5={ibot_acc['topk'].item():.3f}"
+                    )
             print(msg)
 
         # ---- checkpoint ----

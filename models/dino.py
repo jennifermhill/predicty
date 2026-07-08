@@ -396,6 +396,31 @@ def ibot_loss(
     return -(t * s).sum(dim=-1).mean()
 
 
+@torch.no_grad()
+def ibot_reconstruction_accuracy(
+    student_ibot: torch.Tensor,
+    teacher_ibot: torch.Tensor,
+    ibot_center: torch.Tensor,
+    top_k: int = 5,
+) -> dict[str, torch.Tensor]:
+    """Prototype-recovery accuracy for the iBOT masking objective.
+
+    the iBOT target is the teacher's prototype assignment on the unmasked crop.
+    "reconstruction accuracy" is how often the student, seeing only the masked
+    crop, recovers that assignment. top-1 is exact-match; top-k credits the
+    student when the teacher's argmax lands in its k most confident prototypes.
+    both are the interpretable companion to the raw cross-entropy loss.
+    """
+    teacher_target = (teacher_ibot - ibot_center).argmax(dim=-1)
+    student_pred = student_ibot.argmax(dim=-1)
+    top1 = (student_pred == teacher_target).float().mean()
+
+    k = min(top_k, student_ibot.size(-1))
+    student_topk = student_ibot.topk(k, dim=-1).indices
+    topk = (student_topk == teacher_target.unsqueeze(-1)).any(dim=-1).float().mean()
+    return {"top1": top1, "topk": topk}
+
+
 if __name__ == "__main__":
     # smoke test with random tensors. no zarr required.
     # run from project root: python -m models.dino
@@ -468,6 +493,15 @@ if __name__ == "__main__":
         )
         loss = loss + ibot_loss_val
         print(f"ibot_loss: {ibot_loss_val.item():.4f}")
+        ibot_acc = ibot_reconstruction_accuracy(
+            out["student_masking_globals"],
+            out["teacher_masking_globals"],
+            wrapper.ibot_center,
+        )
+        print(
+            f"ibot_recon_acc: top1={ibot_acc['top1'].item():.3f} "
+            f"top5={ibot_acc['topk'].item():.3f}"
+        )
 
     print(f"loss: {loss.item():.4f}")
     assert torch.isfinite(loss), "loss is not finite"

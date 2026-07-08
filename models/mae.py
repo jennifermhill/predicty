@@ -19,6 +19,33 @@ def _trunc_normal_(x: torch.Tensor, std: float = 0.02) -> None:
     nn.init.trunc_normal_(x, std=std, a=-2 * std, b=2 * std)
 
 
+def _reconstruction_metrics(
+    pred: torch.Tensor, target: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Scale-free reconstruction quality between two flat voxel tensors.
+
+    Returns (r2, pearson_corr, relative_l2). r2 and corr sit in [-1, 1] where
+    higher is better; rel_l2 is in [0, inf) where lower is better. Falls back to
+    finite defaults when the target is constant (undefined variance).
+    """
+    if pred.numel() == 0:
+        zero = pred.new_zeros(())
+        return zero, zero, zero
+
+    target_mean = target.mean()
+    ss_tot = ((target - target_mean) ** 2).sum()
+    ss_res = ((target - pred) ** 2).sum()
+    r2 = 1.0 - ss_res / ss_tot.clamp(min=1e-8)
+
+    pred_centered = pred - pred.mean()
+    target_centered = target - target_mean
+    denom = (pred_centered.norm() * target_centered.norm()).clamp(min=1e-8)
+    corr = (pred_centered * target_centered).sum() / denom
+
+    rel_l2 = ss_res.sqrt() / target.norm().clamp(min=1e-8)
+    return r2, corr, rel_l2
+
+
 def make_random_mask(
     batch_size: int, n_patches: int, mask_ratio: float, device: torch.device
 ) -> torch.Tensor:
@@ -178,12 +205,25 @@ class MaskedPatchAutoencoder(nn.Module):
         patch_loss = F.mse_loss(pred, target, reduction="none").mean(dim=-1)
         loss = patch_loss[mask].mean()
 
+        # reconstruction quality on masked patches only. mse alone is hard to
+        # read (its scale drifts with norm_pix_loss and input magnitude), so we
+        # also report scale-free metrics that say how good the reconstruction
+        # actually is: r2 (fraction of target variance explained), pearson
+        # correlation, and relative l2 error.
+        with torch.no_grad():
+            pred_masked = pred[mask].flatten()
+            target_masked = target[mask].flatten()
+            r2, corr, rel_l2 = _reconstruction_metrics(pred_masked, target_masked)
+
         return {
             "loss": loss,
             "pred": pred,
             "target": target,
             "mask": mask,
             "mask_ratio": mask.float().mean(),
+            "recon_r2": r2,
+            "recon_corr": corr,
+            "recon_rel_l2": rel_l2,
         }
 
     def random_mask(self, batch_size: int, device: torch.device) -> torch.Tensor:
