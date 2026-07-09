@@ -10,7 +10,6 @@ from configs.config import Config
 from data.dataset import MultiZarrDataset, ZarrCellDataset, worker_init_fn
 from data.picker import pick_zarr_path
 
-
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument(
@@ -22,7 +21,6 @@ def _parse_args() -> argparse.Namespace:
     # peek only at --config; picker.py reads --zarr-path itself.
     args, _ = parser.parse_known_args()
     return args
-
 
 def main() -> None:
     args = _parse_args()
