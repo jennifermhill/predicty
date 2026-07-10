@@ -364,15 +364,21 @@ def visualize_layercam_3d(
     save_path: Optional[str] = None,
     max_slices: int = 12,
     overlay_alpha: float = 0.5,
+    z_weights: Optional[np.ndarray] = None,
 ) -> None:
     """per-z-slice display of a 3D attribution map, so depth is not hidden.
 
-    top row shows each raw depth slice; bottom row overlays that slice's LayerCAM
+    top row shows each raw depth slice; middle row overlays that slice's LayerCAM
     on a shared [0, 1] color scale (one colorbar) so slices are comparable. the
     far-right column summarizes the volume with a max-projection of the crop and
     of the attribution, and each overlay title reports that slice's mean
-    attribution so you can read which depth slices the map favors. uses
-    matplotlib only (no OpenCV dependency).
+    attribution so you can read which depth slices the map favors.
+
+    if `z_weights` is given, a bottom bar strip shows ZAttentionPool's literal
+    per-slice depth weighting. this is a different signal from the map above:
+    the map's spatial-per-z variation reflects feature relevance, whereas the
+    bars are the depth weights the model actually applied (spatially uniform).
+    uses matplotlib only (no OpenCV dependency).
 
     Args:
         crop: raw crop volume, shape (Z, H, W).
@@ -381,11 +387,14 @@ def visualize_layercam_3d(
         save_path: where to save the figure.
         max_slices: cap on displayed slices; evenly subsampled if Z exceeds it.
         overlay_alpha: blend weight of the heatmap over the grayscale slice.
+        z_weights: optional (Z,) ZAttentionPool weights, drawn as a bar strip.
     """
     if crop.ndim != 3 or cam3d.ndim != 3:
         raise ValueError(f"expected (Z, H, W) crop and cam; got {crop.shape}, {cam3d.shape}")
     if crop.shape[0] != cam3d.shape[0]:
         raise ValueError(f"z mismatch: crop has {crop.shape[0]} slices, cam has {cam3d.shape[0]}")
+    if z_weights is not None and len(z_weights) != crop.shape[0]:
+        raise ValueError(f"z_weights has {len(z_weights)} entries, expected {crop.shape[0]}")
 
     z_total = crop.shape[0]
     # subsample depth slices if there are too many to show side by side.
@@ -398,35 +407,60 @@ def visualize_layercam_3d(
     slice_importance = cam3d.reshape(z_total, -1).mean(axis=1)
 
     n_cols = len(shown) + 1  # + 1 summary column
-    fig, axes = plt.subplots(2, n_cols, figsize=(2.2 * n_cols, 5.0), squeeze=False)
+    # two image rows, plus a short bar row when pool weights are supplied.
+    height_ratios = [1.0, 1.0, 0.5] if z_weights is not None else [1.0, 1.0]
+    n_rows = len(height_ratios)
+    fig = plt.figure(figsize=(2.2 * n_cols, 2.5 * n_rows))
+    gs = fig.add_gridspec(n_rows, n_cols, height_ratios=height_ratios)
     fig.suptitle(title, fontsize=14, fontweight="bold")
 
     hm_im = None
+    overlay_axes = []
     for col, z in enumerate(shown):
-        axes[0, col].imshow(crop[z], cmap="gray")
-        axes[0, col].set_title(f"z={z}", fontsize=9)
-        axes[0, col].axis("off")
+        ax_raw = fig.add_subplot(gs[0, col])
+        ax_raw.imshow(crop[z], cmap="gray")
+        ax_raw.set_title(f"z={z}", fontsize=9)
+        ax_raw.axis("off")
 
-        axes[1, col].imshow(crop[z], cmap="gray")
-        hm_im = axes[1, col].imshow(
-            cam3d[z], cmap="jet", vmin=0.0, vmax=1.0, alpha=overlay_alpha
-        )
-        axes[1, col].set_title(f"imp {slice_importance[z]:.2f}", fontsize=8)
-        axes[1, col].axis("off")
+        ax_ov = fig.add_subplot(gs[1, col])
+        ax_ov.imshow(crop[z], cmap="gray")
+        hm_im = ax_ov.imshow(cam3d[z], cmap="jet", vmin=0.0, vmax=1.0, alpha=overlay_alpha)
+        ax_ov.set_title(f"imp {slice_importance[z]:.2f}", fontsize=8)
+        ax_ov.axis("off")
+        overlay_axes.append(ax_ov)
 
     # summary column: max-projection of the crop and of the attribution.
-    axes[0, -1].imshow(crop.max(axis=0), cmap="gray")
-    axes[0, -1].set_title("crop max-proj", fontsize=9)
-    axes[0, -1].axis("off")
-    axes[1, -1].imshow(crop.max(axis=0), cmap="gray")
-    axes[1, -1].imshow(cam3d.max(axis=0), cmap="jet", vmin=0.0, vmax=1.0, alpha=overlay_alpha)
-    axes[1, -1].set_title("cam max-proj", fontsize=9)
-    axes[1, -1].axis("off")
+    ax_sum_raw = fig.add_subplot(gs[0, -1])
+    ax_sum_raw.imshow(crop.max(axis=0), cmap="gray")
+    ax_sum_raw.set_title("crop max-proj", fontsize=9)
+    ax_sum_raw.axis("off")
+    ax_sum_ov = fig.add_subplot(gs[1, -1])
+    ax_sum_ov.imshow(crop.max(axis=0), cmap="gray")
+    ax_sum_ov.imshow(cam3d.max(axis=0), cmap="jet", vmin=0.0, vmax=1.0, alpha=overlay_alpha)
+    ax_sum_ov.set_title("cam max-proj", fontsize=9)
+    ax_sum_ov.axis("off")
+    overlay_axes.append(ax_sum_ov)
 
     if hm_im is not None:
         fig.colorbar(
-            hm_im, ax=axes[1, :].tolist(),
+            hm_im, ax=overlay_axes,
             fraction=0.02, pad=0.01, label="attribution",
+        )
+
+    # bottom strip: ZAttentionPool's literal per-slice depth weighting.
+    if z_weights is not None:
+        ax_bar = fig.add_subplot(gs[2, :])
+        zs = np.arange(z_total)
+        bars = ax_bar.bar(zs, np.asarray(z_weights), color="#9e9e9e")
+        # highlight the slices shown in the montage so the two views line up.
+        for z in shown:
+            bars[int(z)].set_color("#1565c0")
+        ax_bar.set_xticks(zs)
+        ax_bar.set_xlabel("z slice")
+        ax_bar.set_ylabel("pool weight")
+        ax_bar.set_title(
+            "ZAttentionPool depth weighting (model's literal z-attention, spatially uniform)",
+            fontsize=9,
         )
 
     if save_path:

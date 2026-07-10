@@ -260,6 +260,44 @@ def get_stem_layer(encoder: nn.Module) -> nn.Module:
     )
 
 
+@torch.no_grad()
+def zattention_weights(
+    encoder: nn.Module,
+    input_tensor: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """ZAttentionPool's per-z-slice softmax weights for a single crop.
+
+    these are the model's literal depth weighting: one number per z-slice,
+    spatially uniform (the pool averages its score over H, W before the softmax
+    over z). that makes this the honest companion to LayerCAM3D's per-voxel map,
+    which can show spatial-per-z variation the pool never actually uses to
+    weight depth. re-derives the weights exactly as ZAttentionPool.forward does
+    by hooking its score conv. returns a (Z,) tensor that sums to 1.
+    """
+    if not hasattr(encoder, "z_pool") or not hasattr(encoder.z_pool, "score"):
+        raise ValueError("encoder has no ZAttentionPool `z_pool.score` to read")
+    if input_tensor.size(0) != 1:
+        raise ValueError(f"expected batch size 1, got {input_tensor.size(0)}")
+
+    captured: dict[str, torch.Tensor] = {}
+
+    def hook(module, inp, out):
+        captured["score"] = out.detach()  # (1, 1, Z, H, W)
+
+    handle = encoder.z_pool.score.register_forward_hook(hook)
+    encoder.eval()
+    try:
+        encoder(input_tensor.to(device))
+    finally:
+        handle.remove()
+
+    score = captured["score"]  # (1, 1, Z, H, W)
+    # same reduction as the pool: spatial mean per slice, then softmax over z.
+    weights = score.mean(dim=(-1, -2)).softmax(dim=2)  # (1, 1, Z)
+    return weights[0, 0].detach().cpu()  # (Z,)
+
+
 class LayerCAM3D:
     """3D LayerCAM at the encoder's 3D stem, before the depth axis is collapsed.
 

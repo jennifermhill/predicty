@@ -28,7 +28,13 @@ import torch.nn as nn
 from configs.config import Config
 from data.dataset import MultiZarrDataset
 from models.encoder import HybridEncoder
-from eval.gradcam import GradCAM, LayerCAM3D, get_final_conv_layer, upsample_gradcam
+from eval.gradcam import (
+    GradCAM,
+    LayerCAM3D,
+    get_final_conv_layer,
+    upsample_gradcam,
+    zattention_weights,
+)
 from eval.visualize_gradcam import (
     visualize_gradcam_multiclass,
     visualize_layercam_3d,
@@ -242,9 +248,11 @@ def run_behavior_gradcam(
 
         print(f"  Saved: behavior_gradcam_{sample_idx:03d}.png")
 
-        # full-resolution 3D LayerCAM for the true behavior, shown per z-slice.
+        # full-resolution 3D LayerCAM for the true behavior, shown per z-slice,
+        # with the pool's literal depth weighting as a companion bar strip.
         if layercam_3d is not None:
             cam3d = layercam_3d.generate(crop, behavior_idx).numpy()  # (Z, H, W)
+            z_w = zattention_weights(encoder, crop, device).numpy()  # (Z,)
             visualize_layercam_3d(
                 crop_np,
                 cam3d,
@@ -253,6 +261,7 @@ def run_behavior_gradcam(
                     f"true: {behavior_name}"
                 ),
                 save_path=str(output_dir / f"behavior_layercam3d_{sample_idx:03d}.png"),
+                z_weights=z_w,
             )
             print(f"  Saved: behavior_layercam3d_{sample_idx:03d}.png")
 
@@ -339,9 +348,11 @@ def run_dataset_gradcam(
 
         print(f"  Saved: dataset_gradcam_{sample_idx:03d}.png")
 
-        # full-resolution 3D LayerCAM for the crop's own dataset, per z-slice.
+        # full-resolution 3D LayerCAM for the crop's own dataset, per z-slice,
+        # with the pool's literal depth weighting as a companion bar strip.
         if layercam_3d is not None:
             cam3d = layercam_3d.generate(crop, own_idx).numpy()  # (Z, H, W)
+            z_w = zattention_weights(encoder, crop, device).numpy()  # (Z,)
             visualize_layercam_3d(
                 crop_np,
                 cam3d,
@@ -350,6 +361,7 @@ def run_dataset_gradcam(
                     f"crop from {dataset_names_clean[own_idx]}"
                 ),
                 save_path=str(output_dir / f"dataset_layercam3d_{sample_idx:03d}.png"),
+                z_weights=z_w,
             )
             print(f"  Saved: dataset_layercam3d_{sample_idx:03d}.png")
 
