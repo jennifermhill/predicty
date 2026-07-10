@@ -148,6 +148,7 @@ class DINOWrapper(nn.Module):
             stem_channels=cfg.stem_channels,
             latent_dim=cfg.latent_dim,
             norm_groups=cfg.norm_groups,
+            chunk_size=getattr(cfg, "encoder_chunk_size", None),
         )
         student_proj = DINOHead(
             in_dim=cfg.latent_dim,

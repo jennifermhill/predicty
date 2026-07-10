@@ -168,6 +168,14 @@ class Config:
     # frozen encoder. the effective group count is clamped to the largest divisor
     # of each layer's channel count that is <= this value.
     norm_groups: int = 32
+    # cap on how many crops flow through the encoder's 3D stem at once. the dino
+    # wrapper flattens all crops into one batch (batch_size * 2 globals, plus the
+    # locals), and the stem's full-resolution activations dominate gpu memory
+    # (groupnorm runs in fp32 under amp, ~20 GiB for 128 globals). chunking the
+    # stem forward is exact (each crop encodes independently) and, with the
+    # encoder's whole-forward checkpointing, is the main lever against oom. None
+    # disables chunking. lower this if you still oom, raise it for speed.
+    encoder_chunk_size: int | None = 32
 
     # projector (DINO head) discarded after training. K is the prototype count
     # the cross-entropy operates over.
