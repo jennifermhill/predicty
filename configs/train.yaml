@@ -237,15 +237,17 @@ center_momentum: 0.9
 # predicts dataset_idx from encoder features while gradient reversal pushes the
 # encoder to remove dataset identity. automatically inactive for single-zarr
 # runs because there is no multi-class dataset signal.
-# effective pressure on the encoder ~ weight * grl_scale. grl_scale bumped
-# 1.0 -> 2.0 to push harder on dataset leakage while keeping weight at 0.1, so
-# the experiment changes one lever (reversed-gradient strength) and stays
-# interpretable. watch dataset_adversary/acc trending toward chance
-# (1/n_datasets) and collapse/embedding_var staying off the floor.
+# effective pressure on the encoder ~ weight * grl_scale. the reversed gradient
+# rewards low-variance embeddings, so an over-strong adversary collapses the
+# representation (embedding_var crashed to the floor while teacher_entropy pinned
+# at ln(projector_k)). pressure cut hard here: weight 0.1 -> 0.02 and grl_scale
+# 3.0 -> 1.0, so effective pressure drops 0.3 -> 0.02. keep it weak until DINO is
+# stable, then ramp pressure back up gradually. watch dataset_adversary/acc
+# trending toward chance (1/n_datasets) and collapse/embedding_var off the floor.
 dataset_adversary_enabled: true
-dataset_adversary_weight: 0.1
+dataset_adversary_weight: 0.02
 dataset_adversary_grl_start: 0.0
-dataset_adversary_grl_scale: 3.0
+dataset_adversary_grl_scale: 1.0
 dataset_adversary_hidden: 256
 dataset_adversary_dropout: 0.1
 
@@ -280,7 +282,7 @@ ibot_mask_ratio: 0.75
 # weight_decay:   applied to weight matrices only (biases / norm scales excluded).
 # grad_clip_norm: clip gradient L2 norm to this value before each optimizer step.
 # warmup_frac:    fraction of total_steps spent in linear warmup. cosine after.
-base_lr: 1.25e-4
+base_lr: 3.5e-5
 weight_decay: 0.04
 grad_clip_norm: 1.0
 warmup_frac: 0.1

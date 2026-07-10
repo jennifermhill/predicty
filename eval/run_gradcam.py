@@ -29,11 +29,8 @@ from configs.config import Config
 from data.dataset import MultiZarrDataset
 from models.encoder import HybridEncoder
 from eval.gradcam import (
-    GradCAM,
-    LayerCAM3D,
-    get_final_conv_layer,
+    GradCAMAnalyzer,
     upsample_gradcam,
-    zattention_weights,
 )
 from eval.visualize_gradcam import (
     visualize_gradcam_multiclass,
@@ -169,11 +166,9 @@ def run_behavior_gradcam(
     output_dir = output_dir / "behavior"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Setup Grad-CAM
-    target_layer = get_final_conv_layer(encoder)
-    gradcam = GradCAM(encoder, behavior_head, target_layer, device)
-    # optional full-resolution 3D attribution at the stem (keeps the z axis).
-    layercam_3d = LayerCAM3D(encoder, behavior_head, device) if cam_3d else None
+    # single-forward analyzer: analytic 2D grad-cam (no backprop) + probs +
+    # depth weights from one pass, plus an optional 3D LayerCAM (one backward).
+    analyzer = GradCAMAnalyzer(encoder, behavior_head, device, cam_3d=cam_3d)
 
     samples_df = pd.read_json(cfg.annotation_path, lines=True)
     samples_df = samples_df[samples_df['label'].isin(behavior_names)]
@@ -205,20 +200,19 @@ def run_behavior_gradcam(
         crop = batch["globals"][0]  # (C=1, Z, H, W), no batch dim
         crop = crop.unsqueeze(0).to(device)  # (1, 1, Z, H, W) = (B, C, Z, H, W)
 
-        # predicted class + probabilities for this crop, so the plot can flag
-        # what the model actually decided alongside where it looked.
-        with torch.no_grad():
-            logits = behavior_head(encoder(crop))
-            prob_vec = torch.softmax(logits, dim=-1)[0]
-            pred_class = int(prob_vec.argmax().item())
-            probs = {i: float(prob_vec[i].item()) for i in range(len(behavior_names))}
-
-        # Generate Grad-CAM for all behaviors
+        # one forward yields 2D grad-cams for every behavior, the prediction +
+        # probabilities, depth weights, and (when cam_3d) the 3D map for the
+        # true behavior. plot flags what the model decided alongside where it
+        # looked.
         print(f"\nSample {sample_idx + 1}/{n_samples}")
-        gradcams = gradcam.generate_gradcam_multiclass(
+        result = analyzer.analyze(
             crop,
             len(behavior_names),
+            cam3d_class=behavior_idx if cam_3d else None,
         )
+        pred_class = result["pred_class"]
+        probs = result["probs"]
+        gradcams = result["cams_2d"]
 
         # Upsample to input resolution
         h_in, w_in = crop.shape[-2:]
@@ -249,10 +243,11 @@ def run_behavior_gradcam(
         print(f"  Saved: behavior_gradcam_{sample_idx:03d}.png")
 
         # full-resolution 3D LayerCAM for the true behavior, shown per z-slice,
-        # with the pool's literal depth weighting as a companion bar strip.
-        if layercam_3d is not None:
-            cam3d = layercam_3d.generate(crop, behavior_idx).numpy()  # (Z, H, W)
-            z_w = zattention_weights(encoder, crop, device).numpy()  # (Z,)
+        # with the pool's literal depth weighting as a companion bar strip. both
+        # came from the same analyze() call above (no extra forward passes).
+        if cam_3d:
+            cam3d = result["cam_3d"].numpy()  # (Z, H, W)
+            z_w = result["z_weights"].numpy()  # (Z,)
             visualize_layercam_3d(
                 crop_np,
                 cam3d,
@@ -283,11 +278,9 @@ def run_dataset_gradcam(
     output_dir = output_dir / "dataset"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Setup Grad-CAM
-    target_layer = get_final_conv_layer(encoder)
-    gradcam = GradCAM(encoder, dataset_head, target_layer, device)
-    # optional full-resolution 3D attribution at the stem (keeps the z axis).
-    layercam_3d = LayerCAM3D(encoder, dataset_head, device) if cam_3d else None
+    # single-forward analyzer: analytic 2D grad-cam (no backprop) + probs +
+    # depth weights from one pass, plus an optional 3D LayerCAM (one backward).
+    analyzer = GradCAMAnalyzer(encoder, dataset_head, device, cam_3d=cam_3d)
 
     # strip directory + .zarr so panel labels read cleanly. the gradcam dict
     # keys are dataset indices used to index this list, so it must stay full
@@ -312,15 +305,21 @@ def run_dataset_gradcam(
             if idx != own_idx:
                 shown_idx.append(idx)
 
-        # what the discriminator actually predicts, to highlight in the panel.
-        with torch.no_grad():
-            pred_idx = int(dataset_head(encoder(crop)).argmax(dim=-1).item())
+        # one forward yields the prediction, a 2D grad-cam for every dataset,
+        # depth weights, and (when cam_3d) the 3D map for the crop's own dataset.
+        result = analyzer.analyze(
+            crop,
+            len(dataset_names),
+            cam3d_class=own_idx if cam_3d else None,
+        )
+        pred_idx = result["pred_class"]
 
         print(
             f"\nSample {sample_idx + 1}/{len(samples)} "
             f"(from {dataset_names_clean[own_idx]}, predicted {dataset_names_clean[pred_idx]})"
         )
-        gradcams = {idx: gradcam.generate_gradcam(crop, idx) for idx in shown_idx}
+        # all classes are computed; keep only the panel's shown datasets.
+        gradcams = {idx: result["cams_2d"][idx] for idx in shown_idx}
 
         # Upsample
         h_in, w_in = crop.shape[-2:]
@@ -349,10 +348,11 @@ def run_dataset_gradcam(
         print(f"  Saved: dataset_gradcam_{sample_idx:03d}.png")
 
         # full-resolution 3D LayerCAM for the crop's own dataset, per z-slice,
-        # with the pool's literal depth weighting as a companion bar strip.
-        if layercam_3d is not None:
-            cam3d = layercam_3d.generate(crop, own_idx).numpy()  # (Z, H, W)
-            z_w = zattention_weights(encoder, crop, device).numpy()  # (Z,)
+        # with the pool's literal depth weighting as a companion bar strip. both
+        # came from the same analyze() call above (no extra forward passes).
+        if cam_3d:
+            cam3d = result["cam_3d"].numpy()  # (Z, H, W)
+            z_w = result["z_weights"].numpy()  # (Z,)
             visualize_layercam_3d(
                 crop_np,
                 cam3d,

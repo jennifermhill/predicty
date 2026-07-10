@@ -128,24 +128,15 @@ class GradCAM:
 
         # Step 1: Compute channel weights by global average pooling gradients
         # α_c^k = (1/Z) * Σ_i Σ_j (∂y^c / ∂A_{ij}^k)
-        batch_size = gradients.size(0)
-        num_channels = gradients.size(1)
-
         # Global average pool across spatial dimensions (2, 3)
         alpha = gradients.mean(dim=(2, 3))  # (batch, C)
 
         # Step 2: Weighted combination with ReLU
-        # L^Grad-CAM = ReLU(Σ_k α_c^k * A^k)
-        gradcam = torch.zeros(
-            activations.shape[2:],
-            device=activations.device,
-            dtype=activations.dtype,
+        # L^Grad-CAM = ReLU(Σ_k α_c^k * A^k). broadcast the per-channel weights
+        # over the feature maps and sum over channels in one op (no python loop).
+        gradcam = torch.relu(
+            (alpha[0][:, None, None] * activations[0]).sum(dim=0)
         )
-
-        for c in range(num_channels):
-            gradcam += alpha[0, c] * activations[0, c]
-
-        gradcam = torch.relu(gradcam)
 
         # Step 3: Normalize to [0, 1]
         gradcam_min = gradcam.min()
@@ -370,3 +361,139 @@ class LayerCAM3D:
         else:
             cam = torch.zeros_like(cam)
         return cam.detach().cpu()
+
+
+def _normalize01(x: torch.Tensor) -> torch.Tensor:
+    """min-max normalize to [0, 1]; a flat input maps to all zeros."""
+    x = x - x.min()
+    peak = x.max()
+    return x / peak if peak > 1e-8 else torch.zeros_like(x)
+
+
+class GradCAMAnalyzer:
+    """all attributions for one crop from a single encoder forward.
+
+    returns, per crop: class probabilities + predicted class, a 2D grad-cam for
+    every class, ZAttentionPool's per-z depth weights, and (optionally) a 3D
+    LayerCAM at the stem for one target class.
+
+    the 2D grad-cam needs no backward pass. the target layer (layer4[-1]) feeds
+    straight into the backbone's global-average-pool and the probe head is
+    linear, so grad-cam's channel weights for class c are exactly that class's
+    head weight row (up to a positive constant that cancels in normalization).
+    every class is then a weighted sum of the same captured feature maps. only
+    the 3D LayerCAM needs real gradients (the stem sits deep in the net), which
+    costs one backward on the retained graph for its single target class.
+
+    net cost per crop: one forward, plus one backward only when a 3D map is
+    requested, versus the previous (n_classes + 3) forwards and (n_classes + 1)
+    backwards.
+    """
+
+    def __init__(
+        self,
+        encoder: nn.Module,
+        classifier: nn.Module,
+        device: torch.device,
+        cam_3d: bool = False,
+    ) -> None:
+        if not isinstance(classifier, nn.Linear):
+            raise TypeError(
+                "GradCAMAnalyzer's analytic 2D path assumes a linear probe head; "
+                f"got {type(classifier).__name__}. use the GradCAM class (per-class "
+                "backprop) for a non-linear head."
+            )
+        if not hasattr(encoder, "z_pool") or not hasattr(encoder.z_pool, "score"):
+            raise ValueError("encoder has no ZAttentionPool `z_pool.score` to read")
+        self.encoder = encoder
+        self.classifier = classifier
+        self.device = device
+        self.cam_3d = cam_3d
+        self.final_conv = get_final_conv_layer(encoder)  # layer4[-1], pre-GAP
+        self.stem = get_stem_layer(encoder) if cam_3d else None
+        self.z_score = encoder.z_pool.score
+
+    def analyze(
+        self,
+        crop: torch.Tensor,
+        n_classes: int,
+        cam3d_class: Optional[int] = None,
+    ) -> dict:
+        """
+        Args:
+            crop: single crop, shape (1, 1, Z, H, W).
+            n_classes: number of head outputs (2D grad-cam is made for each).
+            cam3d_class: if given and cam_3d is enabled, also make a 3D LayerCAM
+                for this class (one backward pass).
+
+        Returns dict with keys: 'probs' (class_idx -> float), 'pred_class' (int),
+        'cams_2d' (class_idx -> (h, w) tensor in [0, 1]), 'z_weights' ((Z,) tensor
+        summing to 1), and 'cam_3d' ((Z, H, W) tensor in [0, 1] or None).
+        """
+        if crop.size(0) != 1:
+            raise ValueError(f"expected batch size 1, got {crop.size(0)}")
+        self.encoder.eval()
+        self.classifier.eval()
+
+        captured: dict[str, torch.Tensor] = {}
+        handles = [
+            self.final_conv.register_forward_hook(
+                lambda m, i, o: captured.__setitem__("conv", o)
+            ),
+            self.z_score.register_forward_hook(
+                lambda m, i, o: captured.__setitem__("zscore", o.detach())
+            ),
+        ]
+        want_3d = self.cam_3d and cam3d_class is not None
+        # the stem hook also grabs gradients, so only attach it when doing 3D.
+        stem_hook = GradCAMHook(self.stem) if want_3d else None
+
+        crop = crop.to(self.device)
+        # gradients are needed only for the 3D backward; the analytic 2D maps,
+        # probabilities, and depth weights all read from the forward alone.
+        with torch.set_grad_enabled(want_3d):
+            if want_3d:
+                crop = crop.requires_grad_(True)
+            embedding = self.encoder(crop)
+            logits = self.classifier(embedding)
+
+        # probabilities + prediction, straight from the shared forward.
+        prob_vec = torch.softmax(logits, dim=-1)[0]
+        pred_class = int(prob_vec.argmax().item())
+        probs = {i: float(prob_vec[i].item()) for i in range(n_classes)}
+
+        # analytic 2D grad-cam for every class at once (no backward):
+        # map_c = relu(sum_k head.weight[c, k] * A_k), then per-class normalize.
+        A = captured["conv"][0].detach()          # (C, h, w) pre-pool features
+        W = self.classifier.weight.detach()       # (n_classes, C)
+        maps = torch.einsum("nc,chw->nhw", W, A)  # (n_classes, h, w)
+        cams_2d = {
+            c: _normalize01(torch.relu(maps[c])).cpu() for c in range(n_classes)
+        }
+
+        # ZAttentionPool depth weights: same reduction the pool applies.
+        score = captured["zscore"]                # (1, 1, Z, H, W)
+        z_weights = score.mean(dim=(-1, -2)).softmax(dim=2)[0, 0].cpu()  # (Z,)
+
+        # optional 3D LayerCAM: one backward for the single target class.
+        cam_3d_map = None
+        if want_3d:
+            self.encoder.zero_grad()
+            self.classifier.zero_grad()
+            logits[0, cam3d_class].backward()
+            cam_3d_map = LayerCAM3D._compute_layercam(
+                stem_hook.activations, stem_hook.gradients
+            )
+            stem_hook.remove()
+            crop.requires_grad_(False)
+
+        for h in handles:
+            h.remove()
+
+        return {
+            "probs": probs,
+            "pred_class": pred_class,
+            "cams_2d": cams_2d,
+            "z_weights": z_weights,
+            "cam_3d": cam_3d_map,
+        }
