@@ -8,6 +8,8 @@ computes class activation maps by weighting feature maps by gradients of the cla
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -240,3 +242,93 @@ def get_final_conv_layer(encoder: nn.Module) -> nn.Module:
         )
 
     return last_conv
+
+
+def get_stem_layer(encoder: nn.Module) -> nn.Module:
+    """return the 3D stem, whose output is the last full-resolution 3D tensor.
+
+    HybridEncoder collapses the depth axis in ZAttentionPool right after the
+    stem, so the stem output (B, stem_channels, Z, H, W) is the last activation
+    that still has a z axis. it is also stride-1, so it is at full input
+    (Z, H, W) resolution. this is the target for 3D attribution.
+    """
+    if hasattr(encoder, "stem"):
+        return encoder.stem
+    raise ValueError(
+        "encoder has no `stem`; 3D attribution needs a module whose output "
+        "still has a z axis. specify target_layer explicitly."
+    )
+
+
+class LayerCAM3D:
+    """3D LayerCAM at the encoder's 3D stem, before the depth axis is collapsed.
+
+    a Grad-CAM on the 2D backbone can only attribute in xy at the coarse layer4
+    resolution, and has no z axis at all (ZAttentionPool already collapsed it).
+    this hooks the stem output instead, the last activation that is still
+    (Z, H, W) and full-resolution, and forms a per-voxel map with LayerCAM's
+    element-wise positive-gradient weighting (better than global-average-pooled
+    Grad-CAM weights at a shallow layer). the result is a genuine 3D heatmap the
+    same shape as the input crop, so no z information is hidden.
+    """
+
+    def __init__(
+        self,
+        encoder: nn.Module,
+        classifier: nn.Module,
+        device: torch.device,
+        target_layer: Optional[nn.Module] = None,
+    ) -> None:
+        self.encoder = encoder
+        self.classifier = classifier
+        self.device = device
+        # default to the 3D stem output (the z_pool input).
+        self.target_layer = target_layer if target_layer is not None else get_stem_layer(encoder)
+
+    def generate(self, input_tensor: torch.Tensor, target_class: int) -> torch.Tensor:
+        """return a (Z, H, W) attribution map in [0, 1] for `target_class`.
+
+        Args:
+            input_tensor: single crop, shape (1, 1, Z, H, W).
+            target_class: class index whose score is attributed.
+        """
+        if input_tensor.size(0) != 1:
+            raise ValueError(f"expected batch size 1, got {input_tensor.size(0)}")
+
+        self.encoder.eval()
+        self.classifier.eval()
+        hook = GradCAMHook(self.target_layer)
+
+        input_tensor = input_tensor.to(self.device).requires_grad_(True)
+        with torch.enable_grad():
+            embedding = self.encoder(input_tensor)
+            logits = self.classifier(embedding)
+            class_score = logits[0, target_class]
+
+        self.encoder.zero_grad()
+        self.classifier.zero_grad()
+        class_score.backward()
+
+        cam = self._compute_layercam(hook.activations, hook.gradients)
+
+        hook.remove()
+        input_tensor.requires_grad_(False)
+        return cam
+
+    @staticmethod
+    def _compute_layercam(
+        activations: torch.Tensor, gradients: torch.Tensor
+    ) -> torch.Tensor:
+        # activations, gradients: (1, C, Z, H, W). LayerCAM weights each voxel by
+        # its own positive gradient (not a channel-averaged scalar), which keeps
+        # spatial + depth structure that global-average-pool grad-cam would blur.
+        weights = torch.relu(gradients)
+        cam = (weights * activations).sum(dim=1)  # (1, Z, H, W)
+        cam = torch.relu(cam)[0]  # (Z, H, W)
+        cam = cam - cam.min()
+        peak = cam.max()
+        if peak > 1e-8:
+            cam = cam / peak
+        else:
+            cam = torch.zeros_like(cam)
+        return cam.detach().cpu()

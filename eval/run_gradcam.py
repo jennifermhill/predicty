@@ -28,9 +28,10 @@ import torch.nn as nn
 from configs.config import Config
 from data.dataset import MultiZarrDataset
 from models.encoder import HybridEncoder
-from eval.gradcam import GradCAM, get_final_conv_layer, upsample_gradcam
+from eval.gradcam import GradCAM, LayerCAM3D, get_final_conv_layer, upsample_gradcam
 from eval.visualize_gradcam import (
     visualize_gradcam_multiclass,
+    visualize_layercam_3d,
     max_project_3d,
 )
 
@@ -63,6 +64,14 @@ def parse_args() -> argparse.Namespace:
         help="number of samples to visualize per class",
     )
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--cam-3d",
+        action="store_true",
+        help=(
+            "also produce a full-resolution 3D LayerCAM per sample at the 3D "
+            "stem (before z is collapsed), saved as a per-z-slice montage"
+        ),
+    )
     return p.parse_args()
 
 
@@ -144,6 +153,7 @@ def run_behavior_gradcam(
     n_samples: int,
     device: torch.device,
     output_dir: Path,
+    cam_3d: bool = False,
 ) -> None:
     """run Grad-CAM for behavior classification."""
     print("\n" + "=" * 70)
@@ -156,6 +166,8 @@ def run_behavior_gradcam(
     # Setup Grad-CAM
     target_layer = get_final_conv_layer(encoder)
     gradcam = GradCAM(encoder, behavior_head, target_layer, device)
+    # optional full-resolution 3D attribution at the stem (keeps the z axis).
+    layercam_3d = LayerCAM3D(encoder, behavior_head, device) if cam_3d else None
 
     samples_df = pd.read_json(cfg.annotation_path, lines=True)
     samples_df = samples_df[samples_df['label'].isin(behavior_names)]
@@ -230,6 +242,20 @@ def run_behavior_gradcam(
 
         print(f"  Saved: behavior_gradcam_{sample_idx:03d}.png")
 
+        # full-resolution 3D LayerCAM for the true behavior, shown per z-slice.
+        if layercam_3d is not None:
+            cam3d = layercam_3d.generate(crop, behavior_idx).numpy()  # (Z, H, W)
+            visualize_layercam_3d(
+                crop_np,
+                cam3d,
+                title=(
+                    f"Behavior 3D LayerCAM - Sample {sample_idx + 1} - "
+                    f"true: {behavior_name}"
+                ),
+                save_path=str(output_dir / f"behavior_layercam3d_{sample_idx:03d}.png"),
+            )
+            print(f"  Saved: behavior_layercam3d_{sample_idx:03d}.png")
+
 
 def run_dataset_gradcam(
     encoder: HybridEncoder,
@@ -238,6 +264,7 @@ def run_dataset_gradcam(
     samples: list[dict],
     device: torch.device,
     output_dir: Path,
+    cam_3d: bool = False,
 ) -> None:
     """run Grad-CAM for dataset discrimination."""
     print("\n" + "=" * 70)
@@ -250,6 +277,8 @@ def run_dataset_gradcam(
     # Setup Grad-CAM
     target_layer = get_final_conv_layer(encoder)
     gradcam = GradCAM(encoder, dataset_head, target_layer, device)
+    # optional full-resolution 3D attribution at the stem (keeps the z axis).
+    layercam_3d = LayerCAM3D(encoder, dataset_head, device) if cam_3d else None
 
     # strip directory + .zarr so panel labels read cleanly. the gradcam dict
     # keys are dataset indices used to index this list, so it must stay full
@@ -309,6 +338,20 @@ def run_dataset_gradcam(
         )
 
         print(f"  Saved: dataset_gradcam_{sample_idx:03d}.png")
+
+        # full-resolution 3D LayerCAM for the crop's own dataset, per z-slice.
+        if layercam_3d is not None:
+            cam3d = layercam_3d.generate(crop, own_idx).numpy()  # (Z, H, W)
+            visualize_layercam_3d(
+                crop_np,
+                cam3d,
+                title=(
+                    f"Dataset 3D LayerCAM - Sample {sample_idx + 1} - "
+                    f"crop from {dataset_names_clean[own_idx]}"
+                ),
+                save_path=str(output_dir / f"dataset_layercam3d_{sample_idx:03d}.png"),
+            )
+            print(f"  Saved: dataset_layercam3d_{sample_idx:03d}.png")
 
 
 def main() -> None:
@@ -410,6 +453,7 @@ def main() -> None:
             args.n_samples,
             device,
             output_dir,
+            cam_3d=args.cam_3d,
         )
     elif args.mode in ["behavior", "both"]:
         print("\n[gradcam] Skipping behavior Grad-CAM (probe not loaded)")
@@ -422,6 +466,7 @@ def main() -> None:
             samples,
             device,
             output_dir,
+            cam_3d=args.cam_3d,
         )
     elif args.mode in ["dataset", "both"]:
         print("\n[gradcam] Skipping dataset Grad-CAM (probe not loaded)")

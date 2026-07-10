@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 from torchvision.models import resnet50
 
 
@@ -100,8 +101,17 @@ class HybridEncoder(nn.Module):
         x = self.z_pool(x)
         # drop trivial z axis -> (B, stem_channels, H, W) for ResNet
         x = x.squeeze(2)
-        # backbone returns (B, 2048).
-        return self.backbone(x)
+        # groupnorm retains each layer's full input for backward (unlike the
+        # fused cudnn batchnorm it replaced), so checkpoint the four resnet
+        # stages: recompute their activations in backward instead of storing
+        # them. only during training, where the backward pass exists.
+        b = self.backbone
+        x = b.maxpool(b.relu(b.bn1(b.conv1(x))))
+        for stage in (b.layer1, b.layer2, b.layer3, b.layer4):
+            x = checkpoint(stage, x, use_reentrant=False) if self.training else stage(x)
+        x = b.avgpool(x).flatten(1)
+        # fc is Identity for latent_dim 2048, else a linear projection.
+        return b.fc(x)
 
 
 if __name__ == "__main__":

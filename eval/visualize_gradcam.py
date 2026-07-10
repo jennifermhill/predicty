@@ -357,6 +357,85 @@ def max_project_3d(
     return np.max(volume, axis=axis)
 
 
+def visualize_layercam_3d(
+    crop: np.ndarray,
+    cam3d: np.ndarray,
+    title: str = "3D LayerCAM",
+    save_path: Optional[str] = None,
+    max_slices: int = 12,
+    overlay_alpha: float = 0.5,
+) -> None:
+    """per-z-slice display of a 3D attribution map, so depth is not hidden.
+
+    top row shows each raw depth slice; bottom row overlays that slice's LayerCAM
+    on a shared [0, 1] color scale (one colorbar) so slices are comparable. the
+    far-right column summarizes the volume with a max-projection of the crop and
+    of the attribution, and each overlay title reports that slice's mean
+    attribution so you can read which depth slices the map favors. uses
+    matplotlib only (no OpenCV dependency).
+
+    Args:
+        crop: raw crop volume, shape (Z, H, W).
+        cam3d: attribution map in [0, 1], shape (Z, H, W).
+        title: plot title.
+        save_path: where to save the figure.
+        max_slices: cap on displayed slices; evenly subsampled if Z exceeds it.
+        overlay_alpha: blend weight of the heatmap over the grayscale slice.
+    """
+    if crop.ndim != 3 or cam3d.ndim != 3:
+        raise ValueError(f"expected (Z, H, W) crop and cam; got {crop.shape}, {cam3d.shape}")
+    if crop.shape[0] != cam3d.shape[0]:
+        raise ValueError(f"z mismatch: crop has {crop.shape[0]} slices, cam has {cam3d.shape[0]}")
+
+    z_total = crop.shape[0]
+    # subsample depth slices if there are too many to show side by side.
+    if z_total > max_slices:
+        shown = np.linspace(0, z_total - 1, max_slices).round().astype(int)
+    else:
+        shown = np.arange(z_total)
+
+    # mean attribution per slice, the "which depth matters" signal.
+    slice_importance = cam3d.reshape(z_total, -1).mean(axis=1)
+
+    n_cols = len(shown) + 1  # + 1 summary column
+    fig, axes = plt.subplots(2, n_cols, figsize=(2.2 * n_cols, 5.0), squeeze=False)
+    fig.suptitle(title, fontsize=14, fontweight="bold")
+
+    hm_im = None
+    for col, z in enumerate(shown):
+        axes[0, col].imshow(crop[z], cmap="gray")
+        axes[0, col].set_title(f"z={z}", fontsize=9)
+        axes[0, col].axis("off")
+
+        axes[1, col].imshow(crop[z], cmap="gray")
+        hm_im = axes[1, col].imshow(
+            cam3d[z], cmap="jet", vmin=0.0, vmax=1.0, alpha=overlay_alpha
+        )
+        axes[1, col].set_title(f"imp {slice_importance[z]:.2f}", fontsize=8)
+        axes[1, col].axis("off")
+
+    # summary column: max-projection of the crop and of the attribution.
+    axes[0, -1].imshow(crop.max(axis=0), cmap="gray")
+    axes[0, -1].set_title("crop max-proj", fontsize=9)
+    axes[0, -1].axis("off")
+    axes[1, -1].imshow(crop.max(axis=0), cmap="gray")
+    axes[1, -1].imshow(cam3d.max(axis=0), cmap="jet", vmin=0.0, vmax=1.0, alpha=overlay_alpha)
+    axes[1, -1].set_title("cam max-proj", fontsize=9)
+    axes[1, -1].axis("off")
+
+    if hm_im is not None:
+        fig.colorbar(
+            hm_im, ax=axes[1, :].tolist(),
+            fraction=0.02, pad=0.01, label="attribution",
+        )
+
+    if save_path:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+
+    plt.close()
+
+
 def save_gradcam_heatmap(
     gradcam: torch.Tensor | np.ndarray,
     save_path: str,
