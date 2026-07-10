@@ -1,4 +1,4 @@
-"""Visualization utilities for Grad-CAM heatmaps."""
+"""visualization utilities for Grad-CAM heatmaps."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ def apply_colormap(
     colormap: int = cv2.COLORMAP_JET,
 ) -> np.ndarray:
     """
-    Apply a colormap to a grayscale heatmap.
+    apply a colormap to a grayscale heatmap.
 
     Args:
         heatmap: Grayscale image [0, 1] or [0, 255]
@@ -39,7 +39,7 @@ def overlay_gradcam(
     alpha: float = 0.5,
 ) -> np.ndarray:
     """
-    Overlay Grad-CAM heatmap on input image.
+    overlay Grad-CAM heatmap on input image.
 
     Args:
         image: Input image, grayscale [0, 1] or RGB [0, 1]
@@ -47,7 +47,7 @@ def overlay_gradcam(
         alpha: Blending weight (0 = image only, 1 = heatmap only)
 
     Returns:
-        Blended RGB image [0, 1]
+        blended RGB image [0, 1]
     """
     # Ensure 3-channel
     if image.ndim == 2:
@@ -69,7 +69,7 @@ def overlay_gradcam(
 
 
 def focus_stats(gradcam: np.ndarray, top_frac: float = 0.2) -> dict[str, float]:
-    """Summarize where a Grad-CAM heatmap concentrates its attention.
+    """summarize where a Grad-CAM heatmap concentrates its attention.
 
     Returns the peak location, the area fraction above the top-`top_frac`
     intensity threshold, and how concentrated the map is (mass inside that
@@ -95,7 +95,7 @@ def focus_stats(gradcam: np.ndarray, top_frac: float = 0.2) -> dict[str, float]:
 
 
 def _highlight_axis(ax, color: str = "#1565c0", width: float = 3.0) -> None:
-    """Draw a colored border around a subplot to flag the predicted class."""
+    """draw a colored border around a subplot to flag the predicted class."""
     ax.axis("on")
     ax.set_xticks([])
     ax.set_yticks([])
@@ -105,7 +105,7 @@ def _highlight_axis(ax, color: str = "#1565c0", width: float = 3.0) -> None:
 
 
 def _draw_focus_contour(ax, gradcam: np.ndarray, levels=(0.5, 0.75)) -> None:
-    """Outline high-activation regions so focus is readable against the cell."""
+    """outline high-activation regions so focus is readable against the cell."""
     if gradcam.max() - gradcam.min() < 1e-8:
         return
     ax.contour(
@@ -125,9 +125,9 @@ def visualize_gradcam_single(
     figsize: tuple[int, int] = (16, 4),
 ) -> None:
     """
-    Visualize original, heatmap, overlay, and a focus-contour panel.
+    visualize original, heatmap, overlay, and a focus-contour panel.
 
-    Panels: original grayscale; Grad-CAM with an intensity colorbar; blended
+    panels: original grayscale; Grad-CAM with an intensity colorbar; blended
     overlay; and the original with the top activation region outlined so the
     focus can be read directly against the cell structure. A caption reports
     peak location, hot-area coverage, and how concentrated the attention is.
@@ -200,12 +200,13 @@ def visualize_gradcam_multiclass(
     probs: Optional[dict[int, float]] = None,
 ) -> None:
     """
-    Visualize Grad-CAM for multiple classes in a two-row grid.
+    visualize Grad-CAM for multiple classes in a two-row grid.
 
-    Top row overlays each class heatmap on the crop with the top activation
+    the leading column shows the original crop with no overlay for reference.
+    top row overlays each class heatmap on the crop with the top activation
     region outlined; bottom row shows the raw heatmap on a shared, fixed [0, 1]
     color scale (one colorbar) so intensities are comparable across classes.
-    Per-class titles include hot-area coverage, and the predicted class column
+    per-class titles include hot-area coverage, and the predicted class column
     is highlighted when `pred_class`/`probs` are provided.
 
     Args:
@@ -214,13 +215,17 @@ def visualize_gradcam_multiclass(
         class_names: List of class names
         title: Plot title
         save_path: Path to save figure
-        figsize: Figure size, defaults to (4*n_classes, 8)
+        figsize: Figure size, defaults to (4*(n_classes+1), 8) for the extra
+            original-crop column
         pred_class: Optional predicted class index to highlight
         probs: Optional dict mapping class_idx → probability, shown in titles
     """
     n_classes = len(gradcams)
+    # leading column holds the original crop for reference, so the grid has
+    # one more column than there are classes.
+    n_cols = n_classes + 1
     if figsize is None:
-        figsize = (4 * n_classes, 8)
+        figsize = (4 * n_cols, 8)
 
     # Ensure 2D image
     if image.ndim == 3:
@@ -228,11 +233,19 @@ def visualize_gradcam_multiclass(
     else:
         image_2d = image
 
-    fig, axes = plt.subplots(2, n_classes, figsize=figsize, squeeze=False)
+    fig, axes = plt.subplots(2, n_cols, figsize=figsize, squeeze=False)
     fig.suptitle(title, fontsize=14, fontweight="bold")
 
+    # column 0: original crop, no overlay. bottom cell left blank so the row
+    # stays aligned with the heatmaps to its right.
+    axes[0, 0].imshow(image_2d, cmap="gray")
+    axes[0, 0].set_title("Original", fontsize=11, fontweight="bold")
+    axes[0, 0].axis("off")
+    axes[1, 0].axis("off")
+
     hm_im = None
-    for col, (class_idx, gradcam) in enumerate(sorted(gradcams.items())):
+    for offset, (class_idx, gradcam) in enumerate(sorted(gradcams.items())):
+        col = offset + 1  # shift past the original-crop column
         stats = focus_stats(gradcam)
         name = class_names[class_idx]
         header = name
@@ -259,8 +272,10 @@ def visualize_gradcam_multiclass(
         axes[1, col].axis("off")
 
     if hm_im is not None:
+        # attach the colorbar to the heatmap columns only, skipping the blank
+        # cell under the original crop.
         fig.colorbar(
-            hm_im, ax=axes[1, :].tolist(),
+            hm_im, ax=axes[1, 1:].tolist(),
             fraction=0.046, pad=0.02, label="activation",
         )
 
@@ -279,7 +294,7 @@ def visualize_gradcam_grid(
     figsize: Optional[tuple[int, int]] = None,
 ) -> None:
     """
-    Visualize multiple samples with their Grad-CAM overlays in a grid.
+    visualize multiple samples with their Grad-CAM overlays in a grid.
 
     Args:
         images: Array of images, shape (n_samples, H, W) or (n_samples, H, W, 3)
@@ -330,7 +345,7 @@ def max_project_3d(
     axis: int = 0,
 ) -> np.ndarray:
     """
-    Max project a 3D volume to 2D.
+    max project a 3D volume to 2D.
 
     Args:
         volume: 3D array (Z, H, W)
@@ -348,7 +363,7 @@ def save_gradcam_heatmap(
     colormap: int = cv2.COLORMAP_JET,
 ) -> None:
     """
-    Save Grad-CAM heatmap as an image file.
+    save Grad-CAM heatmap as an image file.
 
     Args:
         gradcam: Heatmap tensor or array [0, 1]

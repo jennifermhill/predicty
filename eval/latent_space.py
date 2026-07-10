@@ -1,6 +1,6 @@
-"""Latent-space visualization for a frozen WS-DINO encoder.
+"""latent-space visualization for a frozen WS-DINO encoder.
 
-This samples normal training crops, embeds them with a checkpointed encoder,
+this samples normal training crops, embeds them with a checkpointed encoder,
 then projects the high-dimensional embeddings to 2D for inspection.
 
 Usage:
@@ -13,7 +13,7 @@ Outputs:
     <out-dir>/<method>/latent_by_*.png  scatter plots colored by metadata fields
 
 PCA always runs so every report has a deterministic, variance-faithful view.
-When umap-learn (or scikit-learn for t-SNE) is installed, that manifold method
+when umap-learn (or scikit-learn for t-SNE) is installed, that manifold method
 runs too, giving both a umap/ and a pca/ subdirectory side by side.
 """
 
@@ -88,7 +88,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def disable_augmentations(cfg: Config) -> None:
-    """Turn off stochastic augmentations for deterministic visual diagnostics."""
+    """turn off stochastic augmentations for deterministic visual diagnostics."""
     for name in ("aug_intensity", "aug_gamma", "aug_noise", "aug_blur"):
         getattr(cfg, name).enabled = False
     # Keep per-crop normalization on because it is the encoder input convention.
@@ -577,7 +577,7 @@ def plot_annotations_pca(
     out_dir: Path,
     plot_size: float,
 ) -> None:
-    """PCA fit on just the annotated (labeled) crops, colored by label. This
+    """PCA fit on just the annotated (labeled) crops, colored by label. this
     is a separate 2D projection from the main pca/ output -- fit only on the
     labeled subset so category structure isn't washed out by the much larger
     random-crop population."""
@@ -654,7 +654,7 @@ def sliced_wasserstein_distance(
     n_quantiles: int = 100,
     seed: int = 0,
 ) -> float:
-    """Sliced Wasserstein-1 distance between two point clouds.
+    """sliced Wasserstein-1 distance between two point clouds.
 
     projects both clouds onto many random 1d directions, computes the exact 1d
     wasserstein-1 distance on each slice by matching quantiles, and averages. the
@@ -684,7 +684,7 @@ def print_batch_effect_wasserstein(
     seed: int = 0,
     min_per_dataset: int = 10,
 ) -> None:
-    """Pairwise sliced-Wasserstein distance between per-dataset embedding clouds.
+    """pairwise sliced-Wasserstein distance between per-dataset embedding clouds.
 
     a direct, geometry-aware measure of residual batch effect. if the dataset
     adversary scrubbed dataset identity, the clouds overlap and distances sit

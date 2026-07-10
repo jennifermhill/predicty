@@ -1,8 +1,8 @@
-"""Linear probe for behavior identity on a frozen WS-DINO encoder.
+"""linear probe for behavior identity on a frozen WS-DINO encoder.
 
-We freeze the encoder, extract embeddings of t1 global crops over all annotated samples,
+we freeze the encoder, extract embeddings of t1 global crops over all annotated samples,
 and train a single nn.Linear to predict which behavior each crop came from.
-The intent is for this classifier to SUCCEED: high val accuracy indicates the encoder
+the intent is for this classifier to SUCCEED: high val accuracy indicates the encoder
 has learned a representation that separates behaviors, which is the desired outcome.
 
 usage:
@@ -25,14 +25,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
 import torch.multiprocessing as mp
 mp.set_start_method("spawn", force=True)
 from sklearn.model_selection import StratifiedGroupKFold
 
 from configs.config import Config
-from data.dataset import MultiZarrDataset, worker_init_fn
-from data.spatial_regions import region_bounds_for_top_left
+from data.dataset import MultiZarrDataset
 from models.encoder import HybridEncoder
 
 def setup_logging(checkpoint_path: str) -> Path:

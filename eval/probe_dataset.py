@@ -1,6 +1,6 @@
-"""Linear probe for dataset identity on a frozen WS-DINO encoder.
+"""linear probe for dataset identity on a frozen WS-DINO encoder.
 
-We freeze the encoder, extract embeddings of t1 global crops over many samples,
+we freeze the encoder, extract embeddings of t1 global crops over many samples,
 and train a single nn.Linear to predict which zarr (dataset_idx) each crop came
 from. By default, extraction samples only the configured held-out spatial
 regions, which DINO training should exclude, then splits those regions

@@ -1,9 +1,9 @@
-"""Visualize the masked patches used by the MAE auxiliary loss.
+"""visualize the masked patches used by the MAE auxiliary loss.
 
-This samples one global crop from the configured dataset, applies the same
+this samples one global crop from the configured dataset, applies the same
 MaskedPatchAutoencoder patch mask used during training, and saves diagnostic
 PNGs showing the original crop, masked crop, and mask layout.
-If --checkpoint is provided, it also visualizes the trained MAE reconstruction.
+if --checkpoint is provided, it also visualizes the trained MAE reconstruction.
 
 Usage:
     python eval/visualize_mae_mask.py --config configs/train.yaml
@@ -81,7 +81,7 @@ def mean_projection(x: np.ndarray) -> np.ndarray:
 
 
 def disable_stochastic_augmentations(cfg: Config) -> None:
-    """Keep encoder normalization but make the sampled evaluation crop stable."""
+    """keep encoder normalization but make the sampled evaluation crop stable."""
     for name in ("aug_intensity", "aug_gamma", "aug_noise", "aug_blur"):
         getattr(cfg, name).enabled = False
     if cfg.aug_percrop_norm.enabled:
@@ -132,7 +132,7 @@ def reconstruction_metrics(
     mask_volume: np.ndarray,
     objective_mse: float,
 ) -> dict[str, MetricValue]:
-    """Evaluate only hidden voxels; visible voxels are copied and must be excluded."""
+    """evaluate only hidden voxels; visible voxels are copied and must be excluded."""
     hidden = mask_volume.astype(bool)
     if original.shape != reconstruction.shape or original.shape != hidden.shape:
         raise ValueError("original, reconstruction, and mask_volume must have equal shapes")

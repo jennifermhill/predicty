@@ -1,4 +1,4 @@
-"""Run Grad-CAM on behavior and dataset probes.
+"""run Grad-CAM on behavior and dataset probes.
 
 usage:
     # Behavior Grad-CAM
@@ -21,7 +21,6 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -31,7 +30,6 @@ from data.dataset import MultiZarrDataset
 from models.encoder import HybridEncoder
 from eval.gradcam import GradCAM, get_final_conv_layer, upsample_gradcam
 from eval.visualize_gradcam import (
-    visualize_gradcam_single,
     visualize_gradcam_multiclass,
     max_project_3d,
 )
@@ -72,7 +70,7 @@ def load_behavior_probe(
     checkpoint_path: str,
     device: torch.device,
 ) -> tuple[nn.Linear, list[str]]:
-    """Load behavior classifier from probe checkpoint."""
+    """load behavior classifier from probe checkpoint."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
 
     required_keys = ["input_dim", "output_dim", "class_names", "head_state_dict"]
@@ -95,7 +93,7 @@ def load_dataset_probe(
     checkpoint_path: str,
     device: torch.device,
 ) -> tuple[nn.Linear, list[str]]:
-    """Load dataset discriminator from probe checkpoint."""
+    """load dataset discriminator from probe checkpoint."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
 
     required_keys = ["input_dim", "output_dim", "dataset_names", "head_state_dict"]
@@ -119,10 +117,10 @@ def extract_sample_crops(
     n_samples: int = 10,
 ) -> list[dict[str, Any]]:
     """
-    Extract sample crops from an already-constructed dataset.
+    extract sample crops from an already-constructed dataset.
 
     Returns:
-        List of dicts with keys: 'crop', 'metadata'
+        list of dicts with keys: 'crop', 'metadata'
     """
     samples = []
     for sample in ds:
@@ -147,7 +145,7 @@ def run_behavior_gradcam(
     device: torch.device,
     output_dir: Path,
 ) -> None:
-    """Run Grad-CAM for behavior classification."""
+    """run Grad-CAM for behavior classification."""
     print("\n" + "=" * 70)
     print("BEHAVIOR GRAD-CAM")
     print("=" * 70)
@@ -241,7 +239,7 @@ def run_dataset_gradcam(
     device: torch.device,
     output_dir: Path,
 ) -> None:
-    """Run Grad-CAM for dataset discrimination."""
+    """run Grad-CAM for dataset discrimination."""
     print("\n" + "=" * 70)
     print("DATASET DISCRIMINATION GRAD-CAM")
     print("=" * 70)
@@ -252,18 +250,39 @@ def run_dataset_gradcam(
     # Setup Grad-CAM
     target_layer = get_final_conv_layer(encoder)
     gradcam = GradCAM(encoder, dataset_head, target_layer, device)
+
+    # strip directory + .zarr so panel labels read cleanly. the gradcam dict
+    # keys are dataset indices used to index this list, so it must stay full
+    # length and index-aligned with dataset_names.
+    dataset_names_clean = [
+        name.rsplit("/", 1)[-1].replace(".zarr", "") for name in dataset_names
+    ]
+    n_show = min(5, len(dataset_names))
+
     for sample_idx, sample in enumerate(samples):
         crop = sample["crop"]  # (C=1, Z, H, W), no batch dim
         crop = crop.unsqueeze(0).to(device)  # (1, 1, Z, H, W) = (B, C, Z, H, W)
 
-        # Generate Grad-CAM for all datasets (expensive - sample a few)
-        print(f"\nSample {sample_idx + 1}/{len(samples)}")
-        n_datasets_to_show = min(5, len(dataset_names))
-        gradcams = {}
+        own_idx = int(sample["metadata"]["dataset_idx"])
 
-        for dataset_idx in range(n_datasets_to_show):
-            hm = gradcam.generate_gradcam(crop, dataset_idx)
-            gradcams[dataset_idx] = hm
+        # always show the crop's own dataset, then fill the panel with others.
+        # guarantees the true source dataset appears and avoids duplicate keys.
+        shown_idx = [own_idx]
+        for idx in range(len(dataset_names)):
+            if len(shown_idx) >= n_show:
+                break
+            if idx != own_idx:
+                shown_idx.append(idx)
+
+        # what the discriminator actually predicts, to highlight in the panel.
+        with torch.no_grad():
+            pred_idx = int(dataset_head(encoder(crop)).argmax(dim=-1).item())
+
+        print(
+            f"\nSample {sample_idx + 1}/{len(samples)} "
+            f"(from {dataset_names_clean[own_idx]}, predicted {dataset_names_clean[pred_idx]})"
+        )
+        gradcams = {idx: gradcam.generate_gradcam(crop, idx) for idx in shown_idx}
 
         # Upsample
         h_in, w_in = crop.shape[-2:]
@@ -277,18 +296,16 @@ def run_dataset_gradcam(
         crop_2d = max_project_3d(crop_np)  # (H, W)
 
         gradcams_np = {k: v.cpu().numpy() for k, v in gradcams_upsampled.items()}
-        dataset_names_subset = dataset_names[:n_datasets_to_show]
-        for i in range(len(dataset_names_subset)):
-            # strips path for better visualization
-            if "/" in dataset_names_subset[i]:
-                dataset_names_subset[i] = dataset_names_subset[i][dataset_names_subset[i].rindex("/") + 1:]
-
         visualize_gradcam_multiclass(
             crop_2d,
             gradcams_np,
-            dataset_names_subset,
-            title=f"Dataset Discrimination Grad-CAM - Sample {sample_idx + 1}",
+            dataset_names_clean,
+            title=(
+                f"Dataset Grad-CAM - Sample {sample_idx + 1} - "
+                f"crop from {dataset_names_clean[own_idx]}"
+            ),
             save_path=str(output_dir / f"dataset_gradcam_{sample_idx:03d}.png"),
+            pred_class=pred_idx,
         )
 
         print(f"  Saved: dataset_gradcam_{sample_idx:03d}.png")

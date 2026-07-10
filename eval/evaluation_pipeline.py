@@ -1,13 +1,13 @@
 """
-Short script aiming to simplify multi-model evaluation processes.
+short script aiming to simplify multi-model evaluation processes.
 
-For a given set of models, visualizes latent_space and runs linear probes
+for a given set of models, visualizes latent_space and runs linear probes
 checking dataset and behavior classification capabilities. The dataset probe
 should fail (model has learned dataset-invariant characteristics) and the 
 behavior probe should succeed (model embeddings translate well to downstream
 classification tasks).
 
-Can check if evaluation scripts have previously been run for individual models 
+can check if evaluation scripts have previously been run for individual models 
 to prevent redundant evaluation.
 
 Usage:

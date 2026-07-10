@@ -1,9 +1,9 @@
-"""Grad-CAM: Visual Explanations from Deep Networks via Gradient-based Localization.
+"""Grad-CAM: visual explanations from deep networks via gradient-based localization.
 
-Implementation based on Selvaraju et al. (2016):
+implementation based on Selvaraju et al. (2016):
 https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=8237336
 
-Computes class activation maps by weighting feature maps by gradients of class score.
+computes class activation maps by weighting feature maps by gradients of the class score.
 """
 
 from __future__ import annotations
@@ -11,11 +11,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Callable
 
 
 class GradCAMHook:
-    """Hook to capture activations and gradients from a target layer."""
+    """hook to capture activations and gradients from a target layer."""
 
     def __init__(self, layer: nn.Module):
         self.gradients = None
@@ -27,15 +26,15 @@ class GradCAMHook:
         self.bwd_hook = layer.register_full_backward_hook(self._backward_hook)
 
     def _forward_hook(self, module, input, output):
-        """Capture activations during forward pass."""
+        """capture activations during forward pass."""
         self.activations = output.detach()
 
     def _backward_hook(self, module, grad_input, grad_output):
-        """Capture gradients during backward pass."""
+        """capture gradients during backward pass."""
         self.gradients = grad_output[0]
 
     def remove(self):
-        """Clean up hooks."""
+        """clean up hooks."""
         self.fwd_hook.remove()
         self.bwd_hook.remove()
 
@@ -69,11 +68,11 @@ class GradCAM:
         target_class: int,
     ) -> torch.Tensor:
         """
-        Generate Grad-CAM heatmap for a target class.
+        generate Grad-CAM heatmap for a target class.
 
         Args:
-            input_tensor: Input image/crop, shape (1, C, Z, H, W) or (1, C, H, W)
-            target_class: Index of target class for explanation
+            input_tensor: input image/crop, shape (1, C, Z, H, W) or (1, C, H, W)
+            target_class: index of target class for explanation
 
         Returns:
             Grad-CAM heatmap, shape (H, W) normalized to [0, 1]
@@ -109,9 +108,9 @@ class GradCAM:
 
     def _compute_gradcam(self) -> torch.Tensor:
         """
-        Compute Grad-CAM from hooked gradients and activations.
+        compute Grad-CAM from hooked gradients and activations.
 
-        Algorithm from paper:
+        algorithm from paper:
         1. Compute channel weights: α_c^k = (1/Z) * Σ_i Σ_j (∂y^c / ∂A_{ij}^k)
         2. Weighted combination: L^Grad-CAM = ReLU(Σ_k α_c^k * A^k)
         3. Normalize to [0, 1]
@@ -163,14 +162,14 @@ class GradCAM:
         num_classes: int,
     ) -> dict[int, torch.Tensor]:
         """
-        Generate Grad-CAM for all classes.
+        generate Grad-CAM for all classes.
 
         Args:
-            input_tensor: Input image, shape (1, C, Z, H, W) or (1, C, H, W)
-            num_classes: Number of output classes
+            input_tensor: input image, shape (1, C, Z, H, W) or (1, C, H, W)
+            num_classes: number of output classes
 
         Returns:
-            Dict mapping class_idx → Grad-CAM heatmap
+            dict mapping class_idx -> Grad-CAM heatmap
         """
         results = {}
         for class_idx in range(num_classes):
@@ -184,14 +183,14 @@ def upsample_gradcam(
     target_size: tuple[int, int],
 ) -> torch.Tensor:
     """
-    Upsample Grad-CAM to input image resolution.
+    upsample Grad-CAM to input image resolution.
 
     Args:
-        gradcam: Heatmap from feature map resolution, shape (H_feat, W_feat)
-        target_size: Target spatial size (H_in, W_in)
+        gradcam: heatmap from feature map resolution, shape (H_feat, W_feat)
+        target_size: target spatial size (H_in, W_in)
 
     Returns:
-        Upsampled heatmap, shape (H_in, W_in)
+        upsampled heatmap, shape (H_in, W_in)
     """
     if gradcam.dim() == 2:
         gradcam = gradcam.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
@@ -208,15 +207,15 @@ def upsample_gradcam(
 
 def get_final_conv_layer(encoder: nn.Module) -> nn.Module:
     """
-    Extract the final convolutional layer from a ResNet-based encoder.
+    extract the final convolutional layer from a ResNet-based encoder.
 
-    For HybridEncoder with ResNet-50 body, returns the last conv block.
+    for HybridEncoder with a ResNet-50 backbone, returns the last conv block.
 
     Args:
         encoder: HybridEncoder or similar model
 
     Returns:
-        Final conv layer module
+        final conv layer module
     """
     # HybridEncoder structure: stem (3D) + backbone (2D ResNet-50)
     # ResNet-50 backbone: conv stem + layer1-4

@@ -28,7 +28,7 @@ import torch.nn.functional as F
 
 
 class _GradientReversal(torch.autograd.Function):
-    """Identity in forward, sign-flipped gradient in backward."""
+    """identity in forward, sign-flipped gradient in backward."""
 
     @staticmethod
     def forward(ctx, x: torch.Tensor, scale: float) -> torch.Tensor:
@@ -89,7 +89,7 @@ class DINOHead(nn.Module):
 
 
 class DatasetClassifier(nn.Module):
-    """Small adversarial head for predicting dataset identity from encoder features."""
+    """small adversarial head for predicting dataset identity from encoder features."""
 
     def __init__(
         self,
@@ -430,7 +430,7 @@ def ibot_reconstruction_accuracy(
     ibot_center: torch.Tensor,
     top_k: int = 5,
 ) -> dict[str, torch.Tensor]:
-    """Prototype-recovery accuracy for the iBOT masking objective.
+    """prototype-recovery accuracy for the iBOT masking objective.
 
     the iBOT target is the teacher's prototype assignment on the unmasked crop.
     "reconstruction accuracy" is how often the student, seeing only the masked

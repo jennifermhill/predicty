@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Filter annotation file to only include zarr_paths from train.yaml"""
+"""filter annotation file to only include zarr_paths from train.yaml"""
 
 import pandas as pd
 from pathlib import Path
