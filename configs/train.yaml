@@ -268,6 +268,8 @@ mae_norm_pix_loss: true
 # ---------------------------------------------------------------------------
 # auxiliary global-crop reconstruction with different masking strategy than MAE.
 # uses block-wise masking instead of patch-wise for more spatial coherence.
+# mutually exclusive with mae: enabling this force-disables mae_enabled above.
+ibot_enabled: true
 ibot_weight: 0.1
 ibot_mask_ratio: 0.75
 
