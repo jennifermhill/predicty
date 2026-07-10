@@ -12,6 +12,11 @@ design:
     `stem_channels` inputs and its classification head removed. weights
     are randomly initialized; ImageNet pretraining doesn't transfer to
     microscopy at the scale of this dataset.
+  - normalization is groupnorm, not batchnorm. groupnorm computes statistics
+    per-sample over channel groups, so there are no running-stat buffers. this
+    is deliberate: the ssl training loop pushes masked and multi-scale crops
+    through this encoder, whose degenerate statistics would corrupt batchnorm
+    running stats and then ship in the frozen eval checkpoint.
 """
 
 from __future__ import annotations
@@ -42,29 +47,43 @@ class ZAttentionPool(nn.Module):
 
 
 class HybridEncoder(nn.Module):
-    def __init__(self, stem_channels: int = 64, latent_dim: int = 2048) -> None:
+    def __init__(
+        self, stem_channels: int = 64, latent_dim: int = 2048, norm_groups: int = 32
+    ) -> None:
         super().__init__()
         if stem_channels < 1:
             raise ValueError(f"stem_channels must be >= 1; got {stem_channels}")
         if latent_dim < 1:
             raise ValueError(f"latent_dim must be >= 1; got {latent_dim}")
+        if norm_groups < 1:
+            raise ValueError(f"norm_groups must be >= 1; got {norm_groups}")
+
+        def make_norm(num_channels: int) -> nn.GroupNorm:
+            # clamp groups to the largest divisor of num_channels that is
+            # <= norm_groups so groupnorm is valid for any channel count.
+            # groupnorm handles 3D (stem) and 2D (backbone) tensors alike.
+            groups = min(norm_groups, num_channels)
+            while num_channels % groups != 0:
+                groups -= 1
+            return nn.GroupNorm(groups, num_channels)
 
         # 3D stem: two conv layers that preserve (Z, H, W) and grow channels.
         # ZAttentionPool then collapses z with learned weights so the 2D
         # backbone sees a single feature plane per sample.
         self.stem = nn.Sequential(
             nn.Conv3d(1, 32, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm3d(32),
+            make_norm(32),
             nn.GELU(),
             nn.Conv3d(32, stem_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm3d(stem_channels),
+            make_norm(stem_channels),
             nn.GELU(),
         )
         self.z_pool = ZAttentionPool(stem_channels)
 
         # 2D ResNet-50 backbone. swap the input conv (3 -> stem_channels) and
-        # drop the classifier (we want the 2048-d pre-classifier feature).
-        self.backbone = resnet50(weights=None)
+        # drop the classifier (we want the 2048-d pre-classifier feature). the
+        # norm_layer factory replaces every backbone batchnorm with groupnorm.
+        self.backbone = resnet50(weights=None, norm_layer=make_norm)
         self.backbone.conv1 = nn.Conv2d(
             stem_channels, 64, kernel_size=7, stride=2, padding=3, bias=False
         )

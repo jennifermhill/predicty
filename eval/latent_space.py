@@ -800,6 +800,7 @@ def main() -> None:
         encoder = HybridEncoder(
             stem_channels=cfg.stem_channels,
             latent_dim=cfg.latent_dim,
+            norm_groups=cfg.norm_groups,
         ).to(device)
         encoder.load_state_dict(ckpt["encoder_state_dict"])
         for p in encoder.parameters():

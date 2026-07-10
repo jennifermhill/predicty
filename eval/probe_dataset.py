@@ -32,7 +32,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
-import torch.nn as nn
+import torch.nn as nn 
 from torch.utils.data import DataLoader
 
 from configs.config import Config
@@ -320,6 +320,7 @@ def main() -> None:
     encoder = HybridEncoder(
         stem_channels=cfg.stem_channels,
         latent_dim=cfg.latent_dim,
+        norm_groups=cfg.norm_groups,
     ).to(device)
     encoder.load_state_dict(ckpt["encoder_state_dict"])
     for p in encoder.parameters():

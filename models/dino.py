@@ -147,6 +147,7 @@ class DINOWrapper(nn.Module):
         student_enc = HybridEncoder(
             stem_channels=cfg.stem_channels,
             latent_dim=cfg.latent_dim,
+            norm_groups=cfg.norm_groups,
         )
         student_proj = DINOHead(
             in_dim=cfg.latent_dim,
@@ -229,6 +230,15 @@ class DINOWrapper(nn.Module):
             )
             self.register_buffer("ibot_center", torch.zeros(cfg.projector_k))
 
+    def train(self, mode: bool = True):
+        # teacher is EMA-only. keep it in eval regardless of the wrapper's mode
+        # so its batchnorm uses running stats and never batch stats. without
+        # this, any `model.train()` (loop top, DDP, post-validation) would flip
+        # the teacher's batchnorm and corrupt the targets it produces.
+        super().train(mode)
+        self.teacher.eval()
+        return self
+
     def forward(self, batch: dict) -> dict:
         from models.mae import make_random_mask, apply_mask_to_volume
 
@@ -253,8 +263,6 @@ class DINOWrapper(nn.Module):
             l_features = None
             s_l = None
             student_features = g_features
-
-        self.student.last_features = student_features.detach()
 
         dataset_logits = None
         dataset_targets = None
@@ -287,6 +295,14 @@ class DINOWrapper(nn.Module):
             s_g_ibot_feat = self.student.encode(g_flat_masked)
             s_g_ibot = self.student.masking_head(s_g_ibot_feat)
 
+        # stash the real (globals+locals) embeddings for the collapse monitor.
+        # must come after the ibot masked encode above: student.encode sets
+        # last_features as a side effect, so the masked crop would otherwise be
+        # what the variance monitor reads. setting it here keeps that signal on
+        # unmasked embeddings. (mae calls the encoder directly, not encode, so
+        # it never touches last_features.)
+        self.student.last_features = student_features.detach()
+
         with torch.no_grad():
             # teacher: split encode and project so masking head can reuse encoding
             t_g_feat = self.teacher.encode(g_flat)
@@ -315,6 +331,17 @@ class DINOWrapper(nn.Module):
         """teacher = m * teacher + (1 - m) * student, parameter-wise."""
         for p_s, p_t in zip(self.student.parameters(), self.teacher.parameters()):
             p_t.data.mul_(momentum).add_(p_s.data, alpha=1.0 - momentum)
+        # batchnorm running stats are buffers, not parameters, so the EMA above
+        # misses them. EMA the float buffers (running_mean, running_var) with
+        # the same momentum so the teacher's normalization drifts as slowly as
+        # its weights. hard-copying instead would apply the student's current
+        # stats to the teacher's lagged weights, a mismatch. integer buffers
+        # (e.g. num_batches_tracked) can't be EMA'd, so copy those directly.
+        for b_s, b_t in zip(self.student.buffers(), self.teacher.buffers()):
+            if b_t.dtype.is_floating_point:
+                b_t.data.mul_(momentum).add_(b_s.data, alpha=1.0 - momentum)
+            else:
+                b_t.data.copy_(b_s.data)
 
     @torch.no_grad()
     def update_center(
@@ -488,7 +515,7 @@ if __name__ == "__main__":
             out["student_masking_globals"],
             out["teacher_masking_globals"],
             wrapper.ibot_center,
-            cfg.teacher_temp,
+            cfg.teacher_temp_end,
             cfg.student_temp,
         )
         loss = loss + ibot_loss_val

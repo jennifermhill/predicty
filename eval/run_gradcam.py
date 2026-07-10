@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 
 from configs.config import Config
-from data.dataset import MultiZarrDataset, ZarrCellDataset, worker_init_fn
+from data.dataset import MultiZarrDataset
 from models.encoder import HybridEncoder
 from eval.gradcam import GradCAM, get_final_conv_layer, upsample_gradcam
 from eval.visualize_gradcam import (
@@ -114,48 +114,16 @@ def load_dataset_probe(
     return head, dataset_names
 
 
-def create_dummy_probes(
-    latent_dim: int,
-    device: torch.device,
-) -> tuple[nn.Linear, nn.Linear, list[str], list[str]]:
-    """
-    Create dummy probe heads for demonstration.
-
-    In production, load actual trained probes from checkpoints.
-    """
-    n_behaviors = 4  # streaming, slugs, aggregation, empty
-    n_datasets = 20  # Number of zarr datasets
-
-    behavior_head = nn.Linear(latent_dim, n_behaviors).to(device)
-    behavior_head.eval()
-    dataset_head = nn.Linear(latent_dim, n_datasets).to(device)
-    dataset_head.eval()
-
-    behavior_names = ["streaming", "slugs", "aggregation", "empty"]
-    dataset_names = [f"dataset_{i}" for i in range(n_datasets)]
-
-    return behavior_head, dataset_head, behavior_names, dataset_names
-
-
 def extract_sample_crops(
-    cfg: Config,
     ds: MultiZarrDataset,
     n_samples: int = 10,
-    seed: int = 42,
 ) -> list[dict[str, Any]]:
     """
-    Extract sample crops from the dataset.
+    Extract sample crops from an already-constructed dataset.
 
     Returns:
         List of dicts with keys: 'crop', 'metadata'
     """
-    cfg.seed = seed
-    # Use MultiZarrDataset for multi-zarr configs, else single ZarrCellDataset
-    if cfg.zarr_paths is not None:
-        ds = MultiZarrDataset(cfg)
-    else:
-        ds = ZarrCellDataset(cfg)
-
     samples = []
     for sample in ds:
         if len(samples) >= n_samples:
@@ -347,6 +315,7 @@ def main() -> None:
     encoder = HybridEncoder(
         stem_channels=cfg.stem_channels,
         latent_dim=cfg.latent_dim,
+        norm_groups=cfg.norm_groups,
     ).to(device)
     encoder.load_state_dict(ckpt["encoder_state_dict"])
     encoder.eval()
@@ -397,10 +366,12 @@ def main() -> None:
             )
             print(f"[gradcam] dataset classes: {len(dataset_names)} datasets")
 
-    # Extract sample crops
+    # Extract sample crops. set the seed before building the dataset so
+    # sampling is reproducible.
+    cfg.seed = args.seed
     ds = MultiZarrDataset(cfg)
     print(f"[gradcam] extracting {args.n_samples} sample crops...")
-    samples = extract_sample_crops(cfg, ds, args.n_samples, args.seed)
+    samples = extract_sample_crops(ds, args.n_samples)
     print(f"[gradcam] extracted {len(samples)} samples")
 
     if not samples:

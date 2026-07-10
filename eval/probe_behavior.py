@@ -16,7 +16,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 import statistics
 import pandas as pd
 
@@ -177,7 +177,7 @@ def stratified_group_kfold_split(
     dataset_idx: list,
     seed: int,
     n_splits: int = 5
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
     sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
     for train_index, test_index in sgkf.split(X, y, groups=dataset_idx):
         X_train, X_test = X[train_index], X[test_index]
@@ -322,6 +322,7 @@ def main() -> None:
     encoder = HybridEncoder(
         stem_channels=cfg.stem_channels,
         latent_dim=cfg.latent_dim,
+        norm_groups=cfg.norm_groups,
     ).to(device)
     encoder.load_state_dict(ckpt["encoder_state_dict"])
     for p in encoder.parameters():

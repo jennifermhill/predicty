@@ -218,18 +218,16 @@ def get_final_conv_layer(encoder: nn.Module) -> nn.Module:
     Returns:
         Final conv layer module
     """
-    # HybridEncoder structure: stem (3D) + body (2D ResNet-50)
-    # ResNet-50 body: stem + layer1-4
+    # HybridEncoder structure: stem (3D) + backbone (2D ResNet-50)
+    # ResNet-50 backbone: conv stem + layer1-4
     # Final conv layer is the last block of layer4
 
-    if hasattr(encoder, "body"):
-        # Assume encoder has a 'body' attribute (2D ResNet)
-        body = encoder.body
-        if hasattr(body, "layer4"):
+    if hasattr(encoder, "backbone"):
+        backbone = encoder.backbone
+        if hasattr(backbone, "layer4"):
             # ResNet has layer1, layer2, layer3, layer4
-            layer4 = body.layer4
             # layer4[-1] is the last bottleneck block
-            return layer4[-1]
+            return backbone.layer4[-1]
 
     # Fallback: recursively find last Conv2d
     last_conv = None
