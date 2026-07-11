@@ -220,8 +220,8 @@ def extract_embeddings(
             t1=int(r["t1"]),
             t2=int(r["t2"]),
             z=int(r["z"]),
-            x_off=int(r["global_x"]),
-            y_off=int(r["global_y"]),
+            global_x=int(r["global_x"]),
+            global_y=int(r["global_y"]),
             dataset_idx=ds_idx,
         )
         ann_globals.append(sample["globals"])

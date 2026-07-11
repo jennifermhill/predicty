@@ -758,7 +758,7 @@ class ZarrCellDataset(IterableDataset):
         return sample
 
     def _annotation_tensor(
-        self, t1: int, t2: int, z: int, global_x: int, global_y: int
+        self, t1: int, t2: int, z: int, global_x: int, global_y: int, dataset_idx: int = 0
     ) -> dict[str, Any]:
         """load a global crop pair given annotation coordinates (no augmentation)."""
         cfg = self.cfg
@@ -784,6 +784,8 @@ class ZarrCellDataset(IterableDataset):
                 "frame_y": self.Y,
                 "frame_x": self.X,
                 "spatial_region_idx": 0,
+                "dataset_idx": dataset_idx,
+                "frame_gap": self.frame_gap,
             },
         }
 
