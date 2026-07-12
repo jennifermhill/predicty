@@ -45,6 +45,7 @@ mp.set_start_method("spawn", force=True)
 from configs.config import Config
 from data.dataset import MultiZarrDataset, ZarrCellDataset, worker_init_fn
 from models.encoder import HybridEncoder
+from eval.wasserstein import print_batch_effect_wasserstein
 
 
 def parse_args() -> argparse.Namespace:
@@ -647,106 +648,6 @@ def maybe_print_cluster_metrics(coords: np.ndarray, rows: list[dict[str, Any]]) 
     print(f"[metrics] silhouette by dataset_idx on 2D projection: {score:.3f}")
     print("[metrics] near 0 means mixed/overlapping datasets; high positive means dataset-separated islands")
 
-def sliced_wasserstein_distance(
-    x_a: np.ndarray,
-    x_b: np.ndarray,
-    n_projections: int = 128,
-    n_quantiles: int = 100,
-    seed: int = 0,
-) -> float:
-    """sliced Wasserstein-1 distance between two point clouds.
-
-    projects both clouds onto many random 1d directions, computes the exact 1d
-    wasserstein-1 distance on each slice by matching quantiles, and averages. the
-    1d case reduces to sorting, so this approximates the full high-dim optimal
-    transport distance without a solver or extra dependency. quantile matching
-    also handles clouds with different sample counts.
-    """
-    dim = x_a.shape[1]
-    rng = np.random.default_rng(seed)
-    directions = rng.standard_normal((dim, n_projections)).astype(np.float64)
-    directions /= np.linalg.norm(directions, axis=0, keepdims=True) + 1e-12
-
-    proj_a = x_a.astype(np.float64) @ directions  # (n_a, n_projections)
-    proj_b = x_b.astype(np.float64) @ directions  # (n_b, n_projections)
-
-    q = np.linspace(0.0, 1.0, n_quantiles)
-    qa = np.quantile(proj_a, q, axis=0)  # (n_quantiles, n_projections)
-    qb = np.quantile(proj_b, q, axis=0)
-    # mean |Δquantile| per slice IS the 1d wasserstein-1 distance; average slices.
-    return float(np.abs(qa - qb).mean())
-
-
-def print_batch_effect_wasserstein(
-    X: np.ndarray,
-    rows: list[dict[str, Any]],
-    n_projections: int = 128,
-    seed: int = 0,
-    min_per_dataset: int = 10,
-) -> None:
-    """pairwise sliced-Wasserstein distance between per-dataset embedding clouds.
-
-    a direct, geometry-aware measure of residual batch effect. if the dataset
-    adversary scrubbed dataset identity, the clouds overlap and distances sit
-    near zero; large distances mean datasets stay separable in latent space.
-    computed on full-dim embeddings, where the encoder actually operates, rather
-    than on a 2d projection.
-    """
-    dataset_idx = np.asarray([r["dataset_idx"] for r in rows], dtype=np.int64)
-    unique = np.unique(dataset_idx)
-    if unique.size < 2:
-        print("[wasserstein] only one dataset; skipping batch-effect distance")
-        return
-
-    names: dict[int, str] = {}
-    for r in rows:
-        names.setdefault(
-            int(r["dataset_idx"]), r.get("dataset_name") or str(r["dataset_idx"])
-        )
-
-    # drop datasets with too few points for stable quantile estimates.
-    groups: dict[int, np.ndarray] = {}
-    for d in unique:
-        pts = X[dataset_idx == d]
-        if pts.shape[0] >= min_per_dataset:
-            groups[int(d)] = pts
-        else:
-            print(
-                f"[wasserstein] dataset {names[int(d)]} has {pts.shape[0]} < "
-                f"{min_per_dataset} points; excluded"
-            )
-    keys = sorted(groups)
-    if len(keys) < 2:
-        print("[wasserstein] fewer than two datasets with enough points; skipping")
-        return
-
-    n = len(keys)
-    mat = np.zeros((n, n), dtype=np.float64)
-    for i in range(n):
-        for j in range(i + 1, n):
-            dist = sliced_wasserstein_distance(
-                groups[keys[i]], groups[keys[j]], n_projections=n_projections, seed=seed
-            )
-            mat[i, j] = mat[j, i] = dist
-
-    label_list = [names[k] for k in keys]
-    width = max(12, max(len(s) for s in label_list) + 2)
-    print("[wasserstein] pairwise sliced-Wasserstein distance between dataset embedding clouds")
-    print("[wasserstein] lower = better mixing (batch effect removed); higher = datasets separable")
-    header = " " * width + "".join(f"{s[: width - 1]:>{width}}" for s in label_list)
-    print(header)
-    for i, ri in enumerate(label_list):
-        cells = "".join(f"{mat[i, j]:>{width}.4f}" for j in range(n))
-        print(f"{ri[: width - 1]:>{width}}{cells}")
-
-    iu = np.triu_indices(n, k=1)
-    vals = mat[iu]
-    print(
-        f"[wasserstein] summary over {vals.size} dataset pairs: "
-        f"mean={vals.mean():.4f} min={vals.min():.4f} max={vals.max():.4f}"
-    )
-
-
 def find_cached_run(checkpoint: str) -> Path | None:
     base = Path("latent_space")
     if not base.is_dir():
@@ -817,7 +718,7 @@ def main() -> None:
 
     # batch-effect check in the full latent space: how far apart the per-dataset
     # embedding clouds sit. complements the training-time dataset adversary.
-    print_batch_effect_wasserstein(X_projected, rows, seed=args.seed)
+    print_batch_effect_wasserstein(X_projected, rows, out_dir=out_dir, seed=args.seed)
 
     methods = resolve_methods(args.method)
     print(f"[latent] projection methods: {', '.join(methods)}")
