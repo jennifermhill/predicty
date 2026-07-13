@@ -233,9 +233,10 @@ class DINOWrapper(nn.Module):
 
     def train(self, mode: bool = True):
         # teacher is EMA-only. keep it in eval regardless of the wrapper's mode
-        # so its batchnorm uses running stats and never batch stats. without
-        # this, any `model.train()` (loop top, DDP, post-validation) would flip
-        # the teacher's batchnorm and corrupt the targets it produces.
+        # so any mode-dependent layer uses inference behavior. groupnorm is mode
+        # invariant and the teacher has no dropout, so this is currently
+        # defensive: it guards against a stray `model.train()` (loop top, DDP,
+        # post-validation) corrupting the targets if such a layer is ever added.
         super().train(mode)
         self.teacher.eval()
         return self
@@ -332,12 +333,13 @@ class DINOWrapper(nn.Module):
         """teacher = m * teacher + (1 - m) * student, parameter-wise."""
         for p_s, p_t in zip(self.student.parameters(), self.teacher.parameters()):
             p_t.data.mul_(momentum).add_(p_s.data, alpha=1.0 - momentum)
-        # batchnorm running stats are buffers, not parameters, so the EMA above
-        # misses them. EMA the float buffers (running_mean, running_var) with
-        # the same momentum so the teacher's normalization drifts as slowly as
-        # its weights. hard-copying instead would apply the student's current
-        # stats to the teacher's lagged weights, a mismatch. integer buffers
-        # (e.g. num_batches_tracked) can't be EMA'd, so copy those directly.
+        # modules can hold non-parameter float buffers that the parameter EMA
+        # above misses. groupnorm keeps none, so this is a no-op today, but stays
+        # correct if a buffered module (e.g. a reintroduced batchnorm with
+        # running_mean/running_var) is added: EMA float buffers with the same
+        # momentum so the teacher's normalization drifts as slowly as its
+        # weights rather than jumping to the student's current stats. integer
+        # buffers (e.g. num_batches_tracked) can't be EMA'd, so copy directly.
         for b_s, b_t in zip(self.student.buffers(), self.teacher.buffers()):
             if b_t.dtype.is_floating_point:
                 b_t.data.mul_(momentum).add_(b_s.data, alpha=1.0 - momentum)
