@@ -9,6 +9,7 @@ package.json
 /logs/
 /latent_space/
 plans/
+/mae_masks/ 
 notes.txt
 TRAINING_GUIDE.txt
 PARAMETERS.txt
