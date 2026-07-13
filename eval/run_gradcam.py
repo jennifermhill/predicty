@@ -68,6 +68,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
+        "--output-dir",
+        default=None,
+        help="where to save visualizations (default: latent_space/gradcam_<timestamp>)",
+    )
+    p.add_argument(
         "--cam-3d",
         action="store_true",
         help=(
@@ -450,8 +455,14 @@ def main() -> None:
         print("[gradcam] WARNING: no samples extracted. check dataset configuration or zarr paths.")
         return
 
-    # Output directory
-    output_dir = Path("latent_space") / f"gradcam_{time.strftime('%Y%m%d_%H%M%S')}"
+    # Output directory. defaults to a fresh timestamped folder, but callers
+    # (e.g. eval/evaluation_pipeline.py) can pin it under a run's latent_space
+    # dir so redundant-run checks can find it later.
+    output_dir = (
+        Path(args.output_dir)
+        if args.output_dir
+        else Path("latent_space") / f"gradcam_{time.strftime('%Y%m%d_%H%M%S')}"
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Run Grad-CAM

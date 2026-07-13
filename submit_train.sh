@@ -19,7 +19,7 @@
 #BSUB -J predicty_train              # job name (shows in bjobs)
 #BSUB -q gpu_h200                    # H200 queue: 12 slots/GPU, 40GB ram/slot, 141GB VRAM
 #BSUB -gpu "num=1"                   # request 1 GPU
-#BSUB -n 8                           # 8 slots = 8 cores + 320 GB ram (slot-implied)
+#BSUB -n 20                           # 8 slots = 8 cores + 320 GB ram (slot-implied)
 #BSUB -W 72:00                       # 72 hour walltime
 #BSUB -oo logs/lsf/default/train.out # stdout log (overwritten on each submit; -oo not -o)
 #BSUB -eo logs/lsf/default/train.err # stderr log (overwritten on each submit)

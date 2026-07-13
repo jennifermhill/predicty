@@ -195,7 +195,7 @@ aug_rotation:
 # to fetch crops in parallel. each worker reopens its own zarr handle and
 # pulls samples independently, then hands batches back to the main process.
 # 0 means "load in the main process" (slower but easier to debug).
-num_workers: 6
+num_workers: 18
 
 # seed: base integer used to make sampling reproducible. each worker derives
 # its own rng from (seed + worker_id), and numpy/torch are seeded the same way.
@@ -247,7 +247,7 @@ center_momentum: 0.9
 dataset_adversary_enabled: true
 dataset_adversary_weight: 0.02
 dataset_adversary_grl_start: 0.0
-dataset_adversary_grl_scale: 1.0
+dataset_adversary_grl_scale: 1.5
 dataset_adversary_hidden: 256
 dataset_adversary_dropout: 0.1
 
@@ -282,7 +282,7 @@ ibot_mask_ratio: 0.75
 # weight_decay:   applied to weight matrices only (biases / norm scales excluded).
 # grad_clip_norm: clip gradient L2 norm to this value before each optimizer step.
 # warmup_frac:    fraction of total_steps spent in linear warmup. cosine after.
-base_lr: 3.5e-5
+base_lr: 7.5e-5
 weight_decay: 0.04
 grad_clip_norm: 1.0
 warmup_frac: 0.1
@@ -298,7 +298,7 @@ warmup_frac: 0.1
 # device:        'cuda' for HPC GPU, 'cpu' for local smoke tests.
 # use_amp:       fp16 autocast on cuda. silently disabled on cpu.
 batch_size: 40
-total_steps: 5000
+total_steps: 20000
 log_interval: 50
 ckpt_interval: 500
 device: cuda
