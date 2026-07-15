@@ -13,7 +13,7 @@ def region_bounds_for_top_left(
     grid_x: int,
     region_idx: int,
 ) -> tuple[int, int, int, int]:
-    """Return [y0, y1), [x0, x1) bounds for legal crop top-left positions."""
+    """return [y0, y1), [x0, x1) bounds for legal crop top-left positions."""
     if grid_y < 1 or grid_x < 1:
         raise ValueError(f"spatial region grid must be positive; got {grid_y}x{grid_x}")
     n_regions = grid_y * grid_x
@@ -51,7 +51,7 @@ def region_index_for_top_left(
     grid_y: int,
     grid_x: int,
 ) -> int:
-    """Map a legal crop top-left position to its row-major spatial region."""
+    """map a legal crop top-left position to its row-major spatial region."""
     legal_y = frame_y - crop_size + 1
     legal_x = frame_x - crop_size + 1
     if not 0 <= y < legal_y or not 0 <= x < legal_x:
@@ -78,7 +78,7 @@ def regions_are_adjacent(
     grid_x: int,
     min_gap: int,
 ) -> bool:
-    """Return whether two regions are closer than the requested tile gap."""
+    """return whether two regions are closer than the requested tile gap."""
     ar, ac = region_row_col(a, grid_x)
     br, bc = region_row_col(b, grid_x)
     return max(abs(ar - br), abs(ac - bc)) <= min_gap
@@ -91,7 +91,7 @@ def select_nonadjacent_regions(
     min_gap: int,
     min_score: float | None = None,
 ) -> list[int]:
-    """Greedily select high-scoring regions that do not touch each other."""
+    """greedily select high-scoring regions that do not touch each other."""
     if count < 1:
         raise ValueError(f"count must be >= 1; got {count}")
     eligible = [

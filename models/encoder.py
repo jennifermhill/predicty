@@ -12,12 +12,18 @@ design:
     `stem_channels` inputs and its classification head removed. weights
     are randomly initialized; ImageNet pretraining doesn't transfer to
     microscopy at the scale of this dataset.
+  - normalization is groupnorm, not batchnorm. groupnorm computes statistics
+    per-sample over channel groups, so there are no running-stat buffers. this
+    is deliberate: the ssl training loop pushes masked and multi-scale crops
+    through this encoder, whose degenerate statistics would corrupt batchnorm
+    running stats and then ship in the frozen eval checkpoint.
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 from torchvision.models import resnet50
 
 
@@ -42,29 +48,56 @@ class ZAttentionPool(nn.Module):
 
 
 class HybridEncoder(nn.Module):
-    def __init__(self, stem_channels: int = 64, latent_dim: int = 2048) -> None:
+    def __init__(
+        self,
+        stem_channels: int = 64,
+        latent_dim: int = 2048,
+        norm_groups: int = 32,
+        chunk_size: int | None = None,
+    ) -> None:
         super().__init__()
         if stem_channels < 1:
             raise ValueError(f"stem_channels must be >= 1; got {stem_channels}")
         if latent_dim < 1:
             raise ValueError(f"latent_dim must be >= 1; got {latent_dim}")
+        if norm_groups < 1:
+            raise ValueError(f"norm_groups must be >= 1; got {norm_groups}")
+        if chunk_size is not None and chunk_size < 1:
+            raise ValueError(f"chunk_size must be >= 1 or None; got {chunk_size}")
+
+        # the dino wrapper flattens all crops into one batch (e.g. batch_size *
+        # 2 globals), then pushes them through the 3D stem at full resolution.
+        # the stem's activations dominate memory (a 64-channel 256x256x10 map is
+        # ~20 GiB in fp32 for 128 crops), so cap how many crops flow through the
+        # stem at once. None means no chunking.
+        self.chunk_size = chunk_size
+
+        def make_norm(num_channels: int) -> nn.GroupNorm:
+            # clamp groups to the largest divisor of num_channels that is
+            # <= norm_groups so groupnorm is valid for any channel count.
+            # groupnorm handles 3D (stem) and 2D (backbone) tensors alike.
+            groups = min(norm_groups, num_channels)
+            while num_channels % groups != 0:
+                groups -= 1
+            return nn.GroupNorm(groups, num_channels)
 
         # 3D stem: two conv layers that preserve (Z, H, W) and grow channels.
         # ZAttentionPool then collapses z with learned weights so the 2D
         # backbone sees a single feature plane per sample.
         self.stem = nn.Sequential(
             nn.Conv3d(1, 32, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm3d(32),
+            make_norm(32),
             nn.GELU(),
             nn.Conv3d(32, stem_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm3d(stem_channels),
+            make_norm(stem_channels),
             nn.GELU(),
         )
         self.z_pool = ZAttentionPool(stem_channels)
 
         # 2D ResNet-50 backbone. swap the input conv (3 -> stem_channels) and
-        # drop the classifier (we want the 2048-d pre-classifier feature).
-        self.backbone = resnet50(weights=None)
+        # drop the classifier (we want the 2048-d pre-classifier feature). the
+        # norm_layer factory replaces every backbone batchnorm with groupnorm.
+        self.backbone = resnet50(weights=None, norm_layer=make_norm)
         self.backbone.conv1 = nn.Conv2d(
             stem_channels, 64, kernel_size=7, stride=2, padding=3, bias=False
         )
@@ -74,15 +107,36 @@ class HybridEncoder(nn.Module):
             nn.Identity() if latent_dim == 2048 else nn.Linear(2048, latent_dim)
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, 1, Z, H, W) -> stem -> (B, stem_channels, Z, H, W)
         x = self.stem(x)
         # learned z collapse -> (B, stem_channels, 1, H, W)
         x = self.z_pool(x)
         # drop trivial z axis -> (B, stem_channels, H, W) for ResNet
         x = x.squeeze(2)
-        # backbone returns (B, 2048).
+        # backbone returns (B, latent_dim); fc is Identity when latent_dim==2048.
         return self.backbone(x)
+
+    def _run(self, x: torch.Tensor) -> torch.Tensor:
+        # checkpoint the whole stem+backbone forward so groupnorm's retained
+        # activations (it recomputes nothing in backward, unlike the fused cudnn
+        # batchnorm it replaced) are recomputed instead of stored. training only,
+        # since there is no backward pass to trade against at inference.
+        if self.training:
+            return checkpoint(self._forward_impl, x, use_reentrant=False)
+        return self._forward_impl(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # split the crop batch so the stem never materializes all crops at once.
+        # chunking runs in eval too (bounds the teacher's forward memory); only
+        # the checkpointing inside _run is training-gated. concatenating chunk
+        # outputs is exact: each crop is encoded independently.
+        if self.chunk_size is not None and x.shape[0] > self.chunk_size:
+            return torch.cat(
+                [self._run(chunk) for chunk in x.split(self.chunk_size, dim=0)],
+                dim=0,
+            )
+        return self._run(x)
 
 
 if __name__ == "__main__":

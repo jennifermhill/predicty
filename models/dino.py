@@ -28,7 +28,7 @@ import torch.nn.functional as F
 
 
 class _GradientReversal(torch.autograd.Function):
-    """Identity in forward, sign-flipped gradient in backward."""
+    """identity in forward, sign-flipped gradient in backward."""
 
     @staticmethod
     def forward(ctx, x: torch.Tensor, scale: float) -> torch.Tensor:
@@ -89,7 +89,7 @@ class DINOHead(nn.Module):
 
 
 class DatasetClassifier(nn.Module):
-    """Small adversarial head for predicting dataset identity from encoder features."""
+    """small adversarial head for predicting dataset identity from encoder features."""
 
     def __init__(
         self,
@@ -147,6 +147,8 @@ class DINOWrapper(nn.Module):
         student_enc = HybridEncoder(
             stem_channels=cfg.stem_channels,
             latent_dim=cfg.latent_dim,
+            norm_groups=cfg.norm_groups,
+            chunk_size=getattr(cfg, "encoder_chunk_size", None),
         )
         student_proj = DINOHead(
             in_dim=cfg.latent_dim,
@@ -229,6 +231,16 @@ class DINOWrapper(nn.Module):
             )
             self.register_buffer("ibot_center", torch.zeros(cfg.projector_k))
 
+    def train(self, mode: bool = True):
+        # teacher is EMA-only. keep it in eval regardless of the wrapper's mode
+        # so any mode-dependent layer uses inference behavior. groupnorm is mode
+        # invariant and the teacher has no dropout, so this is currently
+        # defensive: it guards against a stray `model.train()` (loop top, DDP,
+        # post-validation) corrupting the targets if such a layer is ever added.
+        super().train(mode)
+        self.teacher.eval()
+        return self
+
     def forward(self, batch: dict) -> dict:
         from models.mae import make_random_mask, apply_mask_to_volume
 
@@ -253,8 +265,6 @@ class DINOWrapper(nn.Module):
             l_features = None
             s_l = None
             student_features = g_features
-
-        self.student.last_features = student_features.detach()
 
         dataset_logits = None
         dataset_targets = None
@@ -287,6 +297,14 @@ class DINOWrapper(nn.Module):
             s_g_ibot_feat = self.student.encode(g_flat_masked)
             s_g_ibot = self.student.masking_head(s_g_ibot_feat)
 
+        # stash the real (globals+locals) embeddings for the collapse monitor.
+        # must come after the ibot masked encode above: student.encode sets
+        # last_features as a side effect, so the masked crop would otherwise be
+        # what the variance monitor reads. setting it here keeps that signal on
+        # unmasked embeddings. (mae calls the encoder directly, not encode, so
+        # it never touches last_features.)
+        self.student.last_features = student_features.detach()
+
         with torch.no_grad():
             # teacher: split encode and project so masking head can reuse encoding
             t_g_feat = self.teacher.encode(g_flat)
@@ -315,6 +333,18 @@ class DINOWrapper(nn.Module):
         """teacher = m * teacher + (1 - m) * student, parameter-wise."""
         for p_s, p_t in zip(self.student.parameters(), self.teacher.parameters()):
             p_t.data.mul_(momentum).add_(p_s.data, alpha=1.0 - momentum)
+        # modules can hold non-parameter float buffers that the parameter EMA
+        # above misses. groupnorm keeps none, so this is a no-op today, but stays
+        # correct if a buffered module (e.g. a reintroduced batchnorm with
+        # running_mean/running_var) is added: EMA float buffers with the same
+        # momentum so the teacher's normalization drifts as slowly as its
+        # weights rather than jumping to the student's current stats. integer
+        # buffers (e.g. num_batches_tracked) can't be EMA'd, so copy directly.
+        for b_s, b_t in zip(self.student.buffers(), self.teacher.buffers()):
+            if b_t.dtype.is_floating_point:
+                b_t.data.mul_(momentum).add_(b_s.data, alpha=1.0 - momentum)
+            else:
+                b_t.data.copy_(b_s.data)
 
     @torch.no_grad()
     def update_center(
@@ -396,6 +426,31 @@ def ibot_loss(
     return -(t * s).sum(dim=-1).mean()
 
 
+@torch.no_grad()
+def ibot_reconstruction_accuracy(
+    student_ibot: torch.Tensor,
+    teacher_ibot: torch.Tensor,
+    ibot_center: torch.Tensor,
+    top_k: int = 5,
+) -> dict[str, torch.Tensor]:
+    """prototype-recovery accuracy for the iBOT masking objective.
+
+    the iBOT target is the teacher's prototype assignment on the unmasked crop.
+    "reconstruction accuracy" is how often the student, seeing only the masked
+    crop, recovers that assignment. top-1 is exact-match; top-k credits the
+    student when the teacher's argmax lands in its k most confident prototypes.
+    both are the interpretable companion to the raw cross-entropy loss.
+    """
+    teacher_target = (teacher_ibot - ibot_center).argmax(dim=-1)
+    student_pred = student_ibot.argmax(dim=-1)
+    top1 = (student_pred == teacher_target).float().mean()
+
+    k = min(top_k, student_ibot.size(-1))
+    student_topk = student_ibot.topk(k, dim=-1).indices
+    topk = (student_topk == teacher_target.unsqueeze(-1)).any(dim=-1).float().mean()
+    return {"top1": top1, "topk": topk}
+
+
 if __name__ == "__main__":
     # smoke test with random tensors. no zarr required.
     # run from project root: python -m models.dino
@@ -463,11 +518,20 @@ if __name__ == "__main__":
             out["student_masking_globals"],
             out["teacher_masking_globals"],
             wrapper.ibot_center,
-            cfg.teacher_temp,
+            cfg.teacher_temp_end,
             cfg.student_temp,
         )
         loss = loss + ibot_loss_val
         print(f"ibot_loss: {ibot_loss_val.item():.4f}")
+        ibot_acc = ibot_reconstruction_accuracy(
+            out["student_masking_globals"],
+            out["teacher_masking_globals"],
+            wrapper.ibot_center,
+        )
+        print(
+            f"ibot_recon_acc: top1={ibot_acc['top1'].item():.3f} "
+            f"top5={ibot_acc['topk'].item():.3f}"
+        )
 
     print(f"loss: {loss.item():.4f}")
     assert torch.isfinite(loss), "loss is not finite"

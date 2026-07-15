@@ -1,21 +1,21 @@
-"""Interactively inspect the raw crops represented by points in a 2D latent map.
+"""interactively inspect the raw crops represented by points in a 2D latent map.
 
-Left-click the scatter plot to show the nearest points. Right-click and drag to
-lasso a region. The selected points are highlighted in the latent map and their
+left-click the scatter plot to show the nearest points. right-click and drag to
+lasso a region. the selected points are highlighted in the latent map and their
 exact temporal crops are rendered in a second window.
 
-If metadata.csv has a "label" column (written by an annotation-aware
+if metadata.csv has a "label" column (written by an annotation-aware
 eval/latent_space.py run), annotated points are drawn with a colored ring on
 the map -- colored by their behavior label, layered over the usual per-dataset
 dot color -- and any annotated crop shown in the detail window has its label
-(or "not annotated") printed in the title. Because annotated points are
+(or "not annotated") printed in the title. because annotated points are
 usually a small minority of everything plotted, a left-click reserves one
 slot for the nearest annotated crop even when it isn't literally one of the
 N closest points to the click -- otherwise clicking near a ring almost always
 surfaces only unlabeled neighbors.
 
-Two checkboxes in the bottom-right corner ("Annotated" / "Unannotated", both
-on by default) toggle which points are drawn on the map. Hidden points are
+two checkboxes in the bottom-right corner ("Annotated" / "Unannotated", both
+on by default) toggle which points are drawn on the map. hidden points are
 also excluded from click and lasso selection, so hiding unannotated crops is
 an easy way to browse only the labeled ones.
 
@@ -114,7 +114,7 @@ def indices_inside_polygon(coords: np.ndarray, vertices: list[tuple[float, float
 def representative_indices(
     coords: np.ndarray, selected: np.ndarray, max_crops: int
 ) -> np.ndarray:
-    """Keep crops nearest the selected region's centroid when it is very large."""
+    """keep crops nearest the selected region's centroid when it is very large."""
     if max_crops < 1:
         raise ValueError("max_crops must be at least 1")
     selected = np.asarray(selected, dtype=np.int64)
@@ -126,9 +126,9 @@ def representative_indices(
 
 
 def nearest_annotated_index(ordered_indices: np.ndarray, rows: list[dict[str, Any]]) -> int | None:
-    """First labeled row in an already distance-sorted, deduplicated index array.
+    """first labeled row in an already distance-sorted, deduplicated index array.
 
-    Annotated points are almost always a small minority of the plotted crops,
+    annotated points are almost always a small minority of the plotted crops,
     so a click landing near -- but not exactly on -- a ring's data coordinate
     will usually have several unlabeled points as its literal nearest
     neighbors. This walks the ranking to find the closest one that actually
@@ -143,7 +143,7 @@ def nearest_annotated_index(ordered_indices: np.ndarray, rows: list[dict[str, An
 def compute_visible_mask(
     rows: list[dict[str, Any]], show_annotated: bool, show_unannotated: bool
 ) -> np.ndarray:
-    """Per-row visibility from the two "Annotated"/"Unannotated" checkboxes."""
+    """per-row visibility from the two "Annotated"/"Unannotated" checkboxes."""
     annotated = np.asarray([bool(row.get("label")) for row in rows])
     return np.where(annotated, show_annotated, show_unannotated)
 
@@ -156,9 +156,9 @@ def select_click_indices(
     nearest: int,
     visible_mask: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Nearest crops to a click, with the nearest annotated crop guaranteed a slot.
+    """nearest crops to a click, with the nearest annotated crop guaranteed a slot.
 
-    Pure Euclidean "nearest N" can silently exclude the ring you clicked on:
+    pure Euclidean "nearest N" can silently exclude the ring you clicked on:
     annotated points are typically a small fraction of the total, so unless
     the click lands exactly on the point's coordinate, its nearest neighbors
     are usually unlabeled. Reserving the last slot for the nearest annotated
@@ -186,7 +186,7 @@ def unique_crop_indices(
     rows: list[dict[str, Any]],
     cfg: Config,
 ) -> np.ndarray:
-    """Remove duplicate t1/t2 latent points that reload the same crop pair."""
+    """remove duplicate t1/t2 latent points that reload the same crop pair."""
     unique: list[int] = []
     seen: set[tuple[int, ...]] = set()
     for raw_idx in indices:
@@ -233,7 +233,7 @@ def temporal_pair(row: dict[str, Any], cfg: Config) -> tuple[int, int]:
 
 
 def validate_dataset_mapping(rows: list[dict[str, Any]], zarr_paths: list[str]) -> None:
-    """Catch reordered config paths, which would silently show the wrong crops."""
+    """catch reordered config paths, which would silently show the wrong crops."""
     expected: dict[int, str] = {}
     for row in rows:
         idx = int(row["dataset_idx"])
@@ -418,7 +418,7 @@ class LatentCropViewer:
         self.map_fig.canvas.mpl_connect("key_press_event", self.on_key)
 
     def _create_crop_figure(self) -> None:
-        """Create the crop window and stop retaining it after its GUI is closed."""
+        """create the crop window and stop retaining it after its GUI is closed."""
         self.crop_fig = plt.figure(figsize=(12, 8))
         self.crop_fig.suptitle("Select points in the latent map")
         self.crop_fig.canvas.mpl_connect("close_event", self._on_crop_figure_closed)

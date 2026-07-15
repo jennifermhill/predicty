@@ -162,6 +162,20 @@ class Config:
     stem_channels: int = 64
     # ResNet-50's pre-classifier output dim, the encoder's representation size.
     latent_dim: int = 2048
+    # groupnorm group count for the encoder. groupnorm replaces batchnorm so
+    # normalization is per-sample: no running-stat buffers to be polluted by the
+    # masked/multi-scale crops seen during ssl, and no train/eval mismatch in the
+    # frozen encoder. the effective group count is clamped to the largest divisor
+    # of each layer's channel count that is <= this value.
+    norm_groups: int = 32
+    # cap on how many crops flow through the encoder's 3D stem at once. the dino
+    # wrapper flattens all crops into one batch (batch_size * 2 globals, plus the
+    # locals), and the stem's full-resolution activations dominate gpu memory
+    # (groupnorm runs in fp32 under amp, ~20 GiB for 128 globals). chunking the
+    # stem forward is exact (each crop encodes independently) and, with the
+    # encoder's whole-forward checkpointing, is the main lever against oom. None
+    # disables chunking. lower this if you still oom, raise it for speed.
+    encoder_chunk_size: int | None = 32
 
     # projector (DINO head) discarded after training. K is the prototype count
     # the cross-entropy operates over.
@@ -216,9 +230,11 @@ class Config:
     # iBOT masking-based self-supervised objective
     # ------------------------------------------------------------------
     # Distillation-based masking objective: student predicts teacher's soft
-    # token distribution on masked global crops. Independent of MAE, both can
-    # be active simultaneously. Uses same teacher/student architecture and
-    # centering mechanism as DINO but with masked input and cross-entropy loss.
+    # token distribution on masked global crops. Uses same teacher/student
+    # architecture and centering mechanism as DINO but with masked input and
+    # cross-entropy loss. iBOT and MAE are both masking objectives and are
+    # mutually exclusive: when iBOT is on, MAE is force-disabled (see
+    # __post_init__) so only one masked encoder forward runs per step.
     ibot_enabled: bool = False
     ibot_weight: float = 1.0
     ibot_mask_ratio: float = 0.75
@@ -256,6 +272,18 @@ class Config:
     # compute node, and is torn down when training exits.
     tensorboard_enabled: bool = True
     tensorboard_port: int = 6006
+
+    def __post_init__(self) -> None:
+        # iBOT and MAE are redundant masking objectives that both add a masked
+        # encoder forward and compete on the encoder. keep only one: iBOT wins
+        # since it's the stronger representation signal. resolving it here means
+        # the serialized config and all downstream reads see the effective state.
+        if self.ibot_enabled and self.mae_enabled:
+            print(
+                "[config] ibot_enabled and mae_enabled both set; disabling MAE "
+                "(iBOT takes precedence as the primary masking objective)"
+            )
+            self.mae_enabled = False
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "Config":

@@ -1,9 +1,9 @@
-"""Masked patch reconstruction head for the WS-DINO encoder.
+"""masked patch reconstruction head for the WS-DINO encoder.
 
-This is a training-only auxiliary objective. It masks patchified global crops,
-encodes the masked crop with the shared student encoder, and predicts the
-original masked patch values from the resulting representation. The decoder is
-discarded after training.
+training-only auxiliary objective. masks patchified global crops, encodes the
+masked crop with the shared student encoder, and predicts the original masked
+patch values from the resulting representation. the decoder is discarded after
+training.
 """
 
 from __future__ import annotations
@@ -19,19 +19,46 @@ def _trunc_normal_(x: torch.Tensor, std: float = 0.02) -> None:
     nn.init.trunc_normal_(x, std=std, a=-2 * std, b=2 * std)
 
 
+def _reconstruction_metrics(
+    pred: torch.Tensor, target: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """scale-free reconstruction quality between two flat voxel tensors.
+
+    returns (r2, pearson_corr, relative_l2). r2 and corr sit in [-1, 1] where
+    higher is better; rel_l2 is in [0, inf) where lower is better. falls back to
+    finite defaults when the target is constant (undefined variance).
+    """
+    if pred.numel() == 0:
+        zero = pred.new_zeros(())
+        return zero, zero, zero
+
+    target_mean = target.mean()
+    ss_tot = ((target - target_mean) ** 2).sum()
+    ss_res = ((target - pred) ** 2).sum()
+    r2 = 1.0 - ss_res / ss_tot.clamp(min=1e-8)
+
+    pred_centered = pred - pred.mean()
+    target_centered = target - target_mean
+    denom = (pred_centered.norm() * target_centered.norm()).clamp(min=1e-8)
+    corr = (pred_centered * target_centered).sum() / denom
+
+    rel_l2 = ss_res.sqrt() / target.norm().clamp(min=1e-8)
+    return r2, corr, rel_l2
+
+
 def make_random_mask(
     batch_size: int, n_patches: int, mask_ratio: float, device: torch.device
 ) -> torch.Tensor:
-    """Generate random binary masks for patchified volumes.
+    """generate random binary masks for patchified volumes.
 
     Args:
-        batch_size: Number of masks to generate.
-        n_patches: Total number of patches in a volume.
-        mask_ratio: Fraction of patches to mask.
-        device: Device to create mask on.
+        batch_size: number of masks to generate.
+        n_patches: total number of patches in a volume.
+        mask_ratio: fraction of patches to mask.
+        device: device to create mask on.
 
     Returns:
-        Boolean tensor of shape (batch_size, n_patches) where True indicates masked patches.
+        boolean tensor of shape (batch_size, n_patches) where True indicates masked patches.
     """
     if not 0.0 < mask_ratio < 1.0:
         raise ValueError(f"mask_ratio must be in (0, 1); got {mask_ratio}")
@@ -50,16 +77,16 @@ def apply_mask_to_volume(
     grid_shape: tuple[int, int, int],
     patch_shape: tuple[int, int, int],
 ) -> torch.Tensor:
-    """Apply patch-level masking to a batch of 3D volumes.
+    """apply patch-level masking to a batch of 3D volumes.
 
     Args:
-        x: Input tensor of shape (B, 1, Z, H, W).
-        mask: Binary mask of shape (B, n_patches) where True = masked.
-        grid_shape: (n_z, n_h, n_w) — number of patches in each dimension.
-        patch_shape: (pz, ph, pw) — patch size in each dimension.
+        x: input tensor of shape (B, 1, Z, H, W).
+        mask: binary mask of shape (B, n_patches) where True = masked.
+        grid_shape: (n_z, n_h, n_w), number of patches in each dimension.
+        patch_shape: (pz, ph, pw), patch size in each dimension.
 
     Returns:
-        Masked volume with same shape as x (masked patches set to 0).
+        masked volume with same shape as x (masked patches set to 0).
     """
     n, c, z, h, w = x.shape
     pz, ph, pw = patch_shape
@@ -89,11 +116,11 @@ def apply_mask_to_volume(
 
 
 class MaskedPatchAutoencoder(nn.Module):
-    """Patch-level masked reconstruction decoder for 3D crop tensors.
+    """patch-level masked reconstruction decoder for 3D crop tensors.
 
-    The shared encoder produces one latent vector per masked crop. The decoder
+    the shared encoder produces one latent vector per masked crop. the decoder
     conditions that vector on learned patch-position embeddings and predicts a
-    flattened voxel patch for every patch location. Loss is evaluated only on
+    flattened voxel patch for every patch location. loss is evaluated only on
     masked patches, matching the MAE objective while avoiding a large dense
     volumetric decoder.
     """
@@ -152,11 +179,11 @@ class MaskedPatchAutoencoder(nn.Module):
         _trunc_normal_(self.mask_token)
 
     def forward(self, x: torch.Tensor, encoder: nn.Module) -> dict[str, torch.Tensor]:
-        """Return masked-patch reconstruction loss and diagnostics.
+        """return masked-patch reconstruction loss and diagnostics.
 
         Args:
-            x: Global crops with shape (N, 1, Z, H, W).
-            encoder: Shared student encoder. It receives the masked crop.
+            x: global crops with shape (N, 1, Z, H, W).
+            encoder: shared student encoder. it receives the masked crop.
         """
         if x.ndim != 5 or x.size(1) != 1:
             raise ValueError(f"expected x shape (N, 1, Z, H, W); got {tuple(x.shape)}")
@@ -178,12 +205,25 @@ class MaskedPatchAutoencoder(nn.Module):
         patch_loss = F.mse_loss(pred, target, reduction="none").mean(dim=-1)
         loss = patch_loss[mask].mean()
 
+        # reconstruction quality on masked patches only. mse alone is hard to
+        # read (its scale drifts with norm_pix_loss and input magnitude), so we
+        # also report scale-free metrics that say how good the reconstruction
+        # actually is: r2 (fraction of target variance explained), pearson
+        # correlation, and relative l2 error.
+        with torch.no_grad():
+            pred_masked = pred[mask].flatten()
+            target_masked = target[mask].flatten()
+            r2, corr, rel_l2 = _reconstruction_metrics(pred_masked, target_masked)
+
         return {
             "loss": loss,
             "pred": pred,
             "target": target,
             "mask": mask,
             "mask_ratio": mask.float().mean(),
+            "recon_r2": r2,
+            "recon_corr": corr,
+            "recon_rel_l2": rel_l2,
         }
 
     def random_mask(self, batch_size: int, device: torch.device) -> torch.Tensor:

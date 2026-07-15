@@ -1,6 +1,6 @@
-"""Latent-space visualization for a frozen WS-DINO encoder.
+"""latent-space visualization for a frozen WS-DINO encoder.
 
-This samples normal training crops, embeds them with a checkpointed encoder,
+this samples normal training crops, embeds them with a checkpointed encoder,
 then projects the high-dimensional embeddings to 2D for inspection.
 
 Usage:
@@ -13,7 +13,7 @@ Outputs:
     <out-dir>/<method>/latent_by_*.png  scatter plots colored by metadata fields
 
 PCA always runs so every report has a deterministic, variance-faithful view.
-When umap-learn (or scikit-learn for t-SNE) is installed, that manifold method
+when umap-learn (or scikit-learn for t-SNE) is installed, that manifold method
 runs too, giving both a umap/ and a pca/ subdirectory side by side.
 """
 
@@ -45,6 +45,7 @@ mp.set_start_method("spawn", force=True)
 from configs.config import Config
 from data.dataset import MultiZarrDataset, ZarrCellDataset, worker_init_fn
 from models.encoder import HybridEncoder
+from eval.wasserstein import print_batch_effect_wasserstein
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,7 +89,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def disable_augmentations(cfg: Config) -> None:
-    """Turn off stochastic augmentations for deterministic visual diagnostics."""
+    """turn off stochastic augmentations for deterministic visual diagnostics."""
     for name in ("aug_intensity", "aug_gamma", "aug_noise", "aug_blur"):
         getattr(cfg, name).enabled = False
     # Keep per-crop normalization on because it is the encoder input convention.
@@ -220,8 +221,8 @@ def extract_embeddings(
             t1=int(r["t1"]),
             t2=int(r["t2"]),
             z=int(r["z"]),
-            x_off=int(r["global_x"]),
-            y_off=int(r["global_y"]),
+            global_x=int(r["global_x"]),
+            global_y=int(r["global_y"]),
             dataset_idx=ds_idx,
         )
         ann_globals.append(sample["globals"])
@@ -577,7 +578,7 @@ def plot_annotations_pca(
     out_dir: Path,
     plot_size: float,
 ) -> None:
-    """PCA fit on just the annotated (labeled) crops, colored by label. This
+    """PCA fit on just the annotated (labeled) crops, colored by label. this
     is a separate 2D projection from the main pca/ output -- fit only on the
     labeled subset so category structure isn't washed out by the much larger
     random-crop population."""
@@ -700,6 +701,7 @@ def main() -> None:
         encoder = HybridEncoder(
             stem_channels=cfg.stem_channels,
             latent_dim=cfg.latent_dim,
+            norm_groups=cfg.norm_groups,
         ).to(device)
         encoder.load_state_dict(ckpt["encoder_state_dict"])
         for p in encoder.parameters():
@@ -713,6 +715,10 @@ def main() -> None:
     X_projected = preprocess_embeddings(X, args.embedding_preprocess)
     print(f"[latent] embedding preprocess: {args.embedding_preprocess}")
     print_embedding_diagnostics(X, X_projected)
+
+    # batch-effect check in the full latent space: how far apart the per-dataset
+    # embedding clouds sit. complements the training-time dataset adversary.
+    print_batch_effect_wasserstein(X_projected, rows, out_dir=out_dir, seed=args.seed)
 
     methods = resolve_methods(args.method)
     print(f"[latent] projection methods: {', '.join(methods)}")

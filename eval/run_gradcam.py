@@ -1,4 +1,4 @@
-"""Run Grad-CAM on behavior and dataset probes.
+"""run Grad-CAM on behavior and dataset probes.
 
 usage:
     # Behavior Grad-CAM
@@ -21,18 +21,20 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 
 from configs.config import Config
-from data.dataset import MultiZarrDataset, ZarrCellDataset, worker_init_fn
+from data.dataset import MultiZarrDataset
 from models.encoder import HybridEncoder
-from eval.gradcam import GradCAM, get_final_conv_layer, upsample_gradcam
+from eval.gradcam import (
+    GradCAMAnalyzer,
+    upsample_gradcam,
+)
 from eval.visualize_gradcam import (
-    visualize_gradcam_single,
     visualize_gradcam_multiclass,
+    visualize_layercam_3d,
     max_project_3d,
 )
 
@@ -65,6 +67,14 @@ def parse_args() -> argparse.Namespace:
         help="number of samples to visualize per class",
     )
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--cam-3d",
+        action="store_true",
+        help=(
+            "also produce a full-resolution 3D LayerCAM per sample at the 3D "
+            "stem (before z is collapsed), saved as a per-z-slice montage"
+        ),
+    )
     return p.parse_args()
 
 
@@ -72,7 +82,7 @@ def load_behavior_probe(
     checkpoint_path: str,
     device: torch.device,
 ) -> tuple[nn.Linear, list[str]]:
-    """Load behavior classifier from probe checkpoint."""
+    """load behavior classifier from probe checkpoint."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
 
     required_keys = ["input_dim", "output_dim", "class_names", "head_state_dict"]
@@ -95,7 +105,7 @@ def load_dataset_probe(
     checkpoint_path: str,
     device: torch.device,
 ) -> tuple[nn.Linear, list[str]]:
-    """Load dataset discriminator from probe checkpoint."""
+    """load dataset discriminator from probe checkpoint."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
 
     required_keys = ["input_dim", "output_dim", "dataset_names", "head_state_dict"]
@@ -114,48 +124,16 @@ def load_dataset_probe(
     return head, dataset_names
 
 
-def create_dummy_probes(
-    latent_dim: int,
-    device: torch.device,
-) -> tuple[nn.Linear, nn.Linear, list[str], list[str]]:
-    """
-    Create dummy probe heads for demonstration.
-
-    In production, load actual trained probes from checkpoints.
-    """
-    n_behaviors = 4  # streaming, slugs, aggregation, empty
-    n_datasets = 20  # Number of zarr datasets
-
-    behavior_head = nn.Linear(latent_dim, n_behaviors).to(device)
-    behavior_head.eval()
-    dataset_head = nn.Linear(latent_dim, n_datasets).to(device)
-    dataset_head.eval()
-
-    behavior_names = ["streaming", "slugs", "aggregation", "empty"]
-    dataset_names = [f"dataset_{i}" for i in range(n_datasets)]
-
-    return behavior_head, dataset_head, behavior_names, dataset_names
-
-
 def extract_sample_crops(
-    cfg: Config,
     ds: MultiZarrDataset,
     n_samples: int = 10,
-    seed: int = 42,
 ) -> list[dict[str, Any]]:
     """
-    Extract sample crops from the dataset.
+    extract sample crops from an already-constructed dataset.
 
     Returns:
-        List of dicts with keys: 'crop', 'metadata'
+        list of dicts with keys: 'crop', 'metadata'
     """
-    cfg.seed = seed
-    # Use MultiZarrDataset for multi-zarr configs, else single ZarrCellDataset
-    if cfg.zarr_paths is not None:
-        ds = MultiZarrDataset(cfg)
-    else:
-        ds = ZarrCellDataset(cfg)
-
     samples = []
     for sample in ds:
         if len(samples) >= n_samples:
@@ -178,8 +156,9 @@ def run_behavior_gradcam(
     n_samples: int,
     device: torch.device,
     output_dir: Path,
+    cam_3d: bool = False,
 ) -> None:
-    """Run Grad-CAM for behavior classification."""
+    """run Grad-CAM for behavior classification."""
     print("\n" + "=" * 70)
     print("BEHAVIOR GRAD-CAM")
     print("=" * 70)
@@ -187,9 +166,9 @@ def run_behavior_gradcam(
     output_dir = output_dir / "behavior"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Setup Grad-CAM
-    target_layer = get_final_conv_layer(encoder)
-    gradcam = GradCAM(encoder, behavior_head, target_layer, device)
+    # single-forward analyzer: analytic 2D grad-cam (no backprop) + probs +
+    # depth weights from one pass, plus an optional 3D LayerCAM (one backward).
+    analyzer = GradCAMAnalyzer(encoder, behavior_head, device, cam_3d=cam_3d)
 
     samples_df = pd.read_json(cfg.annotation_path, lines=True)
     samples_df = samples_df[samples_df['label'].isin(behavior_names)]
@@ -221,12 +200,19 @@ def run_behavior_gradcam(
         crop = batch["globals"][0]  # (C=1, Z, H, W), no batch dim
         crop = crop.unsqueeze(0).to(device)  # (1, 1, Z, H, W) = (B, C, Z, H, W)
 
-        # Generate Grad-CAM for all behaviors
+        # one forward yields 2D grad-cams for every behavior, the prediction +
+        # probabilities, depth weights, and (when cam_3d) the 3D map for the
+        # true behavior. plot flags what the model decided alongside where it
+        # looked.
         print(f"\nSample {sample_idx + 1}/{n_samples}")
-        gradcams = gradcam.generate_gradcam_multiclass(
+        result = analyzer.analyze(
             crop,
             len(behavior_names),
+            cam3d_class=behavior_idx if cam_3d else None,
         )
+        pred_class = result["pred_class"]
+        probs = result["probs"]
+        gradcams = result["cams_2d"]
 
         # Upsample to input resolution
         h_in, w_in = crop.shape[-2:]
@@ -245,11 +231,34 @@ def run_behavior_gradcam(
             crop_2d,
             gradcams_np,
             behavior_names,
-            title=f"Behavior Grad-CAM - Sample {sample_idx + 1} - Behavior {behavior_name}",
+            title=(
+                f"Behavior Grad-CAM - Sample {sample_idx + 1} - "
+                f"true: {behavior_name} - pred: {behavior_names[pred_class]}"
+            ),
             save_path=str(output_dir / f"behavior_gradcam_{sample_idx:03d}.png"),
+            pred_class=pred_class,
+            probs=probs,
         )
 
         print(f"  Saved: behavior_gradcam_{sample_idx:03d}.png")
+
+        # full-resolution 3D LayerCAM for the true behavior, shown per z-slice,
+        # with the pool's literal depth weighting as a companion bar strip. both
+        # came from the same analyze() call above (no extra forward passes).
+        if cam_3d:
+            cam3d = result["cam_3d"].numpy()  # (Z, H, W)
+            z_w = result["z_weights"].numpy()  # (Z,)
+            visualize_layercam_3d(
+                crop_np,
+                cam3d,
+                title=(
+                    f"Behavior 3D LayerCAM - Sample {sample_idx + 1} - "
+                    f"true: {behavior_name}"
+                ),
+                save_path=str(output_dir / f"behavior_layercam3d_{sample_idx:03d}.png"),
+                z_weights=z_w,
+            )
+            print(f"  Saved: behavior_layercam3d_{sample_idx:03d}.png")
 
 
 def run_dataset_gradcam(
@@ -259,8 +268,9 @@ def run_dataset_gradcam(
     samples: list[dict],
     device: torch.device,
     output_dir: Path,
+    cam_3d: bool = False,
 ) -> None:
-    """Run Grad-CAM for dataset discrimination."""
+    """run Grad-CAM for dataset discrimination."""
     print("\n" + "=" * 70)
     print("DATASET DISCRIMINATION GRAD-CAM")
     print("=" * 70)
@@ -268,21 +278,48 @@ def run_dataset_gradcam(
     output_dir = output_dir / "dataset"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Setup Grad-CAM
-    target_layer = get_final_conv_layer(encoder)
-    gradcam = GradCAM(encoder, dataset_head, target_layer, device)
+    # single-forward analyzer: analytic 2D grad-cam (no backprop) + probs +
+    # depth weights from one pass, plus an optional 3D LayerCAM (one backward).
+    analyzer = GradCAMAnalyzer(encoder, dataset_head, device, cam_3d=cam_3d)
+
+    # strip directory + .zarr so panel labels read cleanly. the gradcam dict
+    # keys are dataset indices used to index this list, so it must stay full
+    # length and index-aligned with dataset_names.
+    dataset_names_clean = [
+        name.rsplit("/", 1)[-1].replace(".zarr", "") for name in dataset_names
+    ]
+    n_show = min(5, len(dataset_names))
+
     for sample_idx, sample in enumerate(samples):
         crop = sample["crop"]  # (C=1, Z, H, W), no batch dim
         crop = crop.unsqueeze(0).to(device)  # (1, 1, Z, H, W) = (B, C, Z, H, W)
 
-        # Generate Grad-CAM for all datasets (expensive - sample a few)
-        print(f"\nSample {sample_idx + 1}/{len(samples)}")
-        n_datasets_to_show = min(5, len(dataset_names))
-        gradcams = {}
+        own_idx = int(sample["metadata"]["dataset_idx"])
 
-        for dataset_idx in range(n_datasets_to_show):
-            hm = gradcam.generate_gradcam(crop, dataset_idx)
-            gradcams[dataset_idx] = hm
+        # always show the crop's own dataset, then fill the panel with others.
+        # guarantees the true source dataset appears and avoids duplicate keys.
+        shown_idx = [own_idx]
+        for idx in range(len(dataset_names)):
+            if len(shown_idx) >= n_show:
+                break
+            if idx != own_idx:
+                shown_idx.append(idx)
+
+        # one forward yields the prediction, a 2D grad-cam for every dataset,
+        # depth weights, and (when cam_3d) the 3D map for the crop's own dataset.
+        result = analyzer.analyze(
+            crop,
+            len(dataset_names),
+            cam3d_class=own_idx if cam_3d else None,
+        )
+        pred_idx = result["pred_class"]
+
+        print(
+            f"\nSample {sample_idx + 1}/{len(samples)} "
+            f"(from {dataset_names_clean[own_idx]}, predicted {dataset_names_clean[pred_idx]})"
+        )
+        # all classes are computed; keep only the panel's shown datasets.
+        gradcams = {idx: result["cams_2d"][idx] for idx in shown_idx}
 
         # Upsample
         h_in, w_in = crop.shape[-2:]
@@ -296,21 +333,37 @@ def run_dataset_gradcam(
         crop_2d = max_project_3d(crop_np)  # (H, W)
 
         gradcams_np = {k: v.cpu().numpy() for k, v in gradcams_upsampled.items()}
-        dataset_names_subset = dataset_names[:n_datasets_to_show]
-        for i in range(len(dataset_names_subset)):
-            # strips path for better visualization
-            if "/" in dataset_names_subset[i]:
-                dataset_names_subset[i] = dataset_names_subset[i][dataset_names_subset[i].rindex("/") + 1:]
-
         visualize_gradcam_multiclass(
             crop_2d,
             gradcams_np,
-            dataset_names_subset,
-            title=f"Dataset Discrimination Grad-CAM - Sample {sample_idx + 1}",
+            dataset_names_clean,
+            title=(
+                f"Dataset Grad-CAM - Sample {sample_idx + 1} - "
+                f"crop from {dataset_names_clean[own_idx]}"
+            ),
             save_path=str(output_dir / f"dataset_gradcam_{sample_idx:03d}.png"),
+            pred_class=pred_idx,
         )
 
         print(f"  Saved: dataset_gradcam_{sample_idx:03d}.png")
+
+        # full-resolution 3D LayerCAM for the crop's own dataset, per z-slice,
+        # with the pool's literal depth weighting as a companion bar strip. both
+        # came from the same analyze() call above (no extra forward passes).
+        if cam_3d:
+            cam3d = result["cam_3d"].numpy()  # (Z, H, W)
+            z_w = result["z_weights"].numpy()  # (Z,)
+            visualize_layercam_3d(
+                crop_np,
+                cam3d,
+                title=(
+                    f"Dataset 3D LayerCAM - Sample {sample_idx + 1} - "
+                    f"crop from {dataset_names_clean[own_idx]}"
+                ),
+                save_path=str(output_dir / f"dataset_layercam3d_{sample_idx:03d}.png"),
+                z_weights=z_w,
+            )
+            print(f"  Saved: dataset_layercam3d_{sample_idx:03d}.png")
 
 
 def main() -> None:
@@ -334,6 +387,7 @@ def main() -> None:
     encoder = HybridEncoder(
         stem_channels=cfg.stem_channels,
         latent_dim=cfg.latent_dim,
+        norm_groups=cfg.norm_groups,
     ).to(device)
     encoder.load_state_dict(ckpt["encoder_state_dict"])
     encoder.eval()
@@ -384,10 +438,12 @@ def main() -> None:
             )
             print(f"[gradcam] dataset classes: {len(dataset_names)} datasets")
 
-    # Extract sample crops
+    # Extract sample crops. set the seed before building the dataset so
+    # sampling is reproducible.
+    cfg.seed = args.seed
     ds = MultiZarrDataset(cfg)
     print(f"[gradcam] extracting {args.n_samples} sample crops...")
-    samples = extract_sample_crops(cfg, ds, args.n_samples, args.seed)
+    samples = extract_sample_crops(ds, args.n_samples)
     print(f"[gradcam] extracted {len(samples)} samples")
 
     if not samples:
@@ -409,6 +465,7 @@ def main() -> None:
             args.n_samples,
             device,
             output_dir,
+            cam_3d=args.cam_3d,
         )
     elif args.mode in ["behavior", "both"]:
         print("\n[gradcam] Skipping behavior Grad-CAM (probe not loaded)")
@@ -421,6 +478,7 @@ def main() -> None:
             samples,
             device,
             output_dir,
+            cam_3d=args.cam_3d,
         )
     elif args.mode in ["dataset", "both"]:
         print("\n[gradcam] Skipping dataset Grad-CAM (probe not loaded)")

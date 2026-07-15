@@ -1,4 +1,4 @@
-"""Dataset-index schedules for balanced multi-dataset batches."""
+"""dataset-index schedules for balanced multi-dataset batches."""
 
 from __future__ import annotations
 
@@ -11,9 +11,9 @@ def balanced_batch_indices(
     batch_number: int,
     rng: random.Random,
 ) -> list[int]:
-    """Return one shuffled batch with dataset counts differing by at most one.
+    """return one shuffled batch with dataset counts differing by at most one.
 
-    When ``batch_size`` is not divisible by ``n_datasets``, the remainder
+    when ``batch_size`` is not divisible by ``n_datasets``, the remainder
     slots rotate across batches so every dataset receives the same long-run
     exposure.
     """
