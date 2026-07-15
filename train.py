@@ -171,7 +171,7 @@ def main() -> None:
     else:
         print("[train] WARNING: running on cpu — training will be impractically slow")
     print(f"[train] batch_size={cfg.batch_size}  total_steps={cfg.total_steps}")
-    print(f"[train] base_lr={cfg.base_lr}  weight_decay={cfg.weight_decay}")
+    print(f"[train] base_lr={cfg.base_lr}  weight_decay={cfg.weight_decay_start} -> {cfg.weight_decay_end}")
 
     # ---- data ----
     ds = build_dataset(cfg)
@@ -230,7 +230,7 @@ def main() -> None:
     if model.mae_decoder is not None:
         trainable_modules.append(model.mae_decoder)
     optimizer = AdamW(
-        get_param_groups(trainable_modules, cfg.weight_decay),
+        get_param_groups(trainable_modules, cfg.weight_decay_start),
         lr=cfg.base_lr,
         betas=(0.9, 0.999),
     )
@@ -292,10 +292,15 @@ def main() -> None:
                 ).tolist()
                 print(f"[train] first batch dataset counts: {dataset_counts}")
 
-        # set LR per-step from the schedule.
+        # set LR & weight per-step from the schedule.
         lr = lr_schedule(step, cfg.total_steps, cfg.base_lr, cfg.warmup_frac)
+
+        # weight decay uses same cosine schedule as ema momentum, but with a different start/end range.
+        wd = ema_momentum_schedule(step, cfg.total_steps, cfg.weight_decay_start, cfg.weight_decay_end)
         for g in optimizer.param_groups:
             g["lr"] = lr
+            if g.get("wd_scheduled"): # skip the no-decay group
+                g["weight_decay"] = wd
 
         # forward + loss under autocast (fp16 ops on cuda).
         with autocast(device.type, dtype=torch.float16, enabled=use_amp):
@@ -404,6 +409,7 @@ def main() -> None:
             writer.add_scalar("ema_momentum", m, step)
             writer.add_scalar("warmups/teacher_temp", teach_temp, step)
             writer.add_scalar("warmups/dataset_adversary_grl_scale", model.dataset_adversary_grl_scale, step)
+            writer.add_scalar("warmups/weight_decay", wd, step)
             writer.add_scalar("grad_norm", grad_norm.item(), step)
             writer.add_scalar("collapse/teacher_entropy", entropy.item(), step)
             writer.add_scalar("collapse/embedding_var", emb_var.item(), step)

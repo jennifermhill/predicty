@@ -70,8 +70,8 @@ def get_param_groups(model: torch.nn.Module, weight_decay: float) -> list[dict]:
         else:
             decay.append(p)
     return [
-        {"params": decay, "weight_decay": weight_decay},
-        {"params": no_decay, "weight_decay": 0.0},
+        {"params": decay, "weight_decay": weight_decay, "wd_scheduled": True},
+        {"params": no_decay, "weight_decay": 0.0, "wd_scheduled": False},
     ]
 
 

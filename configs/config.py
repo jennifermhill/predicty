@@ -245,7 +245,8 @@ class Config:
     # optimizer / schedule
     # ------------------------------------------------------------------
     base_lr: float = 2.5e-4
-    weight_decay: float = 0.04
+    weight_decay_start: float = 0.04
+    weight_decay_end: float = 0.4
     grad_clip_norm: float = 1.0
     # fraction of total_steps spent in linear warmup. rest is cosine decay.
     warmup_frac: float = 0.15

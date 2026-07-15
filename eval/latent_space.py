@@ -521,25 +521,33 @@ def plot_categorical(
     plot_size: float,
     x_label: str,
     y_label: str,
+    marker_size: float = 5,
+    alpha: float = 0.65,
+    colors: list[Any] | None = None,
+    legend_markerscale: float = 3,
 ) -> None:
     fig, ax = plt.subplots(figsize=(plot_size, plot_size), dpi=160)
     labels = sorted(set(values), key=lambda x: str(x))
-    cmap = plt.get_cmap("tab20")
+    if colors is not None:
+        palette = [colors[i % len(colors)] for i in range(len(labels))]
+    else:
+        cmap = plt.get_cmap("tab20")
+        palette = [cmap(i % 20) for i in range(len(labels))]
     for idx, label in enumerate(labels):
         mask = np.asarray([v == label for v in values])
         ax.scatter(
             coords[mask, 0],
             coords[mask, 1],
-            s=5,
-            alpha=0.65,
-            color=cmap(idx % 20),
+            s=marker_size,
+            alpha=alpha,
+            color=palette[idx],
             label=str(label)[:36],
             linewidths=0,
         )
     ax.set_title(title)
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
-    ax.legend(markerscale=3, fontsize=7, frameon=False, loc="best")
+    ax.legend(markerscale=legend_markerscale, fontsize=7, frameon=False, loc="best")
     fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)
@@ -572,35 +580,82 @@ def plot_continuous(
     fig.savefig(out_path)
     plt.close(fig)
 
-def plot_annotations_pca(
+# annotations plots have few points (~500) and few classes, so they get
+# bigger dots and a high-contrast qualitative palette (ColorBrewer Set1),
+# unlike the dense ~10k-point metadata scatters which stay small on tab20.
+
+
+
+def plot_annotations(
     X_projected: np.ndarray,
     rows: list[dict[str, Any]],
     out_dir: Path,
-    plot_size: float,
+    args: argparse.Namespace,
 ) -> None:
-    """PCA fit on just the annotated (labeled) crops, colored by label. this
-    is a separate 2D projection from the main pca/ output -- fit only on the
-    labeled subset so category structure isn't washed out by the much larger
-    random-crop population."""
+    ANNOTATION_COLORS = [
+        "#e41a1c", "#377eb8", "#4daf4a", "#984ea3", 
+        "#ff7f00", "#ffff33", "#a65628", "#f781bf"
+    ]
+    ANNOTATION_MARKER_SIZE = 60
+    ANNOTATION_ALPHA = 0.85
+    ANNOTATION_LEGEND_MARKERSCALE = 1.0
     ann_idx = [i for i, r in enumerate(rows) if r.get("label")]
     if len(ann_idx) < 3:
-        print(f"[annotations] only {len(ann_idx)} labeled points; skipping annotations PCA plot")
+        print(f"[annotations] only {len(ann_idx)} labeled points; skipping annotations plots")
         return
     X_ann = X_projected[ann_idx]
     labels = [rows[i]["label"] for i in ann_idx]
-    coords, explained = pca_project(X_ann, 2)
+
+    # --- PCA (fit on the labeled subset) ---
+    coords_pca, explained = pca_project(X_ann, 2)
     print(
         f"[annotations] PCA on {len(ann_idx)} labeled crops, "
         f"explained variance in 2D: {explained.sum()*100:.1f}%"
     )
     plot_categorical(
-        coords,
+        coords_pca,
         labels,
         f"Annotated crops PCA colored by label (n={len(ann_idx)})",
         out_dir / "annotations_pca_by_label.png",
-        plot_size,
+        args.plot_size,
         "PCA 1",
         "PCA 2",
+        marker_size=ANNOTATION_MARKER_SIZE,
+        alpha=ANNOTATION_ALPHA,
+        colors=ANNOTATION_COLORS,
+        legend_markerscale=ANNOTATION_LEGEND_MARKERSCALE,
+    )
+
+    # --- UMAP (fit on the labeled subset) ---
+    try:
+        import umap  # type: ignore
+    except Exception:
+        print("[annotations] umap-learn not installed; skipping annotations UMAP plot")
+        return
+    X_red = reduce_for_manifold(X_ann, args.pca_dim)
+    # UMAP needs n_neighbors < n_samples; clamp for the small labeled subset.
+    n_neighbors = int(min(args.umap_neighbors, max(2, len(ann_idx) - 1)))
+    reducer = umap.UMAP(
+        n_components=2,
+        n_neighbors=n_neighbors,
+        min_dist=args.umap_min_dist,
+        metric="euclidean",
+        random_state=args.seed,
+    )
+    coords_umap = reducer.fit_transform(X_red)
+    print(f"[annotations] UMAP on {len(ann_idx)} labeled crops (n_neighbors={n_neighbors})")
+    plot_categorical(
+        coords_umap,
+        labels,
+        f"Annotated crops UMAP colored by label (n={len(ann_idx)})",
+        out_dir / "annotations_umap_by_label.png",
+        args.plot_size,
+        "UMAP 1",
+        "UMAP 2",
+        marker_size=ANNOTATION_MARKER_SIZE,
+        alpha=ANNOTATION_ALPHA,
+        colors=ANNOTATION_COLORS,
+        legend_markerscale=ANNOTATION_LEGEND_MARKERSCALE,
     )
 
 def save_plots(
@@ -737,7 +792,7 @@ def main() -> None:
 
     save_npz(out_dir / "embeddings.npz", X, coords_by_method, rows)
 
-    plot_annotations_pca(X_projected, rows, out_dir, args.plot_size)
+    plot_annotations(X_projected, rows, out_dir, args)
 
     print("[latent] wrote:")
     for path in sorted(p for p in out_dir.rglob("*") if p.is_file()):
