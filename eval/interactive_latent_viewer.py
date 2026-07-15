@@ -19,10 +19,26 @@ on by default) toggle which points are drawn on the map. hidden points are
 also excluded from click and lasso selection, so hiding unannotated crops is
 an easy way to browse only the labeled ones.
 
+if --decoder-checkpoint is given (a latent_decoder.pt from eval/decoder.py), a
+third "Inspect" / "Generate" radio toggle appears. Generate mode lets you
+click *anywhere* on the map, including empty areas with no real point: it
+finds real points within a search radius of the click, blends their real
+embeddings.npz vectors (gaussian-weighted by distance -- never pads out to a
+minimum count with distant, less-relevant points), decodes the blend with the
+trained decoder, and shows the generated crop next to its nearest real
+neighbors for comparison. clicks far from any real data fall back to the
+single nearest point and say so plainly rather than quietly extrapolating.
+
 Example:
     python eval/interactive_latent_viewer.py \
         --config configs/train.yaml \
-        --metadata latent_space/latest/metadata.csv
+        --metadata latent_space/latest/umap/metadata.csv
+
+    # with Generate mode enabled:
+    python eval/interactive_latent_viewer.py \
+        --config configs/train.yaml \
+        --metadata latent_space/latest/umap/metadata.csv \
+        --decoder-checkpoint latent_space/latest/latent_decoder.pt
 """
 
 from __future__ import annotations
@@ -39,7 +55,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.path import Path as MplPath
-from matplotlib.widgets import Button, CheckButtons, LassoSelector
+from matplotlib.widgets import Button, CheckButtons, LassoSelector, RadioButtons
 
 from configs.config import Config
 
@@ -78,6 +94,35 @@ def parse_args() -> argparse.Namespace:
         help="maximum crops displayed from one lasso selection",
     )
     parser.add_argument("--point-size", type=float, default=7.0)
+    parser.add_argument(
+        "--decoder-checkpoint",
+        default=None,
+        help=(
+            "optional latent_decoder.pt (from eval/decoder.py). enables a "
+            "Generate mode toggle that decodes a blend of nearby real "
+            "embeddings for empty areas of the map; without it, Generate mode "
+            "is unavailable and the viewer behaves exactly as before."
+        ),
+    )
+    parser.add_argument(
+        "--embeddings",
+        default=None,
+        help=(
+            "embeddings.npz matching --metadata (default: one directory above "
+            "--metadata, matching eval/latent_space.py's layout). only used "
+            "when --decoder-checkpoint is given."
+        ),
+    )
+    parser.add_argument(
+        "--gen-radius",
+        type=float,
+        default=None,
+        help=(
+            "2D search radius for blending nearby real embeddings in Generate "
+            "mode, in the same units as coord_x/coord_y. default: 3x the "
+            "median nearest-neighbor spacing among plotted points."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -310,6 +355,110 @@ def robust_limits(*images: np.ndarray) -> tuple[float, float]:
     return float(lo), float(hi)
 
 
+def default_embeddings_path(metadata_path: Path) -> Path:
+    """embeddings.npz sits one directory above the per-method metadata.csv,
+    e.g. latent_space/<run>/umap/metadata.csv -> latent_space/<run>/embeddings.npz
+    (see eval/latent_space.py's output layout)."""
+    return metadata_path.resolve().parent.parent / "embeddings.npz"
+
+
+def load_real_embeddings(embeddings_path: Path, coords: np.ndarray) -> np.ndarray:
+    """load the real high-dim embeddings written alongside metadata.csv.
+
+    confirms it's the same run and row order by checking that whichever
+    projection embeddings.npz saved (coords_umap or coords_pca) matches
+    --metadata's own coordinates -- catches a mismatched embeddings.npz early
+    instead of silently blending nonsense vectors later.
+    """
+    if not embeddings_path.exists():
+        raise FileNotFoundError(
+            f"embeddings file not found: {embeddings_path}. pass --embeddings "
+            "explicitly if it isn't in the default location."
+        )
+    data = np.load(embeddings_path)
+    if "embeddings" not in data:
+        raise ValueError(f"{embeddings_path} has no 'embeddings' array")
+    embeddings = data["embeddings"]
+    if embeddings.shape[0] != len(coords):
+        raise ValueError(
+            f"{embeddings_path} has {embeddings.shape[0]} embeddings but "
+            f"--metadata has {len(coords)} rows -- mismatched run?"
+        )
+    for key in ("coords_umap", "coords_pca"):
+        if key in data and data[key].shape == coords.shape and np.allclose(data[key], coords, atol=1e-3):
+            print(f"[viewer] embeddings.npz verified against metadata via '{key}'")
+            return embeddings
+    raise ValueError(
+        f"neither coords_umap nor coords_pca in {embeddings_path} matches "
+        "--metadata's coord_x/coord_y -- likely a mismatched embeddings.npz "
+        "(wrong run, or metadata.csv regenerated since)."
+    )
+
+
+def estimate_default_radius(coords: np.ndarray, multiple: float = 3.0) -> float:
+    """default Generate-mode search radius: a multiple of the typical nearest-
+    neighbor spacing among plotted points. UMAP's output scale is arbitrary
+    and PCA's depends on the data's variance, so a fixed constant would be
+    wrong for a different run; this adapts to whatever's actually on screen.
+    """
+    if len(coords) < 2:
+        return 1.0
+    rng = np.random.default_rng(0)
+    sample = rng.choice(len(coords), size=min(500, len(coords)), replace=False)
+    nn_dists = []
+    for i in sample:
+        d = np.linalg.norm(coords - coords[i], axis=1)
+        d[i] = np.inf
+        nn_dists.append(d.min())
+    return float(np.median(nn_dists) * multiple)
+
+
+def gaussian_radius_blend(
+    coords: np.ndarray,
+    target: tuple[float, float],
+    radius: float,
+    visible_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    """indices + normalized weights of real points to blend for a Generate click.
+
+    only points within `radius` are considered at all; within that cutoff,
+    weight falls off as a gaussian with radius as its ~2-sigma width, so nearby
+    points dominate the blend. this deliberately never pads out to a minimum
+    neighbor count with distant, less-relevant points -- if nothing real is
+    within radius, it falls back to the single nearest point and returns a
+    confidence string that says so plainly, rather than quietly blending in
+    whatever's closest regardless of how far that actually is.
+
+    returns (indices, weights, confidence); weights sum to 1 and are sorted
+    descending (closest / highest-weight first).
+    """
+    distances = np.linalg.norm(coords - np.asarray(target)[None, :], axis=1)
+    if visible_mask is not None:
+        distances = np.where(visible_mask, distances, np.inf)
+
+    within = np.flatnonzero(distances <= radius)
+    if len(within) == 0:
+        nearest = int(np.argmin(distances))
+        nearest_dist = float(distances[nearest])
+        confidence = (
+            f"LOW CONFIDENCE -- nearest real point is {nearest_dist:.3f} away, "
+            f"outside the search radius ({radius:.3f}). extrapolating from "
+            f"that one point only."
+        )
+        return np.asarray([nearest]), np.asarray([1.0]), confidence
+
+    bandwidth = radius / 2.0
+    weights = np.exp(-0.5 * (distances[within] / bandwidth) ** 2)
+    weights = weights / weights.sum()
+    order = np.argsort(-weights)
+
+    if len(within) <= 2:
+        confidence = f"moderate confidence -- only {len(within)} real point(s) within radius {radius:.3f}"
+    else:
+        confidence = f"{len(within)} real points within radius {radius:.3f} contributed to this blend"
+    return within[order], weights[order], confidence
+
+
 class LatentCropViewer:
     def __init__(
         self,
@@ -320,6 +469,9 @@ class LatentCropViewer:
         nearest: int,
         max_crops: int,
         point_size: float,
+        embeddings: np.ndarray | None = None,
+        decoder_checkpoint: str | None = None,
+        gen_radius: float | None = None,
     ) -> None:
         self.rows = rows
         self.coords = coords
@@ -328,6 +480,29 @@ class LatentCropViewer:
         self.nearest = nearest
         self.max_crops = max_crops
         self.arrays: dict[int, Any] = {}
+
+        # Generate mode: optional, only wired up when a decoder checkpoint is
+        # given. torch import is lazy so Inspect-only usage never pays for it.
+        self.embeddings = embeddings
+        self.gen_radius = gen_radius
+        self.mode = "inspect"
+        self.decoder = None
+        if decoder_checkpoint is not None:
+            import torch
+
+            from eval.decoder import LatentDecoder
+
+            ckpt = torch.load(decoder_checkpoint, map_location="cpu", weights_only=True)
+            self.decoder = LatentDecoder(
+                latent_dim=ckpt["latent_dim"],
+                crop_shape=tuple(ckpt["crop_shape"]),
+                patch_shape=tuple(ckpt["patch_shape"]),
+                hidden_dim=ckpt["hidden_dim"],
+                depth=ckpt["depth"],
+            )
+            self.decoder.load_state_dict(ckpt["decoder_state_dict"])
+            self.decoder.eval()
+            print(f"[viewer] loaded decoder from {decoder_checkpoint}; Generate mode available")
 
         self.map_fig, self.map_ax = plt.subplots(figsize=(11, 8))
         self.map_fig.subplots_adjust(bottom=0.2, right=0.76)
@@ -411,6 +586,13 @@ class LatentCropViewer:
         )
         self.visibility_check.on_clicked(self._on_visibility_toggle)
 
+        # Inspect/Generate toggle -- only shown when a decoder was loaded.
+        self.mode_radio = None
+        if self.decoder is not None:
+            mode_ax = self.map_fig.add_axes((0.83, 0.19, 0.15, 0.09))
+            self.mode_radio = RadioButtons(mode_ax, ["Inspect", "Generate"])
+            self.mode_radio.on_clicked(self._on_mode_change)
+
         self.crop_fig = None
         self._create_crop_figure()
         self.lasso = LassoSelector(self.map_ax, self.on_lasso, button=3)
@@ -453,6 +635,13 @@ class LatentCropViewer:
             artist.set_offsets(self.coords[idx] if len(idx) else np.empty((0, 2)))
         self.map_fig.canvas.draw_idle()
 
+    def _on_mode_change(self, label: str) -> None:
+        self.mode = label.lower()
+        msg = f"Mode: {label}"
+        if self.mode == "generate":
+            msg += " -- click anywhere to decode a blended crop"
+        self.set_status(msg)
+
     def on_click(self, event: Any) -> None:
         if event.inaxes is not self.map_ax or event.button != 1:
             return
@@ -461,6 +650,11 @@ class LatentCropViewer:
         toolbar = getattr(self.map_fig.canvas, "toolbar", None)
         if toolbar is not None and getattr(toolbar, "mode", ""):
             return
+
+        if self.mode == "generate":
+            self.handle_generate_click((event.xdata, event.ydata))
+            return
+
         indices = select_click_indices(
             self.coords,
             self.rows,
@@ -560,6 +754,78 @@ class LatentCropViewer:
         self.crop_fig.canvas.draw_idle()
         self.crop_fig.show()
 
+    def handle_generate_click(self, target: tuple[float, float]) -> None:
+        assert self.decoder is not None and self.embeddings is not None
+        indices, weights, confidence = gaussian_radius_blend(
+            self.coords, target, self.gen_radius, self.visible_mask
+        )
+        self.highlight.set_offsets(self.coords[indices])
+        self.map_fig.canvas.draw_idle()
+        self.set_status("Generating… " + confidence)
+        try:
+            self.render_generated(indices, weights, confidence)
+        except Exception as exc:
+            self.set_status(f"Could not generate: {exc}")
+            traceback.print_exc()
+            return
+        self.set_status(confidence)
+
+    def render_generated(
+        self, indices: np.ndarray, weights: np.ndarray, confidence: str
+    ) -> None:
+        import torch
+
+        blended = (weights[:, None] * self.embeddings[indices]).sum(axis=0)
+        z = torch.from_numpy(blended).float().unsqueeze(0)
+        with torch.no_grad():
+            volume = self.decoder(z).squeeze(0).squeeze(0).numpy()  # (Z, H, W)
+
+        self._ensure_crop_figure()
+        assert self.crop_fig is not None
+        self.crop_fig.clear()
+
+        # show the generated crop plus up to 4 of its highest-weight real
+        # neighbors, for a side-by-side sanity check against real data.
+        shown = indices[: min(len(indices), 4)]
+        shown_weights = weights[: len(shown)]
+        n_cols = 1 + len(shown)
+        self.crop_fig.set_size_inches(min(18.0, max(4.0, 2.2 * n_cols)), 6.0, forward=True)
+        axes = self.crop_fig.subplots(2, n_cols, squeeze=False)
+
+        gen_mean, gen_max = volume.mean(axis=0), volume.max(axis=0)
+        mean_lo, mean_hi = robust_limits(gen_mean)
+        max_lo, max_hi = robust_limits(gen_max)
+        axes[0, 0].imshow(gen_mean, cmap="gray", vmin=mean_lo, vmax=mean_hi)
+        axes[1, 0].imshow(gen_max, cmap="gray", vmin=max_lo, vmax=max_hi)
+        axes[0, 0].set_ylabel("mean-Z", fontsize=8)
+        axes[1, 0].set_ylabel("max-Z", fontsize=8)
+        axes[0, 0].set_title("GENERATED\n(decoded blend)", fontsize=8, fontweight="bold")
+
+        for col, (idx, weight) in enumerate(zip(shown, shown_weights), start=1):
+            row = self.rows[int(idx)]
+            t = int(row["t"])
+            crop = load_raw_crop(self.arrays, self.zarr_paths, row, self.cfg, t)
+            mean_img, max_img = crop.mean(axis=0), crop.max(axis=0)
+            m_lo, m_hi = robust_limits(mean_img)
+            x_lo, x_hi = robust_limits(max_img)
+            axes[0, col].imshow(mean_img, cmap="gray", vmin=m_lo, vmax=m_hi)
+            axes[1, col].imshow(max_img, cmap="gray", vmin=x_lo, vmax=x_hi)
+            title = (
+                f"real, weight={weight * 100:.0f}%\n"
+                f"ds={row['dataset_idx']} {row['dataset_name'][:16]}"
+            )
+            axes[0, col].set_title(title, fontsize=7)
+
+        for ax_row in axes:
+            for ax in ax_row:
+                ax.set_xticks([])
+                ax.set_yticks([])
+
+        self.crop_fig.suptitle(confidence, fontsize=10)
+        self.crop_fig.tight_layout(rect=(0, 0, 1, 0.93))
+        self.crop_fig.canvas.draw_idle()
+        self.crop_fig.show()
+
 
 def main() -> None:
     args = parse_args()
@@ -573,6 +839,18 @@ def main() -> None:
     zarr_paths = zarr_paths_from_config(cfg)
     validate_dataset_mapping(rows, zarr_paths)
 
+    embeddings = None
+    gen_radius = args.gen_radius
+    if args.decoder_checkpoint is not None:
+        embeddings_path = (
+            Path(args.embeddings) if args.embeddings else default_embeddings_path(Path(args.metadata))
+        )
+        print(f"[viewer] loading real embeddings from {embeddings_path}")
+        embeddings = load_real_embeddings(embeddings_path, coords)
+        if gen_radius is None:
+            gen_radius = estimate_default_radius(coords)
+        print(f"[viewer] Generate mode search radius: {gen_radius:.4f}")
+
     print(f"[viewer] loaded {len(rows)} latent points")
     print("[viewer] left-click for nearest points; right-click-drag to lasso; C to clear")
     viewer = LatentCropViewer(
@@ -583,6 +861,9 @@ def main() -> None:
         nearest=args.nearest,
         max_crops=args.max_crops,
         point_size=args.point_size,
+        embeddings=embeddings,
+        decoder_checkpoint=args.decoder_checkpoint,
+        gen_radius=gen_radius,
     )
     # Keep the viewer and its weakly-referenced Matplotlib callbacks alive until
     # all GUI windows have closed.
