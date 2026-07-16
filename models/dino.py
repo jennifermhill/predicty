@@ -230,6 +230,10 @@ class DINOWrapper(nn.Module):
                 self.ibot_patch_size,
             )
             self.register_buffer("ibot_center", torch.zeros(cfg.projector_k))
+        
+        self.koleo_enabled = getattr(cfg, "koleo_enabled", False)
+
+        
 
     def train(self, mode: bool = True):
         # teacher is EMA-only. keep it in eval regardless of the wrapper's mode
@@ -311,6 +315,11 @@ class DINOWrapper(nn.Module):
             t_g_ibot = None
             if self.ibot_enabled:
                 t_g_ibot = self.teacher.masking_head(t_g_feat)
+        
+        koleo = None
+        if self.koleo_enabled:
+            # apply per view across distinct samples, not within the t1/t2 pair
+            koleo = 0.5 * (koleo_loss(g_features[0::2]) + koleo_loss(g_features[1::2]))
 
         return {
             "student_globals": s_g,
@@ -325,6 +334,7 @@ class DINOWrapper(nn.Module):
             "dataset_logits": dataset_logits,
             "dataset_targets": dataset_targets,
             "mae": mae_out,
+            "koleo": koleo
         }
 
     @torch.no_grad()
@@ -422,6 +432,15 @@ def ibot_loss(
     # student: sharpen, log-softmax
     s = (student_ibot / student_temp).log_softmax(dim=-1)
     return -(t * s).sum(dim=-1).mean()
+
+def koleo_loss(features: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    with torch.autocast(features.device.type, enabled=False):
+        x = torch.nn.functional.normalize(features.float(), dim=-1, p=2, eps=eps)
+        sim = x @ x.t()                 # cosine sims (unit sphere)
+        sim.fill_diagonal_(-2.0)        # exclude self (cos ∈ [-1,1])
+        nn_idx = sim.argmax(dim=1)      # nearest neighbor = max cosine
+        nn_dist = (x - x[nn_idx]).norm(dim=-1)
+        return -(nn_dist + eps).log().mean()
 
 
 @torch.no_grad()

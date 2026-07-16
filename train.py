@@ -330,6 +330,7 @@ def main() -> None:
                     student_temp=cfg.student_temp,
                 )
 
+            koleo_val = out["koleo"] if out["koleo"] is not None else None
             loss = dino
             if dataset_loss is not None:
                 loss = loss + cfg.dataset_adversary_weight * dataset_loss
@@ -337,6 +338,8 @@ def main() -> None:
                 loss = loss + cfg.mae_weight * mae_loss
             if ibot_loss_val is not None:
                 loss = loss + cfg.ibot_weight * ibot_loss_val
+            if koleo_val is not None:
+                loss = loss + cfg.koleo_weight * koleo_val
 
         # backward, unscale grads to apply clipping in fp32, step + update.
         scaler.scale(loss).backward()
@@ -405,6 +408,8 @@ def main() -> None:
 
             writer.add_scalar("loss", loss.item(), step)
             writer.add_scalar("loss/dino", dino.item(), step)
+            if koleo_val is not None:
+                writer.add_scalar("loss/koleo", koleo_val.item(), step)
             writer.add_scalar("lr", lr, step)
             writer.add_scalar("ema_momentum", m, step)
             writer.add_scalar("warmups/teacher_temp", teach_temp, step)

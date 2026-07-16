@@ -226,6 +226,14 @@ class Config:
     mae_decoder_depth: int = 2
     mae_norm_pix_loss: bool = True
 
+
+    # ---------------------------------------------------------------------------
+    # Koleo auxiliary loss
+    # ---------------------------------------------------------------------------
+
+    koleo_enabled: bool = False
+    koleo_weight: float = 0.1     # DINOv2's value
+
     # ------------------------------------------------------------------
     # iBOT masking-based self-supervised objective
     # ------------------------------------------------------------------

@@ -113,7 +113,7 @@ class LatentDecoder(nn.Module):
         patch_shape: tuple[int, int, int],
         hidden_dim: int = 512,
         depth: int = 2,
-        norm_pix_loss: bool = True,
+        norm_pix_loss: bool = False,
     ) -> None:
         super().__init__()
         if depth < 1:
@@ -555,24 +555,49 @@ def main() -> None:
     print(f"[decoder] saved decoder to {decoder_path}")
     decoder.to(device)
 
-    # --- demo: interpolate between two cached crops' latents and decode ---
+    # --- demo: interpolate between two real crops and decode, flanking the
+    # decoded path with the ground-truth crops so both reconstruction fidelity
+    # (real A vs decoded a=0) and the morph between them are visible ---
     print()
-    print(f"[decoder] demo: interpolating between two cached crops ({args.demo_interp_steps} steps)...")
     if crops_train.size(0) < 2:
         print("[decoder] cache too small for a demo pair; skipping")
         return
 
-    z_a = z_train[0].to(device)
-    z_b = z_train[1].to(device)
-    volumes = interpolate_and_decode(decoder, z_a, z_b, n_steps=args.demo_interp_steps)
+    # pick an approximately farthest-apart pair so the interpolation traverses
+    # something meaningful rather than two near-identical crops. cheap two-step
+    # diameter heuristic (O(N)), not a full O(N^2) pairwise scan.
+    d0 = torch.cdist(z_train[:1], z_train).squeeze(0)
+    idx_a = int(d0.argmax())
+    d_a = torch.cdist(z_train[idx_a : idx_a + 1], z_train).squeeze(0)
+    idx_b = int(d_a.argmax())
+    print(
+        f"[decoder] demo: interpolating between real crops {idx_a} and {idx_b} "
+        f"(latent distance {float(d_a[idx_b]):.2f}, {args.demo_interp_steps} steps)..."
+    )
 
-    fig, axes = plt.subplots(1, args.demo_interp_steps, figsize=(2.0 * args.demo_interp_steps, 2.4))
-    for i, ax in enumerate(axes):
-        ax.imshow(volumes[i].mean(axis=0), cmap="gray")
-        ax.set_title(f"a={i / (args.demo_interp_steps - 1):.2f}", fontsize=8)
+    z_a = z_train[idx_a].to(device)
+    z_b = z_train[idx_b].to(device)
+    volumes = interpolate_and_decode(decoder, z_a, z_b, n_steps=args.demo_interp_steps)
+    # z-mean projection of each crop, matching how the decoded volumes are shown.
+    real_a = crops_train[idx_a, 0].float().numpy().mean(axis=0)
+    real_b = crops_train[idx_b, 0].float().numpy().mean(axis=0)
+
+    # one row: [real A] [decoded a=0 .. a=1] [real B]. decoded a=0 is decode(z_a),
+    # so it lands right next to real A for a direct reconstruction comparison.
+    panels = [real_a] + [volumes[i].mean(axis=0) for i in range(args.demo_interp_steps)] + [real_b]
+    titles = (
+        ["real A"]
+        + [f"a={i / (args.demo_interp_steps - 1):.2f}" for i in range(args.demo_interp_steps)]
+        + ["real B"]
+    )
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(2.0 * len(panels), 2.4))
+    for ax, img, title in zip(axes, panels, titles):
+        ax.imshow(img, cmap="gray")
+        ax.set_title(title, fontsize=8)
         ax.set_xticks([])
         ax.set_yticks([])
-    fig.suptitle("decoded latent interpolation: crop A (a=0) -> crop B (a=1)", fontsize=10)
+    fig.suptitle("decoded latent interpolation: real crop A -> real crop B (ends are ground truth)", fontsize=10)
     fig.tight_layout()
     demo_path = log_dir / f"decoder_interp_demo_{time.strftime('%Y%m%d_%H%M%S')}.png"
     fig.savefig(demo_path, dpi=150)

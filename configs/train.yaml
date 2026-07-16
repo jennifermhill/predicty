@@ -195,7 +195,7 @@ aug_rotation:
 # to fetch crops in parallel. each worker reopens its own zarr handle and
 # pulls samples independently, then hands batches back to the main process.
 # 0 means "load in the main process" (slower but easier to debug).
-num_workers: 18
+num_workers: 22
 
 # seed: base integer used to make sampling reproducible. each worker derives
 # its own rng from (seed + worker_id), and numpy/torch are seeded the same way.
@@ -290,6 +290,21 @@ weight_decay_end: 0.4
 grad_clip_norm: 3.0
 warmup_frac: 0.1
 
+
+# ---------------------------------------------------------------------------
+# Koleo auxiliary loss
+# ---------------------------------------------------------------------------
+# The post-hoc decoder revealed that the encoder features collapse onto a tiny
+# fraction of the available directions (~1.5 effective dims out of 2048). KoLeo
+# (from DINOv2) is an auxiliary loss that spreads the batch of embeddings apart:
+# the Kozachenko-Leonenko entropy estimator, computed as the negative mean log of
+# each embedding's distance to its nearest neighbor. minimizing it pushes every
+# crop away from its closest neighbor, so the encoder is nudged to use more of the
+# feature space. applied to L2-normalized features, split per view.
+
+koleo_enabled: true
+koleo_weight: 0.1     # DINOv2's value; try 0.05 if it destabilizes DINO
+
 # ---------------------------------------------------------------------------
 # training loop
 # ---------------------------------------------------------------------------
@@ -301,7 +316,7 @@ warmup_frac: 0.1
 # device:        'cuda' for HPC GPU, 'cpu' for local smoke tests.
 # use_amp:       fp16 autocast on cuda. silently disabled on cpu.
 batch_size: 64
-total_steps: 5000
+total_steps: 10000
 log_interval: 50
 ckpt_interval: 500
 device: cuda
