@@ -211,10 +211,10 @@ seed: 0
 # projector_*:   DINO head sitting on top of the encoder during training.
 #                discarded after training; only the encoder ships.
 stem_channels: 64
-latent_dim: 2048
+latent_dim: 128 # reduced dimensionality since microscopy data is less complex than ImageNet.
 encoder_chunk_size: 32
 projector_hidden: 512
-projector_bottleneck: 256
+projector_bottleneck: 64
 projector_k: 2048
 
 # ---------------------------------------------------------------------------
@@ -303,7 +303,7 @@ warmup_frac: 0.1
 # feature space. applied to L2-normalized features, split per view.
 
 koleo_enabled: true
-koleo_weight: 0.1     # DINOv2's value; try 0.05 if it destabilizes DINO
+koleo_weight: 0.05     # DINOv2's value was 0.1
 
 # ---------------------------------------------------------------------------
 # training loop

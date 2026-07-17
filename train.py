@@ -331,6 +331,12 @@ def main() -> None:
                 )
 
             koleo_val = out["koleo"] if out["koleo"] is not None else None
+            koleo_weight = None
+            if koleo_val is not None:
+                koleo_weight = linear_frac_schedule(
+                    step, cfg.total_steps, 0.0, cfg.koleo_weight, cfg.temp_warmup_frac
+                ) # same warmup fraction as teacher temperature for now, can separate if needed
+
             loss = dino
             if dataset_loss is not None:
                 loss = loss + cfg.dataset_adversary_weight * dataset_loss
@@ -339,7 +345,7 @@ def main() -> None:
             if ibot_loss_val is not None:
                 loss = loss + cfg.ibot_weight * ibot_loss_val
             if koleo_val is not None:
-                loss = loss + cfg.koleo_weight * koleo_val
+                loss = loss + koleo_weight * koleo_val
 
         # backward, unscale grads to apply clipping in fp32, step + update.
         scaler.scale(loss).backward()
@@ -415,6 +421,8 @@ def main() -> None:
             writer.add_scalar("warmups/teacher_temp", teach_temp, step)
             writer.add_scalar("warmups/dataset_adversary_grl_scale", model.dataset_adversary_grl_scale, step)
             writer.add_scalar("warmups/weight_decay", wd, step)
+            if koleo_weight is not None:
+                writer.add_scalar("warmups/koleo_weight", koleo_weight, step)
             writer.add_scalar("grad_norm", grad_norm.item(), step)
             writer.add_scalar("collapse/teacher_entropy", entropy.item(), step)
             writer.add_scalar("collapse/embedding_var", emb_var.item(), step)

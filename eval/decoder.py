@@ -186,11 +186,7 @@ def interpolate_and_decode(
     z_b: torch.Tensor,
     n_steps: int = 8,
 ) -> np.ndarray:
-    """linearly interpolate between two latent vectors and decode every point.
-
-    z_a, z_b: (latent_dim,) single embeddings, e.g. encoder(crop_a).squeeze(0).
-    returns: (n_steps, Z, H, W) numpy array, z_a at index 0 and z_b at index -1.
-    """
+    """linearly interpolate between two latent vectors and decode every point. """
     decoder.eval()
     alphas = torch.linspace(0.0, 1.0, n_steps, device=z_a.device).unsqueeze(1)  # (n_steps, 1)
     z_path = (1 - alphas) * z_a.unsqueeze(0) + alphas * z_b.unsqueeze(0)  # (n_steps, latent_dim)
@@ -203,7 +199,7 @@ def interpolate_and_decode(
 # ---------------------------------------------------------------------------
 
 def disable_augmentations(cfg: Config) -> None:
-    """turn off stochastic augs so the decoder sees a deterministic target for
+    """turn off augs so the decoder sees a deterministic target for
     each latent. the frozen encoder is invariant to these (including flip and
     rotation), so with them on one latent maps to many target crops and the
     decoder just learns a blurred average. per-crop norm stays on since that's
@@ -223,11 +219,7 @@ def spatial_holdout_split(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """split the cached crops/embeddings into train/val by spatial coordinate.
 
-    same geometric rule as eval/probe_dataset.py's spatial_holdout_split: within
-    whatever region(s) were sampled, the high-coordinate strip (the last
-    val_frac of the longer axis) becomes validation, so val crops never overlap
-    or sit adjacent to train crops and a strong val_r2 means the decoder
-    generalizes across space rather than memorizing.
+    same geometric rule as eval/probe_dataset.py's spatial_holdout_split
     """
     if not 0.0 < val_frac < 1.0:
         raise ValueError(f"--val-frac must be in (0, 1); got {val_frac}")
@@ -273,10 +265,7 @@ def extract_cache(
 ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
     """embed n_samples t1 global crops once, caching both the crops and their
     embeddings so the decoder trains from memory instead of re-reading zarr
-    every step. mirrors eval/probe_dataset.py's extract_embeddings, which caches
-    embeddings up front; here we also keep the crops (in float16) since they are
-    the decoder's reconstruction targets. augmentations are disabled so each
-    latent maps to a single deterministic target.
+    every step.
     """
     cfg.seed = seed
     disable_augmentations(cfg)
