@@ -10,7 +10,7 @@ lower distance = clouds overlap = dataset identity scrubbed (good mixing);
 higher = datasets stay separable = residual batch effect.
 
 usage:
-    # point at an existing latent_space run folder
+    # point at an existing latent_space run folder (the one that contains the embeddings.npz)
     python eval/probe_wasserstein.py --config configs/train.yaml --run-dir latent_space/final_20260711_161004
 
     # or at the npz directly; report is written alongside it

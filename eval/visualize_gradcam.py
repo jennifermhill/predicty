@@ -3,6 +3,12 @@
 from __future__ import annotations
 
 import cv2
+import matplotlib
+
+# force the non-interactive backend before pyplot loads. on headless compute
+# nodes the default tk backend tears its objects down on the wrong thread at
+# exit, which aborts with "main thread is not in main loop". we only save pngs.
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
