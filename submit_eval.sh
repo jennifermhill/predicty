@@ -68,7 +68,7 @@ trap 'kill ${GPU_SAMPLER_PID} 2>/dev/null || true' EXIT
 # evaluation_pipeline.py derives each run's config from
 # checkpoints/<run>/config.yaml and checkpoint from checkpoints/<run>/latest.pt,
 # so it only needs the run names.
-python eval/evaluation_pipeline.py --run_names ${RUN_NAMES}
+python eval/evaluation_pipeline.py --run-names ${RUN_NAMES}
 
 # clean up node-local scratch on the way out.
 rm -rf $TMPDIR

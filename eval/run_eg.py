@@ -349,19 +349,28 @@ def main() -> None:
     encoder.eval()
     print(f"[eg] encoder loaded from step {ckpt.get('step', 'unknown')}")
 
-    # auto-detect probe checkpoints, matching run_gradcam's behavior.
+    # auto-detect probe checkpoints, matching run_gradcam's behavior. prefer THIS
+    # run's own dir (its input_dim matches this encoder); fall back to the most
+    # recently MODIFIED probe. a plain name sort is wrong: letter-prefixed run names
+    # (e.g. "final_...") sort above digit-prefixed ones, grabbing a stale probe of
+    # the wrong latent_dim.
+    run_name = Path(args.checkpoint).parent.name
+    latent_dir = Path("latent_space")
+
+    def _autodetect_probe(kind: str):
+        if not latent_dir.exists():
+            return None
+        hits = sorted(latent_dir.glob(f"{run_name}*/{kind}.pt"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+        if not hits:  # no probe for this run yet; fall back to newest anywhere
+            hits = sorted(latent_dir.glob(f"*/{kind}.pt"),
+                          key=lambda p: p.stat().st_mtime, reverse=True)
+        return hits[0] if hits else None
+
     if args.behavior_probe is None:
-        latent_dir = Path("latent_space")
-        if latent_dir.exists():
-            hits = sorted(latent_dir.glob("*/behavior_probe.pt"), reverse=True)
-            if hits:
-                args.behavior_probe = hits[0]
+        args.behavior_probe = _autodetect_probe("behavior_probe")
     if args.dataset_probe is None:
-        latent_dir = Path("latent_space")
-        if latent_dir.exists():
-            hits = sorted(latent_dir.glob("*/dataset_probe.pt"), reverse=True)
-            if hits:
-                args.dataset_probe = hits[0]
+        args.dataset_probe = _autodetect_probe("dataset_probe")
 
     behavior_head = behavior_names = None
     dataset_head = dataset_names = None
@@ -400,7 +409,14 @@ def main() -> None:
         print("[eg] WARNING: no crops extracted. check dataset configuration.")
         return
 
-    output_dir = Path("latent_space") / f"eg_{time.strftime('%Y%m%d_%H%M%S')}"
+    # write inside THIS run's own latent_space folder (next to the probes),
+    # e.g. latent_space/<run>_<ts>/eg -- so outputs stay grouped per run.
+    run_dirs = sorted(
+        (p for p in latent_dir.glob(f"{run_name}*") if p.is_dir()),
+        key=lambda p: p.stat().st_mtime, reverse=True,
+    )
+    base = run_dirs[0] if run_dirs else latent_dir / f"{run_name}_{time.strftime('%Y%m%d_%H%M%S')}"
+    output_dir = base / "eg"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.mode in ["behavior", "both"] and behavior_head is not None:

@@ -464,9 +464,14 @@ class GradCAMAnalyzer:
 
         # analytic 2D grad-cam for every class at once (no backward):
         # map_c = relu(sum_k head.weight[c, k] * A_k), then per-class normalize.
-        A = captured["conv"][0].detach()          # (C, h, w) pre-pool features
-        W = self.classifier.weight.detach()       # (n_classes, C)
-        maps = torch.einsum("nc,chw->nhw", W, A)  # (n_classes, h, w)
+        A = captured["conv"][0].detach()          # (C, h, w) pre-pool conv features
+        W = self.classifier.weight.detach()       # (n_classes, latent_dim)
+        # if the encoder projects conv features (C) down to latent_dim before the head,
+        # fold that projection in so W lines up with A's channels. exact: it's all linear.
+        proj = getattr(self.encoder.backbone, "fc", None)
+        if isinstance(proj, torch.nn.Linear):
+            W = W @ proj.weight.detach()          # (n_classes, latent_dim) @ (latent_dim, C) -> (n_classes, C)
+        maps = torch.einsum("nc,chw->nhw", W, A)
         cams_2d = {
             c: _normalize01(torch.relu(maps[c])).cpu() for c in range(n_classes)
         }
