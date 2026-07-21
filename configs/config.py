@@ -244,8 +244,10 @@ class Config:
     # mutually exclusive: when iBOT is on, MAE is force-disabled (see
     # __post_init__) so only one masked encoder forward runs per step.
     ibot_enabled: bool = False
+    ibot_p: float = 0.5
     ibot_weight: float = 1.0
-    ibot_mask_ratio: float = 0.75
+    ibot_mask_ratio: tuple = (0.1, 0.5)
+    # samples uniformly from this range each step. 0.1 = 10% of tokens masked, 0.5 = 50%.
     ibot_layer: str = "layer4"
     ibot_block_size: int = 2
 

@@ -161,7 +161,7 @@ class DINOWrapper(nn.Module):
         if self.ibot_enabled:
             from models.ibot import make_block_mask, apply_grid_mask
 
-            self.ibot_mask_ratio = float(getattr(cfg, "ibot_mask_ratio", 0.4))
+            self.ibot_mask_ratio = list(getattr(cfg, "ibot_mask_ratio", [0.1, 0.5]))
             self.ibot_layer = getattr(cfg, "ibot_layer", "layer4")
             self.ibot_block_size = int(getattr(cfg, "ibot_block_size", 2))
             
@@ -172,6 +172,7 @@ class DINOWrapper(nn.Module):
             self.ibot_channels = tok.shape[1]
             self.ibot_grid = tok.shape[-1]  # assumes square grid
             self.register_buffer("ibot_center", torch.zeros(cfg.projector_k))
+            self.ibot_p = float(getattr(cfg, "ibot_p", 0.5))
             
             student_mask_head = DINOHead(
                 in_dim=self.ibot_channels,
@@ -281,14 +282,15 @@ class DINOWrapper(nn.Module):
             mae_out = self.mae_decoder(g_flat, self.student.encoder)
 
         # iBOT student: masked globals through masking head
+        do_ibot = self.ibot_enabled and torch.rand(()) < self.ibot_p
         s_g_ibot = None
         ibot_mask = None
-        if self.ibot_enabled:
+        if do_ibot:
             from models.ibot import make_block_mask, apply_grid_mask
             ibot_mask = make_block_mask(
                 B * n_g, 
                 grid=self.ibot_grid, 
-                ratio=self.ibot_mask_ratio, 
+                ratio=torch.FloatTensor(1).uniform_(self.ibot_mask_ratio[0], self.ibot_mask_ratio[1]).item(),
                 block=self.ibot_block_size,
                 device=g_flat.device
             )
@@ -311,7 +313,7 @@ class DINOWrapper(nn.Module):
             t_g_feat = self.teacher.encode(g_flat)
             t_g = self.teacher.project(t_g_feat)
             t_g_ibot = None
-            if self.ibot_enabled:
+            if do_ibot:
                 t_g_ibot = project_grid(self.teacher.masking_head, self.teacher.encoder.forward_tokens(g_flat, layer=self.ibot_layer))
         
         koleo = None
