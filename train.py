@@ -250,6 +250,10 @@ def main() -> None:
     ckpt_dir = Path(cfg.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    # ---- ibot ----
+    ibot_last = [None, None, None, 0]  # loss, acc@1, acc@5, step
+    # initialized before training loop to remain persistent between steps
+
     # ---- resume ----
     start_step = 0
     if args.resume:
@@ -259,6 +263,7 @@ def main() -> None:
     # ---- training loop ----
     loader_iter = iter(loader)
     t_last_log = time.time()
+    ibot_last = [None, None, None, 0]  # last iBOT [loss, top1, top5, step], carried between masked steps
 
     step = start_step
     for step in range(start_step, cfg.total_steps):
@@ -330,6 +335,22 @@ def main() -> None:
                     teacher_temp=teach_temp,
                     student_temp=cfg.student_temp,
                 )
+                # capture iBOT metrics on every masked step (not only log-steps)
+                # so the logged point lands at ~the current step. cheap: argmax/
+                # topk on already-computed tokens, no backward.
+                with torch.no_grad():
+                    _ibot_acc = ibot_patch_accuracy(
+                        out["student_masking_globals"],
+                        out["teacher_masking_globals"],
+                        out["ibot_mask"],
+                        model.ibot_center,
+                    )
+                ibot_last = [
+                    ibot_loss_val.item(),
+                    _ibot_acc["top1"].item(),
+                    _ibot_acc["topk"].item(),
+                    step,
+                ]
 
             koleo_val = out["koleo"] if out["koleo"] is not None else None
             koleo_weight = None
@@ -399,16 +420,8 @@ def main() -> None:
                 mae_mask_ratio = (
                     out["mae"]["mask_ratio"] if out["mae"] is not None else None
                 )
-                # iBOT prototype-recovery accuracy: how well the masked student
-                # matches the teacher's assignment on the full crop.
-                ibot_acc = None
-                if out["student_masking_globals"] is not None:
-                    ibot_acc = ibot_patch_accuracy(
-                        out["student_masking_globals"],
-                        out["teacher_masking_globals"],
-                        out["ibot_mask"],
-                        model.ibot_center,
-                    )
+                # iBOT metrics are captured every masked step (see loss block);
+                # ibot_last holds the most recent, logged below at its real step.
 
             dt = time.time() - t_last_log
             t_last_log = time.time()
@@ -439,11 +452,13 @@ def main() -> None:
                 writer.add_scalar("mae/recon_r2", out["mae"]["recon_r2"].item(), step)
                 writer.add_scalar("mae/recon_corr", out["mae"]["recon_corr"].item(), step)
                 writer.add_scalar("mae/recon_rel_l2", out["mae"]["recon_rel_l2"].item(), step)
-            if ibot_loss_val is not None:
-                writer.add_scalar("ibot/loss", ibot_loss_val.item(), step)
-                if ibot_acc is not None:
-                    writer.add_scalar("ibot/recon_acc_top1", ibot_acc["top1"].item(), step)
-                    writer.add_scalar("ibot/recon_acc_top5", ibot_acc["topk"].item(), step)
+            if cfg.ibot_enabled:
+                if ibot_last[0] is not None:
+                    writer.add_scalar("ibot/loss", ibot_last[0], ibot_last[3])
+                if ibot_last[1] is not None:
+                    writer.add_scalar("ibot/recon_acc_top1", ibot_last[1], ibot_last[3])
+                if ibot_last[2] is not None:
+                    writer.add_scalar("ibot/recon_acc_top5", ibot_last[2], ibot_last[3])
 
             msg = (
                 f"step {step:06d}  loss={loss.item():.4f}  lr={lr:.2e}  "
@@ -461,13 +476,11 @@ def main() -> None:
                     f"  mae_loss={mae_loss.item():.4f} "
                     f"mae_r2={out['mae']['recon_r2'].item():.3f}"
                 )
-            if ibot_loss_val is not None:
-                msg += f"  ibot_loss={ibot_loss_val.item():.4f}"
-                if ibot_acc is not None:
-                    msg += (
-                        f" ibot_acc@1={ibot_acc['top1'].item():.3f} "
-                        f"ibot_acc@5={ibot_acc['topk'].item():.3f}"
-                    )
+            if ibot_last[0] is not None:
+                msg += (
+                    f"  ibot_loss={ibot_last[0]:.4f} "
+                    f"ibot_acc@1={ibot_last[1]:.3f} ibot_acc@5={ibot_last[2]:.3f}"
+                )
             print(msg)
 
         # ---- checkpoint ----
