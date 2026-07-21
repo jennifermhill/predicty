@@ -273,9 +273,15 @@ mae_norm_pix_loss: true
 # auxiliary global-crop reconstruction with different masking strategy than MAE.
 # uses block-wise masking instead of patch-wise for more spatial coherence.
 # mutually exclusive with mae: enabling this force-disables mae_enabled above.
+# ibot_layer: which ResNet layer to extract features from for the iBOT loss. 
+# layer1 = 64x64, layer2 = 32x32, layer3 = 16x16, layer4 = 8x8.
+# ibot_block_size: size of the square block to mask in the feature map in grid cells. 
+# 1 = patch-wise, 2 = 2x2 blocks, etc.
 ibot_enabled: true
 ibot_weight: 0.1
-ibot_mask_ratio: 0.75
+ibot_mask_ratio: 0.4
+ibot_layer: layer4
+ibot_block_size: 2
 
 # ---------------------------------------------------------------------------
 # optimizer / LR schedule

@@ -32,8 +32,8 @@ from data.picker import pick_zarr_path
 from models.dino import (
     DINOWrapper,
     dino_loss,
-    ibot_loss,
-    ibot_reconstruction_accuracy,
+    ibot_patch_loss,
+    ibot_patch_accuracy,
 )
 from train_utils import (
     batch_to_device,
@@ -213,7 +213,7 @@ def main() -> None:
     if model.ibot_enabled:
         print(
             f"[train] iBOT masking: enabled "
-            f"(patch=({cfg.ibot_patch_z}, {cfg.ibot_patch_size}, {cfg.ibot_patch_size}), "
+            f"(patch=({cfg.z_thickness}, {cfg.ibot_block_size}, {cfg.ibot_block_size}), "
             f"mask_ratio={cfg.ibot_mask_ratio}, weight={cfg.ibot_weight})"
         )
     else:
@@ -322,9 +322,10 @@ def main() -> None:
             mae_loss = out["mae"]["loss"] if out["mae"] is not None else None
             ibot_loss_val = None
             if out["student_masking_globals"] is not None:
-                ibot_loss_val = ibot_loss(
+                ibot_loss_val = ibot_patch_loss(
                     out["student_masking_globals"],
                     out["teacher_masking_globals"],
+                    out["ibot_mask"],
                     model.ibot_center,
                     teacher_temp=teach_temp,
                     student_temp=cfg.student_temp,
@@ -402,9 +403,10 @@ def main() -> None:
                 # matches the teacher's assignment on the full crop.
                 ibot_acc = None
                 if out["student_masking_globals"] is not None:
-                    ibot_acc = ibot_reconstruction_accuracy(
+                    ibot_acc = ibot_patch_accuracy(
                         out["student_masking_globals"],
                         out["teacher_masking_globals"],
+                        out["ibot_mask"],
                         model.ibot_center,
                     )
 

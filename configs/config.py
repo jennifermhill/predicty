@@ -246,8 +246,8 @@ class Config:
     ibot_enabled: bool = False
     ibot_weight: float = 1.0
     ibot_mask_ratio: float = 0.75
-    ibot_patch_z: int = 2
-    ibot_patch_size: int = 16
+    ibot_layer: str = "layer4"
+    ibot_block_size: int = 2
 
     # ------------------------------------------------------------------
     # optimizer / schedule

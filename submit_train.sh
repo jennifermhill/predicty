@@ -17,7 +17,7 @@
 # -J/-oo/-eo are overridden per-run by launch.sh; the values here are only the
 # fallback for a raw `bsub < submit_train.sh` (run name defaults to 'default').
 #BSUB -J predicty_train              # job name (shows in bjobs)
-#BSUB -q gpu_h100                   # H100 queue: 12 slots/GPU, 40GB ram/slot, 141GB VRAM
+#BSUB -q gpu_a100                   # A100 queue: 12 slots/GPU, 40GB ram/slot, 141GB VRAM
 #BSUB -gpu "num=1"                   # request 1 GPU
 #BSUB -n 24                           # 8 slots = 8 cores + 320 GB ram (slot-implied)
 #BSUB -W 72:00                       # 72 hour walltime

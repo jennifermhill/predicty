@@ -142,7 +142,7 @@ class DINOWrapper(nn.Module):
         super().__init__()
         # local import keeps the encoder module decoupled from the wrapper.
         from models.encoder import HybridEncoder
-        from models.mae import MaskedPatchAutoencoder
+        from models.ibot import MaskedPatchAutoencoder
 
         student_enc = HybridEncoder(
             stem_channels=cfg.stem_channels,
@@ -159,8 +159,22 @@ class DINOWrapper(nn.Module):
         student_mask_head = None
         self.ibot_enabled = getattr(cfg, "ibot_enabled", False)
         if self.ibot_enabled:
+            from models.ibot import make_block_mask, apply_grid_mask
+
+            self.ibot_mask_ratio = float(getattr(cfg, "ibot_mask_ratio", 0.4))
+            self.ibot_layer = getattr(cfg, "ibot_layer", "layer4")
+            self.ibot_block_size = int(getattr(cfg, "ibot_block_size", 2))
+            
+            # dummy pass to derive channel count + grid size
+            with torch.no_grad():
+                dummy = torch.zeros(1, 1, cfg.z_thickness, cfg.global_crop_size, cfg.global_crop_size)
+                tok = student_enc.forward_tokens(dummy, layer=self.ibot_layer)
+            self.ibot_channels = tok.shape[1]
+            self.ibot_grid = tok.shape[-1]  # assumes square grid
+            self.register_buffer("ibot_center", torch.zeros(cfg.projector_k))
+            
             student_mask_head = DINOHead(
-                in_dim=cfg.latent_dim,
+                in_dim=self.ibot_channels,
                 hidden_dim=cfg.projector_hidden,
                 bottleneck_dim=cfg.projector_bottleneck,
                 out_dim=cfg.projector_k,
@@ -209,27 +223,6 @@ class DINOWrapper(nn.Module):
         # centering buffer: EMA of pre-softmax teacher logits. registered as a
         # buffer so it moves with `.to(device)` and is saved in checkpoints.
         self.register_buffer("center", torch.zeros(cfg.projector_k))
-
-        if self.ibot_enabled:
-            from models.mae import make_random_mask, apply_mask_to_volume
-
-            self.ibot_mask_ratio = float(getattr(cfg, "ibot_mask_ratio", 0.75))
-            self.ibot_patch_z = int(getattr(cfg, "ibot_patch_z", cfg.mae_patch_z))
-            self.ibot_patch_size = int(getattr(cfg, "ibot_patch_size", cfg.mae_patch_size))
-            self.ibot_grid_shape = (
-                cfg.z_thickness // self.ibot_patch_z,
-                cfg.global_crop_size // self.ibot_patch_size,
-                cfg.global_crop_size // self.ibot_patch_size,
-            )
-            self.ibot_n_patches = (
-                self.ibot_grid_shape[0] * self.ibot_grid_shape[1] * self.ibot_grid_shape[2]
-            )
-            self.ibot_patch_shape = (
-                self.ibot_patch_z,
-                self.ibot_patch_size,
-                self.ibot_patch_size,
-            )
-            self.register_buffer("ibot_center", torch.zeros(cfg.projector_k))
         
         self.koleo_enabled = getattr(cfg, "koleo_enabled", False)
 
@@ -246,7 +239,6 @@ class DINOWrapper(nn.Module):
         return self
 
     def forward(self, batch: dict) -> dict:
-        from models.mae import make_random_mask, apply_mask_to_volume
 
         globals_ = batch["globals"]  # (B, 2, 1, Z, H, W)
         locals_ = batch.get("locals")  # (B, n_l, 1, Z, H, W) or None
@@ -292,14 +284,19 @@ class DINOWrapper(nn.Module):
         s_g_ibot = None
         ibot_mask = None
         if self.ibot_enabled:
-            ibot_mask = make_random_mask(
-                B * n_g, self.ibot_n_patches, self.ibot_mask_ratio, g_flat.device
+            from models.ibot import make_block_mask, apply_grid_mask
+            ibot_mask = make_block_mask(
+                B * n_g, 
+                grid=self.ibot_grid, 
+                ratio=self.ibot_mask_ratio, 
+                block=self.ibot_block_size,
+                device=g_flat.device
             )
-            g_flat_masked = apply_mask_to_volume(
-                g_flat, ibot_mask, self.ibot_grid_shape, self.ibot_patch_shape
+            
+            g_masked = apply_grid_mask(
+                g_flat, ibot_mask, self.ibot_grid
             )
-            s_g_ibot_feat = self.student.encode(g_flat_masked)
-            s_g_ibot = self.student.masking_head(s_g_ibot_feat)
+            s_g_ibot = project_grid(self.student.masking_head, self.student.encoder.forward_tokens(g_masked, layer=self.ibot_layer))
 
         # stash the real (globals+locals) embeddings for the collapse monitor.
         # must come after the ibot masked encode above: student.encode sets
@@ -315,7 +312,7 @@ class DINOWrapper(nn.Module):
             t_g = self.teacher.project(t_g_feat)
             t_g_ibot = None
             if self.ibot_enabled:
-                t_g_ibot = self.teacher.masking_head(t_g_feat)
+                t_g_ibot = project_grid(self.teacher.masking_head, self.teacher.encoder.forward_tokens(g_flat, layer=self.ibot_layer))
         
         koleo = None
         if self.koleo_enabled:
@@ -372,7 +369,7 @@ class DINOWrapper(nn.Module):
         """EMA the iBOT centering buffer toward this batch's teacher mean."""
         if self.ibot_enabled:
             self.ibot_center.mul_(momentum).add_(
-                teacher_masking_logits.mean(dim=0), alpha=1.0 - momentum
+                teacher_masking_logits.mean(dim=(0,1)), alpha=1.0 - momentum
             )
 
 
@@ -420,20 +417,20 @@ def dino_loss(
 
     return total / max(n_terms, 1)
 
+def project_grid(head, fmap):
+    """(N, C, gh, gw) -> (N, gh*gw, K): run the head on every cell."""
+    n, c, gh, gw = fmap.shape
+    tok = fmap.permute(0, 2, 3, 1).reshape(n, gh * gw, c)
+    return head(tok).reshape(n, gh * gw, -1)
 
-def ibot_loss(
-    student_ibot: torch.Tensor,
-    teacher_ibot: torch.Tensor,
-    ibot_center: torch.Tensor,
-    teacher_temp: float = 0.04,
-    student_temp: float = 0.1,
-) -> torch.Tensor:
-    """cross-entropy for iBOT masking objective (same-view pairs only)."""
-    # teacher: center, sharpen, softmax, detach
-    t = ((teacher_ibot - ibot_center) / teacher_temp).softmax(dim=-1).detach()
-    # student: sharpen, log-softmax
-    s = (student_ibot / student_temp).log_softmax(dim=-1)
-    return -(t * s).sum(dim=-1).mean()
+def ibot_patch_loss(
+    student_tok, teacher_tok, mask, ibot_center, teacher_temp: float = 0.04, student_temp: float = 0.1
+):
+    """CE on HIDDEN tiles only"""
+    t = ((teacher_tok - ibot_center) / teacher_temp).softmax(dim=-1).detach()
+    s = (student_tok / student_temp).log_softmax(dim=-1)
+    ce = -(t * s).sum(dim=-1)
+    return ce[mask].mean()
 
 def koleo_loss(features: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     with torch.autocast(features.device.type, enabled=False):
@@ -446,27 +443,14 @@ def koleo_loss(features: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 
 
 @torch.no_grad()
-def ibot_reconstruction_accuracy(
-    student_ibot: torch.Tensor,
-    teacher_ibot: torch.Tensor,
-    ibot_center: torch.Tensor,
-    top_k: int = 5,
+def ibot_patch_accuracy(
+    student_tok, teacher_tok, mask, ibot_center, top_k=5
 ) -> dict[str, torch.Tensor]:
-    """prototype-recovery accuracy for the iBOT masking objective.
-
-    the iBOT target is the teacher's prototype assignment on the unmasked crop.
-    "reconstruction accuracy" is how often the student, seeing only the masked
-    crop, recovers that assignment. top-1 is exact-match; top-k credits the
-    student when the teacher's argmax lands in its k most confident prototypes.
-    both are the interpretable companion to the raw cross-entropy loss.
-    """
-    teacher_target = (teacher_ibot - ibot_center).argmax(dim=-1)
-    student_pred = student_ibot.argmax(dim=-1)
-    top1 = (student_pred == teacher_target).float().mean()
-
-    k = min(top_k, student_ibot.size(-1))
-    student_topk = student_ibot.topk(k, dim=-1).indices
-    topk = (student_topk == teacher_target.unsqueeze(-1)).any(dim=-1).float().mean()
+    t_arg = (teacher_tok - ibot_center).argmax(dim=-1)[mask]
+    s = student_tok[mask]
+    top1 = (s.argmax(dim=-1) == t_arg).float().mean()
+    k = min(top_k, s.size(-1))
+    topk = (s.topk(k, dim=-1).indices == t_arg[:, None]).any(dim=-1).float().mean()
     return {"top1": top1, "topk": topk}
 
 
@@ -533,18 +517,20 @@ if __name__ == "__main__":
         out["dataset_logits"], out["dataset_targets"]
     )
     if out["student_masking_globals"] is not None:
-        ibot_loss_val = ibot_loss(
+        ibot_loss_val = ibot_patch_loss(
             out["student_masking_globals"],
             out["teacher_masking_globals"],
+            out["ibot_mask"],
             wrapper.ibot_center,
             cfg.teacher_temp_end,
             cfg.student_temp,
         )
         loss = loss + ibot_loss_val
         print(f"ibot_loss: {ibot_loss_val.item():.4f}")
-        ibot_acc = ibot_reconstruction_accuracy(
+        ibot_acc = ibot_patch_accuracy(
             out["student_masking_globals"],
             out["teacher_masking_globals"],
+            out["ibot_mask"],
             wrapper.ibot_center,
         )
         print(
