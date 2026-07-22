@@ -290,6 +290,7 @@ def main() -> None:
     df = pd.read_json(cfg.annotation_path, lines=True)
     df = df[df['label'] != 'empty']
     df = df.drop(columns = ['timestamp'])
+    df = df[df['label'] != 'slug']
     for col in df.columns:
         try:
             df[col] = pd.to_numeric(df[col])

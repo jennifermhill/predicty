@@ -57,7 +57,7 @@ from configs.config import Config
 from data.dataset import MultiZarrDataset, worker_init_fn
 from data.spatial_regions import region_bounds_for_top_left
 from models.encoder import HybridEncoder
-from models.mae import _reconstruction_metrics, _trunc_normal_
+from models.ibot import _reconstruction_metrics, _trunc_normal_
 
 
 # ---------------------------------------------------------------------------
@@ -418,7 +418,7 @@ def parse_args() -> argparse.Namespace:
         "--n-samples", type=int, default=8192,
         help="number of t1 global crops (with embeddings) to cache before training the decoder",
     )
-    p.add_argument("--steps", type=int, default=3000, help="optimizer steps for the decoder")
+    p.add_argument("--steps", type=int, default=15000, help="optimizer steps for the decoder")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--hidden-dim", type=int, default=512, help="decoder MLP width (matches mae_decoder_hidden default)")
     p.add_argument("--depth", type=int, default=2, help="decoder MLP depth (matches mae_decoder_depth default)")
