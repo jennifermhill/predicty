@@ -85,6 +85,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--k-values", type=int, nargs="+", default=[1, 5, 10, 15, 20], help="k values to sweep")
     p.add_argument("--weighted", action="store_true", help="softmax-weighted vote instead of a plain majority")
     p.add_argument("--temperature", type=float, default=0.07, help="softmax temperature for --weighted (DINO default)")
+    p.add_argument("--class-balanced", action="store_true", help="divide neighbor votes by train class frequency so rare classes aren't outvoted just for being scarce")
     p.add_argument("--seed", type=int, default=42, help="seed for the fold split")
     p.add_argument("--n_splits", type=int, default=5, help="folds for stratified k-fold splitting")
     return p.parse_args()
@@ -98,6 +99,7 @@ def knn_predict(
     n_classes: int,
     weighted: bool,
     temperature: float,
+    class_balanced: bool = False,
 ) -> torch.Tensor:
     """predict a label for every row of X_val by a cosine vote over its k nearest
     neighbors in X_train. returns preds (n_val,) long.
@@ -114,6 +116,11 @@ def knn_predict(
     weights = torch.softmax(top_sim / temperature, dim=1) if weighted else torch.ones_like(top_sim)
     scores = torch.zeros(X_val.size(0), n_classes)
     scores.scatter_add_(1, neighbor_labels, weights)
+    if class_balanced:
+        # prior correction: divide each class's vote by its train frequency so a
+        # rare class isn't outvoted just for being scarce among the neighbors.
+        counts = torch.bincount(y_train, minlength=n_classes).float().clamp(min=1)
+        scores = scores / counts
     return scores.argmax(dim=1)
 
 
@@ -140,6 +147,12 @@ def macro_f1(cm: torch.Tensor) -> tuple[float, list[float]]:
         if cm[c, :].sum() > 0:
             present.append(f1)
     return (statistics.mean(present) if present else 0.0), per_class
+
+
+def balanced_acc(cm: torch.Tensor) -> float:
+    """mean per-class recall over classes present in val (balanced accuracy)."""
+    recs = [int(cm[c, c]) / int(cm[c, :].sum()) for c in range(cm.size(0)) if cm[c, :].sum() > 0]
+    return statistics.mean(recs) if recs else 0.0
 
 
 def interpret(val_acc: float, n_classes: int) -> str:
@@ -173,6 +186,7 @@ def main() -> None:
     df = pd.read_json(cfg.annotation_path, lines=True)
     df = df[df["label"] != "empty"]
     df = df.drop(columns=["timestamp"])
+    df = df[df["zarr_path"] != "/groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test49_2024-02-08/mixin49_wellB2_24hr_ERH Red FarRed.zarr"]
     for col in df.columns:
         try:
             df[col] = pd.to_numeric(df[col])
@@ -226,6 +240,7 @@ def main() -> None:
     # per-k accumulators across folds
     accs = {k: [] for k in args.k_values}
     macros = {k: [] for k in args.k_values}
+    bals = {k: [] for k in args.k_values}
     cms = {k: torch.zeros(n_classes, n_classes, dtype=torch.long) for k in args.k_values}
 
     for fold_idx, (X_train, y_train, X_val, y_val) in enumerate(
@@ -234,26 +249,29 @@ def main() -> None:
         print(f"[knn] fold {fold_idx+1}/{args.n_splits}  (grouped by zarr volume, stratified by label)")
         print(f"[knn] train n={X_train.size(0)}  val n={X_val.size(0)}")
         for k in args.k_values:
-            preds = knn_predict(X_train, y_train, X_val, k, n_classes, args.weighted, args.temperature)
+            preds = knn_predict(X_train, y_train, X_val, k, n_classes, args.weighted, args.temperature, args.class_balanced)
             cm = confusion(y_val, preds, n_classes)
             acc = (preds == y_val).float().mean().item()
             macro, _ = macro_f1(cm)
+            bal = balanced_acc(cm)
             accs[k].append(acc)
             macros[k].append(macro)
+            bals[k].append(bal)
             cms[k] += cm
-            print(f"    k={k:2d}  acc={acc*100:6.2f}%  macro-F1={macro:.3f}")
+            print(f"    k={k:2d}  acc={acc*100:6.2f}%  bal_acc={bal*100:6.2f}%  macro-F1={macro:.3f}")
         print()
 
     # --- cross-validated summary: one row per k ---
     print("#" * 70)
     print(f"  k-NN CROSS-VALIDATED SUMMARY ({args.n_splits} folds, grouped by zarr volume)")
-    print(f"  weighted={args.weighted}  @ training step {step}  (chance = {chance_pct:.1f}%)")
+    print(f"  weighted={args.weighted}  class_balanced={args.class_balanced}  @ training step {step}  (chance = {chance_pct:.1f}%)")
     print("#" * 70)
-    print(f"  {'k':>3}  {'acc mean':>9}  {'acc std':>7}  {'macroF1':>8}  {'mF1 std':>7}")
+    print(f"  {'k':>3}  {'acc':>7}  {'acc std':>7}  {'bal_acc':>8}  {'macroF1':>8}  {'mF1 std':>7}")
     for k in args.k_values:
         a_mean, a_std = statistics.mean(accs[k]), statistics.stdev(accs[k]) if len(accs[k]) > 1 else 0.0
+        b_mean = statistics.mean(bals[k])
         m_mean, m_std = statistics.mean(macros[k]), statistics.stdev(macros[k]) if len(macros[k]) > 1 else 0.0
-        print(f"  {k:>3}  {a_mean*100:8.2f}%  {a_std*100:7.2f}  {m_mean:8.3f}  {m_std:7.3f}")
+        print(f"  {k:>3}  {a_mean*100:6.2f}%  {a_std*100:7.2f}  {b_mean*100:7.2f}%  {m_mean:8.3f}  {m_std:7.3f}")
     print()
 
     # --- detailed pooled report for the best-accuracy k ---

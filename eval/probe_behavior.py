@@ -74,6 +74,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--probe-weight-decay", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=42, help="seed for sampling + train/val split")
     p.add_argument("--n_splits", type=int, default=5, help="Folds for stratified k fold splitting")
+    p.add_argument(
+        "--class-weighted", action=argparse.BooleanOptionalAction, default=True,
+        help="weight the probe loss by inverse class frequency so rare classes aren't ignored",
+    )
     return p.parse_args()
 
 
@@ -193,18 +197,28 @@ def train_probe(
     batch_size: int,
     weight_decay: float,
     device: torch.device,
+    class_weighted: bool = True,
 ) -> tuple[float, float, torch.Tensor, nn.Linear]:
     """train a single nn.Linear with AdamW + cross-entropy; return train_acc,
     val_acc, confusion matrix, and the trained head.
     """
     head = nn.Linear(X_train.size(1), n_classes).to(device)
     opt = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=weight_decay)
-    ce = nn.CrossEntropyLoss()
 
     X_train = X_train.to(device)
     y_train = y_train.to(device)
     X_val = X_val.to(device)
     y_val = y_val.to(device)
+
+    if class_weighted:
+        # weight the loss by inverse class frequency (normalized to mean 1) so the
+        # head can't ignore rare classes -- makes the probe a fair test of whether
+        # the minority-class signal is actually in the embedding.
+        counts = torch.bincount(y_train, minlength=n_classes).float()
+        class_w = counts.sum() / (counts.clamp(min=1) * n_classes)
+        ce = nn.CrossEntropyLoss(weight=class_w)
+    else:
+        ce = nn.CrossEntropyLoss()
 
     n = X_train.size(0)
     gen = torch.Generator(device=device).manual_seed(42)
@@ -235,6 +249,34 @@ def train_probe(
             cm[t, p] += 1
 
     return tr_acc, va_acc, cm, head
+
+
+def macro_f1_from_cm(cm: torch.Tensor) -> tuple[float, list[float]]:
+    """macro-averaged F1 from a confusion matrix (rows=true, cols=pred). classes
+    absent from val are skipped so they don't drag the mean to 0."""
+    per_class: list[float] = []
+    present: list[float] = []
+    for c in range(cm.size(0)):
+        tp = int(cm[c, c])
+        fp = int(cm[:, c].sum()) - tp
+        fn = int(cm[c, :].sum()) - tp
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+        per_class.append(f1)
+        if cm[c, :].sum() > 0:
+            present.append(f1)
+    return (statistics.mean(present) if present else 0.0), per_class
+
+
+def balanced_acc_from_cm(cm: torch.Tensor) -> float:
+    """mean per-class recall over classes present in val (a.k.a. balanced accuracy)."""
+    recalls: list[float] = []
+    for c in range(cm.size(0)):
+        total = int(cm[c, :].sum())
+        if total > 0:
+            recalls.append(int(cm[c, c]) / total)
+    return statistics.mean(recalls) if recalls else 0.0
 
 
 def print_confusion_matrix(cm: torch.Tensor, classes: list[str]) -> None:
@@ -291,6 +333,7 @@ def main() -> None:
     df = df[df['label'] != 'empty']
     df = df.drop(columns = ['timestamp'])
     df = df[df['label'] != 'slug']
+    df = df[df["zarr_path"] != "/groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test49_2024-02-08/mixin49_wellB2_24hr_ERH Red FarRed.zarr"]
     for col in df.columns:
         try:
             df[col] = pd.to_numeric(df[col])
@@ -330,7 +373,7 @@ def main() -> None:
 
     n_classes = len(df['label'].unique())
     chance_pct = 100.0 / n_classes
-    print(f"[probe] n_datasets  : {n_classes}  (chance baseline = {chance_pct:.1f}%)")
+    print(f"[probe] n_classes  : {n_classes}  (chance baseline = {chance_pct:.1f}%)")
     print()
 
     # --- extract embeddings ---
@@ -345,6 +388,7 @@ def main() -> None:
     print()
 
     fold_train_accs, fold_val_accs, fold_cms = [], [], []
+    fold_macro_f1s, fold_bal_accs = [], []
     fold_heads = []  # Store trained heads for later
 
     for fold_idx, (X_train, y_train, X_val, y_val) in enumerate(stratified_group_kfold_split(X, y, list(df['dataset_idx']), args.seed, args.n_splits)):
@@ -363,11 +407,16 @@ def main() -> None:
             batch_size=args.probe_batch_size,
             weight_decay=args.probe_weight_decay,
             device=device,
+            class_weighted=args.class_weighted,
         )
         fold_train_accs.append(tr_acc)
         fold_val_accs.append(va_acc)
         fold_cms.append(cm)
         fold_heads.append((head.cpu(), va_acc))
+        macro, _ = macro_f1_from_cm(cm)
+        bal = balanced_acc_from_cm(cm)
+        fold_macro_f1s.append(macro)
+        fold_bal_accs.append(bal)
 
         # --- fold-specific report ---
         print()
@@ -376,6 +425,8 @@ def main() -> None:
         print("=" * 70)
         print(f"  train_acc        : {tr_acc*100:6.2f}%")
         print(f"  val_acc          : {va_acc*100:6.2f}%   (chance = {chance_pct:.1f}%)")
+        print(f"  balanced_acc     : {bal*100:6.2f}%   (mean per-class recall)")
+        print(f"  macro_F1         : {macro:6.3f}")
         print(f"  val_acc - chance : {(va_acc - 1.0/n_classes)*100:+6.2f} percentage points")
         print_confusion_matrix(cm, sorted(df['label'].unique()))
         print()
@@ -387,19 +438,31 @@ def main() -> None:
     train_std = statistics.stdev(fold_train_accs) if len(fold_train_accs) > 1 else 0.0
     val_mean = statistics.mean(fold_val_accs)
     val_std = statistics.stdev(fold_val_accs) if len(fold_val_accs) > 1 else 0.0
+    macro_mean = statistics.mean(fold_macro_f1s)
+    macro_std = statistics.stdev(fold_macro_f1s) if len(fold_macro_f1s) > 1 else 0.0
+    bal_mean = statistics.mean(fold_bal_accs)
+    bal_std = statistics.stdev(fold_bal_accs) if len(fold_bal_accs) > 1 else 0.0
 
     cm_total = torch.stack(fold_cms).sum(dim=0)
+    pooled_macro, per_class_f1 = macro_f1_from_cm(cm_total)
 
     print()
     print("#" * 70)
     print(f"  CROSS-VALIDATED SUMMARY ({args.n_splits} folds, grouped by zarr volume)")
+    print(f"  class_weighted={args.class_weighted}")
     print("#" * 70)
-    print(f"  train_acc : {train_mean*100:6.2f}%  ± {train_std*100:.2f}  (per-fold: {[f'{a*100:.1f}' for a in fold_train_accs]})")
-    print(f"  val_acc   : {val_mean*100:6.2f}%  ± {val_std*100:.2f}  (per-fold: {[f'{a*100:.1f}' for a in fold_val_accs]})")
+    print(f"  train_acc    : {train_mean*100:6.2f}%  ± {train_std*100:.2f}  (per-fold: {[f'{a*100:.1f}' for a in fold_train_accs]})")
+    print(f"  val_acc      : {val_mean*100:6.2f}%  ± {val_std*100:.2f}  (per-fold: {[f'{a*100:.1f}' for a in fold_val_accs]})")
+    print(f"  balanced_acc : {bal_mean*100:6.2f}%  ± {bal_std*100:.2f}  (mean per-class recall)")
+    print(f"  macro_F1     : {macro_mean:6.3f}  ± {macro_std:.3f}  (per-fold: {[f'{m:.3f}' for m in fold_macro_f1s]})")
     print(f"  val_acc - chance : {(val_mean - 1.0/df['label'].value_counts().max())*100:+6.2f} percentage points")
     print()
     print("  pooled confusion matrix (summed across all folds):")
     print_confusion_matrix(cm_total, sorted(df['label'].unique()))
+    print()
+    print(f"  pooled macro-F1: {pooled_macro:.3f}   per-class F1:")
+    for name, f1 in zip(sorted(df['label'].unique()), per_class_f1):
+        print(f"    {name:30s}  F1={f1:.3f}")
     print()
     print(f"  interpretation: {interpret(val_mean, n_classes)}")
     print("#" * 70)

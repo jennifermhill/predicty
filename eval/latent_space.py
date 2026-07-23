@@ -366,6 +366,24 @@ def preprocess_embeddings(X: np.ndarray, mode: str) -> np.ndarray:
     raise ValueError(f"unknown embedding preprocess mode: {mode}")
 
 
+def _effective_dims(X: np.ndarray) -> tuple[float, float]:
+    """effective dimensionality of an embedding cloud from its full variance
+    spectrum: participation ratio (sum l)^2 / sum l^2, and entropy rank exp(H).
+    both are 'soft counts' of how many directions the variance actually spans
+    (e.g. ~2 of 2048 = collapsed; ~16 of 128 = healthy spread).
+    """
+    Xc = (X - X.mean(axis=0, keepdims=True)).astype(np.float64)
+    sv = np.linalg.svd(Xc, compute_uv=False)     # singular values of centered data
+    ev = sv ** 2                                 # variance along each PC
+    ev = ev[ev > 0]
+    if ev.size == 0 or ev.sum() <= 0:
+        return 0.0, 0.0
+    p = ev / ev.sum()
+    participation = float((ev.sum() ** 2) / (ev ** 2).sum())
+    entropy_rank = float(np.exp(-(p * np.log(p)).sum()))
+    return participation, entropy_rank
+
+
 def print_embedding_diagnostics(X_raw: np.ndarray, X_projected: np.ndarray) -> None:
     norms = np.linalg.norm(X_raw, axis=1)
     feature_var = X_raw.var(axis=0)
@@ -393,6 +411,18 @@ def print_embedding_diagnostics(X_raw: np.ndarray, X_projected: np.ndarray) -> N
         f"PC1={explained_projected[0]*100:.1f}% "
         f"PC2={explained_projected[1]*100 if explained_projected.size > 1 else 0.0:.1f}% "
         f"PC1-10={explained_projected.sum()*100:.1f}%"
+    )
+    part_raw, rank_raw = _effective_dims(X_raw)
+    part_proj, rank_proj = _effective_dims(X_projected)
+    print(
+        "[diagnostics] effective dims raw "
+        f"participation_ratio={part_raw:.1f} entropy_rank={rank_raw:.1f} "
+        f"(of {X_raw.shape[1]} nominal)"
+    )
+    print(
+        "[diagnostics] effective dims after preprocess "
+        f"participation_ratio={part_proj:.1f} entropy_rank={rank_proj:.1f} "
+        f"(of {X_projected.shape[1]} nominal)"
     )
 
 
