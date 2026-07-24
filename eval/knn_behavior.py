@@ -82,7 +82,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", required=True, help="path to a yaml config (same one used for training)")
     p.add_argument("--checkpoint", required=True, help="path to a *.pt file (latest.pt, final.pt, step_*.pt)")
     p.add_argument("--device", default=None, help="override cfg.device (e.g. 'cpu')")
-    p.add_argument("--k-values", type=int, nargs="+", default=[1, 5, 10, 15, 20], help="k values to sweep")
+    p.add_argument("--k-values", type=int, nargs="+", default=[1, 5, 10, 25, 50], help="k values to sweep")
     p.add_argument("--weighted", action="store_true", help="softmax-weighted vote instead of a plain majority")
     p.add_argument("--temperature", type=float, default=0.07, help="softmax temperature for --weighted (DINO default)")
     p.add_argument("--class-balanced", action="store_true", help="divide neighbor votes by train class frequency so rare classes aren't outvoted just for being scarce")
@@ -186,6 +186,7 @@ def main() -> None:
     df = pd.read_json(cfg.annotation_path, lines=True)
     df = df[df["label"] != "empty"]
     df = df.drop(columns=["timestamp"])
+    df = df[df["label"] != "slug"]
     df = df[df["zarr_path"] != "/groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test49_2024-02-08/mixin49_wellB2_24hr_ERH Red FarRed.zarr"]
     for col in df.columns:
         try:

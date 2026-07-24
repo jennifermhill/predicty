@@ -1,4 +1,6 @@
-"""run the full eval suite (latent space + dataset/behavior probes) over runs.
+"""run the full eval suite over runs: latent space, dataset + behavior linear
+probes, non-parametric k-NN behavior eval, and grad-cam + expected-gradients
+attribution.
 
 for each run this visualizes the latent space and runs the two linear probes.
 the dataset probe should fail (the encoder learned dataset-invariant features)
@@ -85,6 +87,17 @@ def main() -> None:
         else:
             print(f"[pipeline] skipped behavior probe for run {run}")
 
+        # non-parametric k-NN behavior eval (no probe .pt needed; it re-extracts embeddings).
+        knn_done = list(run_dir.glob("knn_eval*")) if run_dir else []
+        if run_dir is not None and (not knn_done or not args.check_evaluated):
+            subprocess.run(
+                ["python", "eval/knn_behavior.py", "--config", config, "--checkpoint", checkpoint, "--weighted", "--class-balanced"],
+                check=True,
+            )
+            print(f"[pipeline] knn probe completed for run {run}")
+        else:
+            print(f"[pipeline] skipped knn probe for run {run}")
+
         # grad-cam attribution maps. pass the probe paths from THIS run's dir
         # explicitly so it never auto-detects a stale probe of the wrong latent_dim.
         gradcam_done = list(run_dir.glob("gradcam")) if run_dir else []
@@ -102,6 +115,23 @@ def main() -> None:
             print(f"[pipeline] grad-cam completed for run {run}")
         else:
             print(f"[pipeline] skipped grad-cam for run {run}")
+
+        # expected-gradients attribution. pass this run's probe paths explicitly
+        # (same reason as grad-cam); run_eg auto-places its output in run_dir/eg.
+        eg_done = list(run_dir.glob("eg")) if run_dir else []
+        if run_dir is not None and (not eg_done or not args.check_evaluated):
+            subprocess.run(
+                [
+                    "python", "eval/run_eg.py",
+                    "--config", config, "--checkpoint", checkpoint,
+                    "--behavior-probe", str(run_dir / "behavior_probe.pt"),
+                    "--dataset-probe", str(run_dir / "dataset_probe.pt"),
+                ],
+                check=True,
+            )
+            print(f"[pipeline] expected-gradients completed for run {run}")
+        else:
+            print(f"[pipeline] skipped expected-gradients for run {run}")
 
 
 if __name__ == "__main__":

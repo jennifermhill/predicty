@@ -278,9 +278,9 @@ mae_norm_pix_loss: true
 # ibot_block_size: size of the square block to mask in the feature map in grid cells. 
 # 1 = patch-wise, 2 = 2x2 blocks, etc.
 ibot_enabled: true
-ibot_p: 0.5
+ibot_p: 1.0
 ibot_weight: 0.1
-ibot_mask_ratio: [0.1, 0.5]
+ibot_mask_ratio: [0.4, 0.4]
 ibot_layer: layer4
 ibot_block_size: 2
 
