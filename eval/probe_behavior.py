@@ -75,6 +75,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42, help="seed for sampling + train/val split")
     p.add_argument("--n_splits", type=int, default=5, help="Folds for stratified k fold splitting")
     p.add_argument(
+        "--probe-seeds", type=int, default=3,
+        help="number of probe restarts per fold (seed, seed+1, ...). metrics are "
+        "averaged over restarts and the spread is reported, so run-to-run "
+        "differences smaller than the probe's own variance don't read as signal",
+    )
+    p.add_argument(
+        "--standardize", action=argparse.BooleanOptionalAction, default=True,
+        help="z-score features using train-fold statistics before fitting the head",
+    )
+    p.add_argument(
         "--class-weighted", action=argparse.BooleanOptionalAction, default=True,
         help="weight the probe loss by inverse class frequency so rare classes aren't ignored",
     )
@@ -92,9 +102,27 @@ def disable_augmentations(cfg: Config) -> None:
 
 
 def load_dataset(cfg: Config) -> MultiZarrDataset:
-    df = pd.read_json(cfg.annotation_path, lines=True)
-    cfg.zarr_paths = list(df['zarr_path'].unique())
+    # only fall back to the annotation file when the caller hasn't already
+    # chosen the path list. overwriting it here used to clobber the *filtered*
+    # list main() builds with the unfiltered one, so the extraction loop below
+    # iterated a different set (and a different order) than the labels came from.
+    if not cfg.zarr_paths:
+        df = pd.read_json(cfg.annotation_path, lines=True)
+        cfg.zarr_paths = list(df['zarr_path'].unique())
     ds = MultiZarrDataset(cfg)
+    # MultiZarrDataset silently drops any zarr whose spreadsheet z_limit is
+    # blank, so children[i] is cfg.zarr_paths[i] only when nothing was dropped.
+    # extract_embeddings indexes children positionally, so a drop would attach
+    # labels from one experiment to crops read from another. same guard as
+    # eval/latent_space.py.
+    child_paths = [child.cfg.zarr_path or "" for child in ds.children]
+    if child_paths != list(cfg.zarr_paths):
+        missing = [p for p in cfg.zarr_paths if p not in child_paths]
+        raise RuntimeError(
+            "ds.children order doesn't match cfg.zarr_paths -- positional "
+            "lookup would read crops from the wrong zarr. dropped/reordered: "
+            f"{missing}"
+        )
     return ds
 
 
@@ -139,6 +167,12 @@ def extract_embeddings(
             labels.append(label_idx)
             rows.append({
                 "label_idx": label_idx,
+                # group id in X row order. the caller must build fold groups
+                # from this, NOT from the annotation dataframe's row order:
+                # X is filled zarr-by-zarr here, while index.jsonl interleaves
+                # zarrs (500 rows / 18 zarrs / 37 contiguous blocks), so
+                # df['dataset_idx'][i] does not describe X[i].
+                "dataset_idx": i,
                 "t": int(meta["t1"]),
                 "z": int(meta["z"]),
                 "global_y": int(meta["global_y"]),
@@ -198,10 +232,20 @@ def train_probe(
     weight_decay: float,
     device: torch.device,
     class_weighted: bool = True,
+    seed: int = 42,
+    standardize: bool = True,
+    verbose: bool = True,
 ) -> tuple[float, float, torch.Tensor, nn.Linear]:
     """train a single nn.Linear with AdamW + cross-entropy; return train_acc,
     val_acc, confusion matrix, and the trained head.
+
+    `seed` controls both the head init and the minibatch sampler, so repeated
+    calls at different seeds give an honest estimate of probe-restart variance
+    (previously the init came from the unseeded global RNG and the sampler was
+    hardcoded to 42, so runs were neither reproducible nor averageable).
     """
+    # seed before constructing the head so its init is reproducible.
+    torch.manual_seed(seed)
     head = nn.Linear(X_train.size(1), n_classes).to(device)
     opt = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=weight_decay)
 
@@ -209,6 +253,17 @@ def train_probe(
     y_train = y_train.to(device)
     X_val = X_val.to(device)
     y_val = y_val.to(device)
+
+    if standardize:
+        # standardize with TRAIN-FOLD statistics only. raw encoder features have
+        # per-dimension scales that differ by orders of magnitude, so a single
+        # fixed lr for a fixed step budget conflates "the embedding doesn't
+        # separate behaviors" with "the head never converged". kNN gets this for
+        # free through cosine similarity; the linear probe did not.
+        mu = X_train.mean(dim=0, keepdim=True)
+        sd = X_train.std(dim=0, keepdim=True).clamp(min=1e-6)
+        X_train = (X_train - mu) / sd
+        X_val = (X_val - mu) / sd
 
     if class_weighted:
         # weight the loss by inverse class frequency (normalized to mean 1) so the
@@ -221,7 +276,7 @@ def train_probe(
         ce = nn.CrossEntropyLoss()
 
     n = X_train.size(0)
-    gen = torch.Generator(device=device).manual_seed(42)
+    gen = torch.Generator(device=device).manual_seed(seed)
 
     for step in range(probe_steps):
         idx = torch.randint(0, n, (batch_size,), device=device, generator=gen)
@@ -231,7 +286,7 @@ def train_probe(
         loss.backward()
         opt.step()
 
-        if step == 0 or (step + 1) % max(1, probe_steps // 10) == 0:
+        if verbose and (step == 0 or (step + 1) % max(1, probe_steps // 10) == 0):
             with torch.no_grad():
                 tr_acc = (head(X_train).argmax(1) == y_train).float().mean().item()
                 va_acc = (head(X_val).argmax(1) == y_val).float().mean().item()
@@ -390,31 +445,72 @@ def main() -> None:
     fold_train_accs, fold_val_accs, fold_cms = [], [], []
     fold_macro_f1s, fold_bal_accs = [], []
     fold_heads = []  # Store trained heads for later
+    # every (fold, probe restart) pair, for the run-level variance report.
+    all_val_accs, all_macro_f1s = [], []
 
-    for fold_idx, (X_train, y_train, X_val, y_val) in enumerate(stratified_group_kfold_split(X, y, list(df['dataset_idx']), args.seed, args.n_splits)):
+    # groups must come from `rows`, which is in X order. df['dataset_idx'] is in
+    # annotation-file row order, which interleaves zarrs, so using it made
+    # StratifiedGroupKFold group on the wrong rows and the "leave-experiment-out"
+    # split degenerated into a near-random one.
+    groups = [r["dataset_idx"] for r in rows]
+
+    probe_seeds = [args.seed + s for s in range(max(1, args.probe_seeds))]
+    print(f"[probe] probe restarts per fold: {len(probe_seeds)}  (seeds {probe_seeds})")
+    print()
+
+    for fold_idx, (X_train, y_train, X_val, y_val) in enumerate(stratified_group_kfold_split(X, y, groups, args.seed, args.n_splits)):
         print(f"[probe] fold {fold_idx+1}/{args.n_splits}  (grouped by zarr volume, stratified by label)")
         print(f"[probe] train n={X_train.size(0)}  counts={torch.bincount(y_train, minlength=n_classes).tolist()}")
         print(f"[probe] val   n={X_val.size(0)}  counts={torch.bincount(y_val,   minlength=n_classes).tolist()}")
         print()
 
-        # --- train probe ---
+        # --- train probe (once per restart seed; metrics averaged) ---
         print(f"[probe] training linear head (in_dim={cfg.latent_dim}, out_dim={n_classes})...")
-        tr_acc, va_acc, cm, head = train_probe(
-            X_train, y_train, X_val, y_val,
-            n_classes=n_classes,
-            probe_steps=args.probe_steps,
-            lr=args.probe_lr,
-            batch_size=args.probe_batch_size,
-            weight_decay=args.probe_weight_decay,
-            device=device,
-            class_weighted=args.class_weighted,
-        )
+        seed_tr, seed_va, seed_macro, seed_bal = [], [], [], []
+        cm = torch.zeros(n_classes, n_classes, dtype=torch.long)
+        head = None
+        for s_i, probe_seed in enumerate(probe_seeds):
+            tr_s, va_s, cm_s, head_s = train_probe(
+                X_train, y_train, X_val, y_val,
+                n_classes=n_classes,
+                probe_steps=args.probe_steps,
+                lr=args.probe_lr,
+                batch_size=args.probe_batch_size,
+                weight_decay=args.probe_weight_decay,
+                device=device,
+                class_weighted=args.class_weighted,
+                seed=probe_seed,
+                standardize=args.standardize,
+                verbose=(s_i == 0),
+            )
+            macro_s, _ = macro_f1_from_cm(cm_s)
+            bal_s = balanced_acc_from_cm(cm_s)
+            seed_tr.append(tr_s)
+            seed_va.append(va_s)
+            seed_macro.append(macro_s)
+            seed_bal.append(bal_s)
+            all_val_accs.append(va_s)
+            all_macro_f1s.append(macro_s)
+            cm = cm + cm_s
+            if s_i == 0:
+                head = head_s
+            if len(probe_seeds) > 1:
+                print(
+                    f"  [probe] restart seed={probe_seed}  val_acc={va_s:.3f}  "
+                    f"macro_F1={macro_s:.3f}"
+                )
+
+        tr_acc = statistics.mean(seed_tr)
+        va_acc = statistics.mean(seed_va)
+        macro = statistics.mean(seed_macro)
+        bal = statistics.mean(seed_bal)
+        va_sd = statistics.stdev(seed_va) if len(seed_va) > 1 else 0.0
+        macro_sd = statistics.stdev(seed_macro) if len(seed_macro) > 1 else 0.0
+
         fold_train_accs.append(tr_acc)
         fold_val_accs.append(va_acc)
         fold_cms.append(cm)
         fold_heads.append((head.cpu(), va_acc))
-        macro, _ = macro_f1_from_cm(cm)
-        bal = balanced_acc_from_cm(cm)
         fold_macro_f1s.append(macro)
         fold_bal_accs.append(bal)
 
@@ -422,11 +518,12 @@ def main() -> None:
         print()
         print("=" * 70)
         print(f"  FOLD {fold_idx+1}/{args.n_splits} RESULT @ training step {step}")
+        print(f"  (mean over {len(probe_seeds)} probe restart(s))")
         print("=" * 70)
         print(f"  train_acc        : {tr_acc*100:6.2f}%")
-        print(f"  val_acc          : {va_acc*100:6.2f}%   (chance = {chance_pct:.1f}%)")
+        print(f"  val_acc          : {va_acc*100:6.2f}%  ± {va_sd*100:.2f}   (chance = {chance_pct:.1f}%)")
         print(f"  balanced_acc     : {bal*100:6.2f}%   (mean per-class recall)")
-        print(f"  macro_F1         : {macro:6.3f}")
+        print(f"  macro_F1         : {macro:6.3f}  ± {macro_sd:.3f}")
         print(f"  val_acc - chance : {(va_acc - 1.0/n_classes)*100:+6.2f} percentage points")
         print_confusion_matrix(cm, sorted(df['label'].unique()))
         print()
@@ -455,9 +552,24 @@ def main() -> None:
     print(f"  val_acc      : {val_mean*100:6.2f}%  ± {val_std*100:.2f}  (per-fold: {[f'{a*100:.1f}' for a in fold_val_accs]})")
     print(f"  balanced_acc : {bal_mean*100:6.2f}%  ± {bal_std*100:.2f}  (mean per-class recall)")
     print(f"  macro_F1     : {macro_mean:6.3f}  ± {macro_std:.3f}  (per-fold: {[f'{m:.3f}' for m in fold_macro_f1s]})")
-    print(f"  val_acc - chance : {(val_mean - 1.0/df['label'].value_counts().max())*100:+6.2f} percentage points")
+    # two baselines, because uniform chance is the wrong one for an imbalanced
+    # set: always predicting the largest class already gets majority_pct.
+    label_counts = df['label'].value_counts()
+    majority_pct = 100.0 * label_counts.max() / label_counts.sum()
+    print(f"  val_acc - uniform chance ({chance_pct:.1f}%)   : {(val_mean - 1.0/n_classes)*100:+6.2f} percentage points")
+    print(f"  val_acc - majority class ({majority_pct:.1f}%) : {(val_mean*100 - majority_pct):+6.2f} percentage points")
+    print(f"    (majority baseline = always predict '{label_counts.idxmax()}'; macro_F1 and")
+    print(f"     balanced_acc are the metrics to compare across runs, not val_acc)")
+    if len(all_val_accs) > 1:
+        # spread over every (fold, restart) pair: the floor below which a
+        # run-to-run difference is not distinguishable from probe noise.
+        va_all_sd = statistics.stdev(all_val_accs)
+        mf1_all_sd = statistics.stdev(all_macro_f1s)
+        print()
+        print(f"  probe/fold noise ({len(all_val_accs)} fits): val_acc sd={va_all_sd*100:.2f}pp  macro_F1 sd={mf1_all_sd:.3f}")
+        print(f"  -> treat differences below ~{2*va_all_sd*100:.1f}pp val_acc / {2*mf1_all_sd:.3f} macro_F1 as noise")
     print()
-    print("  pooled confusion matrix (summed across all folds):")
+    print(f"  pooled confusion matrix (summed across all folds x {len(probe_seeds)} restart(s)):")
     print_confusion_matrix(cm_total, sorted(df['label'].unique()))
     print()
     print(f"  pooled macro-F1: {pooled_macro:.3f}   per-class F1:")

@@ -244,8 +244,14 @@ def main() -> None:
     bals = {k: [] for k in args.k_values}
     cms = {k: torch.zeros(n_classes, n_classes, dtype=torch.long) for k in args.k_values}
 
+    # groups come from `rows` (X order), not df["dataset_idx"] (annotation-file
+    # row order). extract_embeddings fills X zarr-by-zarr while index.jsonl
+    # interleaves zarrs, so the df ordering grouped the wrong rows and the
+    # leave-experiment-out split degenerated into a near-random one.
+    groups = [r["dataset_idx"] for r in rows]
+
     for fold_idx, (X_train, y_train, X_val, y_val) in enumerate(
-        stratified_group_kfold_split(X, y, list(df["dataset_idx"]), args.seed, args.n_splits)
+        stratified_group_kfold_split(X, y, groups, args.seed, args.n_splits)
     ):
         print(f"[knn] fold {fold_idx+1}/{args.n_splits}  (grouped by zarr volume, stratified by label)")
         print(f"[knn] train n={X_train.size(0)}  val n={X_val.size(0)}")
