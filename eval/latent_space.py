@@ -8,9 +8,18 @@ Usage:
     python eval/latent_space.py --config configs/train.yaml --checkpoint checkpoints/latest.pt --n-crops 20000 --method umap
 
 Outputs:
-    <out-dir>/embeddings.npz         raw embeddings + 2D coords per method + labels
+    <out-dir>/embeddings.npz         raw embeddings + 2D/3D coords per method + labels
     <out-dir>/<method>/metadata.csv  crop metadata + that method's coords per point
     <out-dir>/<method>/latent_by_*.png  scatter plots colored by metadata fields
+
+each metadata.csv carries both a 2D and a 3D projection per point:
+coord_x/coord_y from the 2D fit (what eval/interactive_latent_viewer.py reads)
+and coord_x3/coord_y3/coord_z3 from a 3D fit (what
+eval/interactive_latent_viewer_3d.py reads). PCA gets both from one
+decomposition because its components are nested -- the 2D coords are literally
+the first two columns of the 3D fit. UMAP/t-SNE are *not* nested, so a
+n_components=3 fit is a genuinely separate (and separately-priced) run whose x/y
+do not match the 2D fit; pass --no-3d to skip it.
 
 PCA always runs so every report has a deterministic, variance-faithful view.
 when umap-learn (or scikit-learn for t-SNE) is installed, that manifold method
@@ -69,6 +78,17 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "umap", "tsne", "pca"),
         default="auto",
         help="2D projection method. auto tries UMAP, then t-SNE, then PCA.",
+    )
+    p.add_argument(
+        "--no-3d",
+        dest="make_3d",
+        action="store_false",
+        help=(
+            "skip the 3D projection. by default each method also produces "
+            "coord_x3/coord_y3/coord_z3 for eval/interactive_latent_viewer_3d.py. "
+            "PCA's 3D fit is free (nested components) but UMAP/t-SNE need a "
+            "second fit, roughly doubling projection time."
+        ),
     )
     p.add_argument("--pca-dim", type=int, default=50, help="pre-reduction dim for UMAP/t-SNE")
     p.add_argument("--umap-neighbors", type=int, default=30)
@@ -465,8 +485,10 @@ def resolve_methods(method: str) -> list[str]:
     return ["pca"] if manifold == "pca" else [manifold, "pca"]
 
 
-def project_single(args: argparse.Namespace, X: np.ndarray, method: str) -> np.ndarray:
-    """project preprocessed embeddings X to 2D with one named method."""
+def project_single(
+    args: argparse.Namespace, X: np.ndarray, method: str, n_components: int = 2
+) -> np.ndarray:
+    """project preprocessed embeddings X to n_components dims with one method."""
     if method == "umap":
         try:
             import umap  # type: ignore
@@ -474,7 +496,7 @@ def project_single(args: argparse.Namespace, X: np.ndarray, method: str) -> np.n
             raise RuntimeError("UMAP requested but umap-learn is not installed") from e
         X_red = reduce_for_manifold(X, args.pca_dim)
         reducer = umap.UMAP(
-            n_components=2,
+            n_components=n_components,
             n_neighbors=args.umap_neighbors,
             min_dist=args.umap_min_dist,
             metric="euclidean",
@@ -489,8 +511,13 @@ def project_single(args: argparse.Namespace, X: np.ndarray, method: str) -> np.n
             raise RuntimeError("t-SNE requested but scikit-learn is not installed") from e
         X_red = reduce_for_manifold(X, args.pca_dim)
         perplexity = min(args.tsne_perplexity, max(5.0, (X.shape[0] - 1) / 3))
+        # barnes_hut (the default) only supports n_components < 4, which covers
+        # both 2D and 3D; be explicit so a future bump fails loudly instead of
+        # silently switching to the O(n^2) exact solver.
+        if n_components >= 4:
+            raise ValueError("t-SNE here supports at most 3 components")
         reducer = TSNE(
-            n_components=2,
+            n_components=n_components,
             perplexity=perplexity,
             init="pca",
             learning_rate="auto",
@@ -499,20 +526,71 @@ def project_single(args: argparse.Namespace, X: np.ndarray, method: str) -> np.n
         return reducer.fit_transform(X_red)
 
     if method == "pca":
-        coords, explained = pca_project(X, 2)
-        print(f"[project] PCA explained variance in 2D: {explained.sum()*100:.1f}%")
+        coords, explained = pca_project(X, n_components)
+        print(
+            f"[project] PCA explained variance in {n_components}D: "
+            f"{explained.sum()*100:.1f}%"
+        )
         return coords
 
     raise ValueError(f"unknown projection method: {method}")
 
 
-def write_metadata_csv(path: Path, rows: list[dict[str, Any]], coords: np.ndarray) -> None:
-    fieldnames = ["coord_x", "coord_y"] + list(rows[0].keys())
+def project_2d_and_3d(
+    args: argparse.Namespace, X: np.ndarray, method: str
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """2D coords and (optionally) 3D coords for one projection method.
+
+    PCA components are nested, so one q=3 decomposition yields both views and
+    the 2D coords are exactly its first two columns -- no second fit, no risk of
+    the two views disagreeing. UMAP and t-SNE optimize a fixed-dimension
+    objective, so their 3D embedding is unrelated to their 2D one (x/y included)
+    and genuinely requires a second fit.
+    """
+    if not args.make_3d:
+        return project_single(args, X, method, 2), None
+
+    if method == "pca":
+        coords3 = project_single(args, X, method, 3)
+        return coords3[:, :2], coords3
+
+    coords2 = project_single(args, X, method, 2)
+    print(f"[project] {method}: fitting a separate 3D embedding (not nested in the 2D one)")
+    coords3 = project_single(args, X, method, 3)
+    return coords2, coords3
+
+
+def write_metadata_csv(
+    path: Path,
+    rows: list[dict[str, Any]],
+    coords: np.ndarray,
+    coords3: np.ndarray | None = None,
+) -> None:
+    """one row per point with the 2D coords first, then the optional 3D coords.
+
+    coord_x/coord_y keep their exact original meaning so
+    eval/interactive_latent_viewer.py is unaffected; the 3D fit lives in
+    separate coord_x3/coord_y3/coord_z3 columns rather than adding a bare
+    coord_z, because for UMAP/t-SNE the 3D fit's x/y differ from the 2D fit's
+    and mixing them would silently plot a hybrid that exists in neither.
+    """
+    coord_fields = ["coord_x", "coord_y"]
+    if coords3 is not None:
+        coord_fields += ["coord_x3", "coord_y3", "coord_z3"]
+    fieldnames = coord_fields + list(rows[0].keys())
     with path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        for row, xy in zip(rows, coords):
-            writer.writerow({"coord_x": float(xy[0]), "coord_y": float(xy[1]), **row})
+        for i, (row, xy) in enumerate(zip(rows, coords)):
+            record: dict[str, Any] = {
+                "coord_x": float(xy[0]),
+                "coord_y": float(xy[1]),
+            }
+            if coords3 is not None:
+                record["coord_x3"] = float(coords3[i, 0])
+                record["coord_y3"] = float(coords3[i, 1])
+                record["coord_z3"] = float(coords3[i, 2])
+            writer.writerow({**record, **row})
 
 
 def save_npz(
@@ -520,6 +598,7 @@ def save_npz(
     X: np.ndarray,
     coords_by_method: dict[str, np.ndarray],
     rows: list[dict[str, Any]],
+    coords3_by_method: dict[str, np.ndarray] | None = None,
 ) -> None:
     dataset_idx_arr = np.asarray([r["dataset_idx"] for r in rows], dtype=np.int64)
     t = np.asarray([r["t"] for r in rows], dtype=np.int64)
@@ -537,9 +616,13 @@ def save_npz(
         "label": label,
     }
     # one coords_<method> array per projection so downstream tools can load
-    # any view from a single file.
+    # any view from a single file. coords_<method>_3d holds the 3D fit, which
+    # the 3D viewer checks metadata.csv against the same way the 2D viewer
+    # checks coords_<method>.
     for method, coords in coords_by_method.items():
         arrays[f"coords_{method}"] = coords.astype(np.float32)
+    for method, coords in (coords3_by_method or {}).items():
+        arrays[f"coords_{method}_3d"] = coords.astype(np.float32)
     np.savez_compressed(path, **arrays)
 
 
@@ -774,6 +857,7 @@ def main() -> None:
     print(f"[latent] out_dir    : {out_dir}")
     print(f"[latent] n_crops    : {args.n_crops}")
     print(f"[latent] views      : {args.views}")
+    print(f"[latent] 3D coords  : {'yes' if args.make_3d else 'no (--no-3d)'}")
 
     cache_path = out_dir / "embeddings.npz"
     if cache_path.exists():
@@ -809,18 +893,22 @@ def main() -> None:
     print(f"[latent] projection methods: {', '.join(methods)}")
 
     coords_by_method: dict[str, np.ndarray] = {}
+    coords3_by_method: dict[str, np.ndarray] = {}
     for method in methods:
-        coords = project_single(args, X_projected, method)
+        coords, coords3 = project_2d_and_3d(args, X_projected, method)
         print(f"[latent] projection {method}: coords={coords.shape}")
         coords_by_method[method] = coords
+        if coords3 is not None:
+            print(f"[latent] projection {method} 3D: coords={coords3.shape}")
+            coords3_by_method[method] = coords3
         method_dir = out_dir / method
         method_dir.mkdir(parents=True, exist_ok=True)
-        write_metadata_csv(method_dir / "metadata.csv", rows, coords)
+        write_metadata_csv(method_dir / "metadata.csv", rows, coords, coords3)
         save_plots(coords, rows, method_dir, args.plot_size, method)
         print(f"[metrics] {method} projection:")
         maybe_print_cluster_metrics(coords, rows)
 
-    save_npz(out_dir / "embeddings.npz", X, coords_by_method, rows)
+    save_npz(out_dir / "embeddings.npz", X, coords_by_method, rows, coords3_by_method)
 
     plot_annotations(X_projected, rows, out_dir, args)
 
