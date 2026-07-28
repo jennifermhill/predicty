@@ -68,6 +68,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
+        "--output-dir",
+        default=None,
+        help="where to save visualizations (default: latent_space/gradcam_<timestamp>)",
+    )
+    p.add_argument(
         "--cam-3d",
         action="store_true",
         help=(
@@ -394,21 +399,28 @@ def main() -> None:
 
     print(f"[gradcam] encoder loaded from step {ckpt.get('step', 'unknown')}")
 
-    # Auto-detect probe checkpoints from latent_space directory
+    # Auto-detect probe checkpoints from the latent_space directory. prefer the
+    # probe from THIS run's own dir (its input_dim matches this encoder); fall back
+    # to the most recently MODIFIED probe. NB: a plain name sort is wrong here --
+    # letter-prefixed run names (e.g. "final_...") sort above digit-prefixed ones,
+    # so `sorted(..., reverse=True)` would grab a stale probe of the wrong latent_dim.
+    run_name = Path(args.checkpoint).parent.name
+    latent_dir = Path("latent_space")
+
+    def _autodetect_probe(kind: str):
+        if not latent_dir.exists():
+            return None
+        matches = sorted(latent_dir.glob(f"{run_name}*/{kind}.pt"),
+                         key=lambda p: p.stat().st_mtime, reverse=True)
+        if not matches:  # no probe for this run yet; fall back to newest anywhere
+            matches = sorted(latent_dir.glob(f"*/{kind}.pt"),
+                             key=lambda p: p.stat().st_mtime, reverse=True)
+        return matches[0] if matches else None
+
     if args.behavior_probe is None:
-        # Look for most recent behavior probe
-        latent_dir = Path("latent_space")
-        if latent_dir.exists():
-            behavior_probes = sorted(latent_dir.glob("*/behavior_probe.pt"), reverse=True)
-            if behavior_probes:
-                args.behavior_probe = behavior_probes[0]
+        args.behavior_probe = _autodetect_probe("behavior_probe")
     if args.dataset_probe is None:
-        # Look for most recent dataset probe
-        latent_dir = Path("latent_space")
-        if latent_dir.exists():
-            dataset_probes = sorted(latent_dir.glob("*/dataset_probe.pt"), reverse=True)
-            if dataset_probes:
-                args.dataset_probe = dataset_probes[0]
+        args.dataset_probe = _autodetect_probe("dataset_probe")
 
     # Load probes
     behavior_head = None
@@ -450,8 +462,18 @@ def main() -> None:
         print("[gradcam] WARNING: no samples extracted. check dataset configuration or zarr paths.")
         return
 
-    # Output directory
-    output_dir = Path("latent_space") / f"gradcam_{time.strftime('%Y%m%d_%H%M%S')}"
+    # Output directory. defaults to a "gradcam" subfolder inside THIS run's own
+    # latent_space folder (next to the probes), so outputs stay grouped per run
+    # and the redundant-run check can find them. an explicit --output-dir wins.
+    if args.output_dir:
+        output_dir = Path(args.output_dir)
+    else:
+        run_dirs = sorted(
+            (p for p in latent_dir.glob(f"{run_name}*") if p.is_dir()),
+            key=lambda p: p.stat().st_mtime, reverse=True,
+        )
+        base = run_dirs[0] if run_dirs else latent_dir / f"{run_name}_{time.strftime('%Y%m%d_%H%M%S')}"
+        output_dir = base / "gradcam"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Run Grad-CAM

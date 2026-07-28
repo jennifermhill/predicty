@@ -226,6 +226,14 @@ class Config:
     mae_decoder_depth: int = 2
     mae_norm_pix_loss: bool = True
 
+
+    # ---------------------------------------------------------------------------
+    # Koleo auxiliary loss
+    # ---------------------------------------------------------------------------
+
+    koleo_enabled: bool = False
+    koleo_weight: float = 0.1     # DINOv2's value
+
     # ------------------------------------------------------------------
     # iBOT masking-based self-supervised objective
     # ------------------------------------------------------------------
@@ -236,16 +244,19 @@ class Config:
     # mutually exclusive: when iBOT is on, MAE is force-disabled (see
     # __post_init__) so only one masked encoder forward runs per step.
     ibot_enabled: bool = False
+    ibot_p: float = 0.5
     ibot_weight: float = 1.0
-    ibot_mask_ratio: float = 0.75
-    ibot_patch_z: int = 2
-    ibot_patch_size: int = 16
+    ibot_mask_ratio: tuple = (0.1, 0.5)
+    # samples uniformly from this range each step. 0.1 = 10% of tokens masked, 0.5 = 50%.
+    ibot_layer: str = "layer4"
+    ibot_block_size: int = 2
 
     # ------------------------------------------------------------------
     # optimizer / schedule
     # ------------------------------------------------------------------
     base_lr: float = 2.5e-4
-    weight_decay: float = 0.04
+    weight_decay_start: float = 0.04
+    weight_decay_end: float = 0.4
     grad_clip_norm: float = 1.0
     # fraction of total_steps spent in linear warmup. rest is cosine decay.
     warmup_frac: float = 0.15

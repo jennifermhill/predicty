@@ -169,8 +169,8 @@ aug_noise:
 aug_blur:
   enabled: true
   p: 0.7
-  sigma_range: [0.1, 3.0]
-  kernel_size: 5
+  sigma_range: [0.1, 2.0]
+  kernel_size: 13
 
 # per-crop z-score normalization. applied last so each crop has zero mean,
 # unit variance regardless of upstream brightness shifts.
@@ -180,13 +180,13 @@ aug_percrop_norm:
 
 # random horizontal/vertical flips. semantically preserving for cell behavior.
 aug_flip:
-  enabled: false
+  enabled: true
   p: 0.5
 
 # random 90-degree rotations. semantically preserving for cell behavior.
 aug_rotation:
-  enabled: false
-  p: 0.5
+  enabled: true
+  p: 0.75
 
 # ---------------------------------------------------------------------------
 # runtime
@@ -195,7 +195,7 @@ aug_rotation:
 # to fetch crops in parallel. each worker reopens its own zarr handle and
 # pulls samples independently, then hands batches back to the main process.
 # 0 means "load in the main process" (slower but easier to debug).
-num_workers: 6
+num_workers: 22
 
 # seed: base integer used to make sampling reproducible. each worker derives
 # its own rng from (seed + worker_id), and numpy/torch are seeded the same way.
@@ -207,12 +207,14 @@ seed: 0
 # ---------------------------------------------------------------------------
 # stem_channels: channels handed from the 3D stem into the 2D ResNet-50.
 # latent_dim:    ResNet-50 pre-classifier output (the encoder representation).
+# encoder_chunk_size: number of crops through the encoder at once. larger -> more memory, but faster.
 # projector_*:   DINO head sitting on top of the encoder during training.
 #                discarded after training; only the encoder ships.
 stem_channels: 64
-latent_dim: 2048
+latent_dim: 128 # reduced dimensionality since microscopy data is less complex than ImageNet.
+encoder_chunk_size: 32
 projector_hidden: 512
-projector_bottleneck: 256
+projector_bottleneck: 64
 projector_k: 2048
 
 # ---------------------------------------------------------------------------
@@ -247,7 +249,7 @@ center_momentum: 0.9
 dataset_adversary_enabled: true
 dataset_adversary_weight: 0.02
 dataset_adversary_grl_start: 0.0
-dataset_adversary_grl_scale: 1.0
+dataset_adversary_grl_scale: 2.0
 dataset_adversary_hidden: 256
 dataset_adversary_dropout: 0.1
 
@@ -256,7 +258,7 @@ dataset_adversary_dropout: 0.1
 # ---------------------------------------------------------------------------
 # auxiliary global-crop reconstruction. the shared encoder sees patch-masked
 # crops; the training-only decoder predicts masked voxel patches.
-mae_enabled: true
+mae_enabled: false
 mae_weight: 0.05
 mae_mask_ratio: 0.75
 mae_patch_z: 2
@@ -271,9 +273,16 @@ mae_norm_pix_loss: true
 # auxiliary global-crop reconstruction with different masking strategy than MAE.
 # uses block-wise masking instead of patch-wise for more spatial coherence.
 # mutually exclusive with mae: enabling this force-disables mae_enabled above.
+# ibot_layer: which ResNet layer to extract features from for the iBOT loss. 
+# layer1 = 64x64, layer2 = 32x32, layer3 = 16x16, layer4 = 8x8.
+# ibot_block_size: size of the square block to mask in the feature map in grid cells. 
+# 1 = patch-wise, 2 = 2x2 blocks, etc.
 ibot_enabled: true
+ibot_p: 1.0
 ibot_weight: 0.1
-ibot_mask_ratio: 0.75
+ibot_mask_ratio: [0.4, 0.4]
+ibot_layer: layer4
+ibot_block_size: 2
 
 # ---------------------------------------------------------------------------
 # optimizer / LR schedule
@@ -282,10 +291,26 @@ ibot_mask_ratio: 0.75
 # weight_decay:   applied to weight matrices only (biases / norm scales excluded).
 # grad_clip_norm: clip gradient L2 norm to this value before each optimizer step.
 # warmup_frac:    fraction of total_steps spent in linear warmup. cosine after.
-base_lr: 3.5e-5
-weight_decay: 0.04
-grad_clip_norm: 1.0
+base_lr: 1.25e-4
+weight_decay_start: 0.04
+weight_decay_end: 0.4
+grad_clip_norm: 3.0
 warmup_frac: 0.1
+
+
+# ---------------------------------------------------------------------------
+# Koleo auxiliary loss
+# ---------------------------------------------------------------------------
+# The post-hoc decoder revealed that the encoder features collapse onto a tiny
+# fraction of the available directions (~1.5 effective dims out of 2048). KoLeo
+# (from DINOv2) is an auxiliary loss that spreads the batch of embeddings apart:
+# the Kozachenko-Leonenko entropy estimator, computed as the negative mean log of
+# each embedding's distance to its nearest neighbor. minimizing it pushes every
+# crop away from its closest neighbor, so the encoder is nudged to use more of the
+# feature space. applied to L2-normalized features, split per view.
+
+koleo_enabled: true
+koleo_weight: 0.05     # DINOv2's value was 0.1
 
 # ---------------------------------------------------------------------------
 # training loop
@@ -297,8 +322,8 @@ warmup_frac: 0.1
 #                plus a `latest.pt` symlink-style copy.
 # device:        'cuda' for HPC GPU, 'cpu' for local smoke tests.
 # use_amp:       fp16 autocast on cuda. silently disabled on cpu.
-batch_size: 40
-total_steps: 5000
+batch_size: 64
+total_steps: 10000
 log_interval: 50
 ckpt_interval: 500
 device: cuda

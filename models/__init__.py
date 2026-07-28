@@ -2,7 +2,7 @@
 
 from models.dino import DINOHead, DINOWrapper, StudentNet, dino_loss
 from models.encoder import HybridEncoder
-from models.mae import MaskedPatchAutoencoder
+from models.ibot import MaskedPatchAutoencoder
 
 __all__ = [
     "HybridEncoder",

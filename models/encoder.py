@@ -137,6 +137,38 @@ class HybridEncoder(nn.Module):
                 dim=0,
             )
         return self._run(x)
+    
+    def _forward_tokens_impl(self, x, layer):
+        x = self.stem(x)
+        x = self.z_pool(x).squeeze(2)
+        b = self.backbone
+        x = b.conv1(x); x = b.bn1(x); x = b.relu(x); x = b.maxpool(x)
+        x = b.layer1(x)
+        if layer == "layer1":
+            return x
+        x = b.layer2(x)
+        if layer == "layer2":
+            return x
+        x = b.layer3(x)
+        if layer == "layer3":
+            return x
+        return b.layer4(x)
+
+    def _run_tokens(self, x, layer):
+        # recompute stem+backbone in backward instead of storing activations
+        # (same trick as _run); this is what kills the iBOT memory spike.
+        if self.training:
+            return checkpoint(self._forward_tokens_impl, x, layer, use_reentrant=False)
+        return self._forward_tokens_impl(x, layer)
+
+    def forward_tokens(self, x, layer="layer4"):
+        # chunk like forward() so the stem never materializes all crops at once
+        if self.chunk_size is not None and x.shape[0] > self.chunk_size:
+            return torch.cat(
+                [self._run_tokens(chunk, layer) for chunk in x.split(self.chunk_size, dim=0)],
+                dim=0,
+            )
+        return self._run_tokens(x, layer)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,8 @@
-"""masked patch reconstruction head for the WS-DINO encoder.
-
-training-only auxiliary objective. masks patchified global crops, encodes the
-masked crop with the shared student encoder, and predicts the original masked
-patch values from the resulting representation. the decoder is discarded after
-training.
+"""
+utils for the masking objective (currently iBOT applied to a Resnet50 backbone): 
+patch-level masked reconstruction of feature maps from a shared encoder. 
+the encoder is frozen and the decoder is trained to reconstruct
+the masked patches from the unmasked ones. the loss is evaluated only on masked patches
 """
 
 from __future__ import annotations
@@ -13,6 +12,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+import random
 
 
 def _trunc_normal_(x: torch.Tensor, std: float = 0.02) -> None:
@@ -45,6 +46,24 @@ def _reconstruction_metrics(
     rel_l2 = ss_res.sqrt() / target.norm().clamp(min=1e-8)
     return r2, corr, rel_l2
 
+def make_block_mask(
+    N: int, grid: int = 8, ratio: float = 0.4, block: int = 2, device: torch.device = "cpu"
+) -> torch.Tensor:
+    target = round(ratio * grid * grid)
+    mask = torch.zeros(N, grid, grid, dtype=torch.bool, device=device)
+    for i in range(N):
+        while mask[i].sum() < target:
+            x = torch.randint(0, grid - block + 1, (1,), device=device)
+            y = torch.randint(0, grid - block + 1, (1,), device=device)
+            mask[i, x : x + block, y : y + block] = True
+    return mask.reshape(N, grid * grid)
+
+def apply_grid_mask(x, mask, grid: int = 8):
+    N, _, Z, H, W = x.shape
+    cell = H // grid
+    m = mask.view(N, grid, grid)
+    m = m.repeat_interleave(cell, dim=1).repeat_interleave(cell, dim=2)
+    return x.masked_fill(m[:, None, None], 0.0)
 
 def make_random_mask(
     batch_size: int, n_patches: int, mask_ratio: float, device: torch.device

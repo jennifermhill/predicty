@@ -15,9 +15,9 @@
 # -J/-oo/-eo are overridden per-run by launch.sh; the values here are only the
 # fallback for a raw `bsub < submit_resume.sh` (run name defaults to 'default').
 #BSUB -J predicty_resume              # job name (shows in bjobs)
-#BSUB -q gpu_h200                     # H200 queue: 12 slots/GPU, 40GB ram/slot, 141GB VRAM
-#BSUB -gpu "num=1"                    # request 1 GPU
-#BSUB -n 8                            # 8 slots = 8 cores + 320 GB ram (slot-implied)
+#BSUB -q gpu_a100                   # A100 queue: 12 slots/GPU, 40GB ram/slot, 141GB VRAM
+#BSUB -gpu "num=1"                   # request 1 GPU
+#BSUB -n 24                           # 8 slots = 8 cores + 320 GB ram (slot-implied)
 #BSUB -W 72:00                        # 72 hour walltime
 #BSUB -oo logs/lsf/default/resume.out # stdout log (overwritten on each submit; -oo not -o)
 #BSUB -eo logs/lsf/default/resume.err # stderr log (overwritten on each submit)

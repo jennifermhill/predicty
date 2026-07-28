@@ -32,8 +32,8 @@ from data.picker import pick_zarr_path
 from models.dino import (
     DINOWrapper,
     dino_loss,
-    ibot_loss,
-    ibot_reconstruction_accuracy,
+    ibot_patch_loss,
+    ibot_patch_accuracy,
 )
 from train_utils import (
     batch_to_device,
@@ -171,7 +171,7 @@ def main() -> None:
     else:
         print("[train] WARNING: running on cpu — training will be impractically slow")
     print(f"[train] batch_size={cfg.batch_size}  total_steps={cfg.total_steps}")
-    print(f"[train] base_lr={cfg.base_lr}  weight_decay={cfg.weight_decay}")
+    print(f"[train] base_lr={cfg.base_lr}  weight_decay={cfg.weight_decay_start} -> {cfg.weight_decay_end}")
 
     # ---- data ----
     ds = build_dataset(cfg)
@@ -213,7 +213,7 @@ def main() -> None:
     if model.ibot_enabled:
         print(
             f"[train] iBOT masking: enabled "
-            f"(patch=({cfg.ibot_patch_z}, {cfg.ibot_patch_size}, {cfg.ibot_patch_size}), "
+            f"(patch=({cfg.z_thickness}, {cfg.ibot_block_size}, {cfg.ibot_block_size}), "
             f"mask_ratio={cfg.ibot_mask_ratio}, weight={cfg.ibot_weight})"
         )
     else:
@@ -230,7 +230,7 @@ def main() -> None:
     if model.mae_decoder is not None:
         trainable_modules.append(model.mae_decoder)
     optimizer = AdamW(
-        get_param_groups(trainable_modules, cfg.weight_decay),
+        get_param_groups(trainable_modules, cfg.weight_decay_start),
         lr=cfg.base_lr,
         betas=(0.9, 0.999),
     )
@@ -250,6 +250,10 @@ def main() -> None:
     ckpt_dir = Path(cfg.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    # ---- ibot ----
+    ibot_last = [None, None, None, 0]  # loss, acc@1, acc@5, step
+    # initialized before training loop to remain persistent between steps
+
     # ---- resume ----
     start_step = 0
     if args.resume:
@@ -259,6 +263,7 @@ def main() -> None:
     # ---- training loop ----
     loader_iter = iter(loader)
     t_last_log = time.time()
+    ibot_last = [None, None, None, 0]  # last iBOT [loss, top1, top5, step], carried between masked steps
 
     step = start_step
     for step in range(start_step, cfg.total_steps):
@@ -292,10 +297,15 @@ def main() -> None:
                 ).tolist()
                 print(f"[train] first batch dataset counts: {dataset_counts}")
 
-        # set LR per-step from the schedule.
+        # set LR & weight per-step from the schedule.
         lr = lr_schedule(step, cfg.total_steps, cfg.base_lr, cfg.warmup_frac)
+
+        # weight decay uses same cosine schedule as ema momentum, but with a different start/end range.
+        wd = ema_momentum_schedule(step, cfg.total_steps, cfg.weight_decay_start, cfg.weight_decay_end)
         for g in optimizer.param_groups:
             g["lr"] = lr
+            if g.get("wd_scheduled"): # skip the no-decay group
+                g["weight_decay"] = wd
 
         # forward + loss under autocast (fp16 ops on cuda).
         with autocast(device.type, dtype=torch.float16, enabled=use_amp):
@@ -317,13 +327,37 @@ def main() -> None:
             mae_loss = out["mae"]["loss"] if out["mae"] is not None else None
             ibot_loss_val = None
             if out["student_masking_globals"] is not None:
-                ibot_loss_val = ibot_loss(
+                ibot_loss_val = ibot_patch_loss(
                     out["student_masking_globals"],
                     out["teacher_masking_globals"],
+                    out["ibot_mask"],
                     model.ibot_center,
                     teacher_temp=teach_temp,
                     student_temp=cfg.student_temp,
                 )
+                # capture iBOT metrics on every masked step (not only log-steps)
+                # so the logged point lands at ~the current step. cheap: argmax/
+                # topk on already-computed tokens, no backward.
+                with torch.no_grad():
+                    _ibot_acc = ibot_patch_accuracy(
+                        out["student_masking_globals"],
+                        out["teacher_masking_globals"],
+                        out["ibot_mask"],
+                        model.ibot_center,
+                    )
+                ibot_last = [
+                    ibot_loss_val.item(),
+                    _ibot_acc["top1"].item(),
+                    _ibot_acc["topk"].item(),
+                    step,
+                ]
+
+            koleo_val = out["koleo"] if out["koleo"] is not None else None
+            koleo_weight = None
+            if koleo_val is not None:
+                koleo_weight = linear_frac_schedule(
+                    step, cfg.total_steps, 0.0, cfg.koleo_weight, cfg.temp_warmup_frac
+                ) # same warmup fraction as teacher temperature for now, can separate if needed
 
             loss = dino
             if dataset_loss is not None:
@@ -332,6 +366,8 @@ def main() -> None:
                 loss = loss + cfg.mae_weight * mae_loss
             if ibot_loss_val is not None:
                 loss = loss + cfg.ibot_weight * ibot_loss_val
+            if koleo_val is not None:
+                loss = loss + koleo_weight * koleo_val
 
         # backward, unscale grads to apply clipping in fp32, step + update.
         scaler.scale(loss).backward()
@@ -384,15 +420,8 @@ def main() -> None:
                 mae_mask_ratio = (
                     out["mae"]["mask_ratio"] if out["mae"] is not None else None
                 )
-                # iBOT prototype-recovery accuracy: how well the masked student
-                # matches the teacher's assignment on the full crop.
-                ibot_acc = None
-                if out["student_masking_globals"] is not None:
-                    ibot_acc = ibot_reconstruction_accuracy(
-                        out["student_masking_globals"],
-                        out["teacher_masking_globals"],
-                        model.ibot_center,
-                    )
+                # iBOT metrics are captured every masked step (see loss block);
+                # ibot_last holds the most recent, logged below at its real step.
 
             dt = time.time() - t_last_log
             t_last_log = time.time()
@@ -400,10 +429,15 @@ def main() -> None:
 
             writer.add_scalar("loss", loss.item(), step)
             writer.add_scalar("loss/dino", dino.item(), step)
+            if koleo_val is not None:
+                writer.add_scalar("loss/koleo", koleo_val.item(), step)
             writer.add_scalar("lr", lr, step)
             writer.add_scalar("ema_momentum", m, step)
             writer.add_scalar("warmups/teacher_temp", teach_temp, step)
             writer.add_scalar("warmups/dataset_adversary_grl_scale", model.dataset_adversary_grl_scale, step)
+            writer.add_scalar("warmups/weight_decay", wd, step)
+            if koleo_weight is not None:
+                writer.add_scalar("warmups/koleo_weight", koleo_weight, step)
             writer.add_scalar("grad_norm", grad_norm.item(), step)
             writer.add_scalar("collapse/teacher_entropy", entropy.item(), step)
             writer.add_scalar("collapse/embedding_var", emb_var.item(), step)
@@ -418,11 +452,13 @@ def main() -> None:
                 writer.add_scalar("mae/recon_r2", out["mae"]["recon_r2"].item(), step)
                 writer.add_scalar("mae/recon_corr", out["mae"]["recon_corr"].item(), step)
                 writer.add_scalar("mae/recon_rel_l2", out["mae"]["recon_rel_l2"].item(), step)
-            if ibot_loss_val is not None:
-                writer.add_scalar("ibot/loss", ibot_loss_val.item(), step)
-                if ibot_acc is not None:
-                    writer.add_scalar("ibot/recon_acc_top1", ibot_acc["top1"].item(), step)
-                    writer.add_scalar("ibot/recon_acc_top5", ibot_acc["topk"].item(), step)
+            if cfg.ibot_enabled:
+                if ibot_last[0] is not None:
+                    writer.add_scalar("ibot/loss", ibot_last[0], ibot_last[3])
+                if ibot_last[1] is not None:
+                    writer.add_scalar("ibot/recon_acc_top1", ibot_last[1], ibot_last[3])
+                if ibot_last[2] is not None:
+                    writer.add_scalar("ibot/recon_acc_top5", ibot_last[2], ibot_last[3])
 
             msg = (
                 f"step {step:06d}  loss={loss.item():.4f}  lr={lr:.2e}  "
@@ -440,13 +476,11 @@ def main() -> None:
                     f"  mae_loss={mae_loss.item():.4f} "
                     f"mae_r2={out['mae']['recon_r2'].item():.3f}"
                 )
-            if ibot_loss_val is not None:
-                msg += f"  ibot_loss={ibot_loss_val.item():.4f}"
-                if ibot_acc is not None:
-                    msg += (
-                        f" ibot_acc@1={ibot_acc['top1'].item():.3f} "
-                        f"ibot_acc@5={ibot_acc['topk'].item():.3f}"
-                    )
+            if ibot_last[0] is not None:
+                msg += (
+                    f"  ibot_loss={ibot_last[0]:.4f} "
+                    f"ibot_acc@1={ibot_last[1]:.3f} ibot_acc@5={ibot_last[2]:.3f}"
+                )
             print(msg)
 
         # ---- checkpoint ----
