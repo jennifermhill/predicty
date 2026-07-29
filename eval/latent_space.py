@@ -22,6 +22,10 @@ n_components=3 fit is a genuinely separate (and separately-priced) run whose x/y
 do not match the 2D fit; pass --no-3d to skip it.
 
 PCA always runs so every report has a deterministic, variance-faithful view.
+"deterministic" is now literal: PCA comes from eval/pca_utils.py's exact SVD with
+a fixed sign convention, so re-running this script on the same embeddings
+reproduces the same coordinates and the same plot orientation. Before, it used a
+randomized torch.pca_lowrank with no seed and did neither.
 when umap-learn (or scikit-learn for t-SNE) is installed, that manifold method
 runs too, giving both a umap/ and a pca/ subdirectory side by side.
 """
@@ -55,6 +59,14 @@ from configs.config import Config
 from data.dataset import MultiZarrDataset, ZarrCellDataset, worker_init_fn
 from models.encoder import HybridEncoder
 from eval.wasserstein import print_batch_effect_wasserstein
+
+# PCA and embedding preprocessing live in eval/pca_utils.py so that this script,
+# eval/latent_traversal_video.py and eval/refresh_pca_and_video.py provably share
+# one implementation. they used to disagree: this script's PCA was a randomized
+# torch.pca_lowrank against an unseeded global RNG, so its static plots did not
+# reproduce run to run, let alone match anything recomputed later. see that
+# module's docstring.
+from eval.pca_utils import pca_project, preprocess_embeddings
 
 
 def parse_args() -> argparse.Namespace:
@@ -360,31 +372,6 @@ def load_cached_embeddings(path: Path, cfg: Config) -> tuple[np.ndarray, list[di
             "label": label if label else None,
         })
     return X, rows
-
-def pca_project(X: np.ndarray, n_components: int = 2) -> tuple[np.ndarray, np.ndarray]:
-    X_t = torch.from_numpy(X).float()
-    X_t = X_t - X_t.mean(dim=0, keepdim=True)
-    q = min(n_components, X_t.shape[0] - 1, X_t.shape[1])
-    _, s, v = torch.pca_lowrank(X_t, q=q, center=False)
-    coords = X_t @ v[:, :q]
-    denom = torch.clamp((X_t ** 2).sum(), min=1e-12)
-    explained = (s[:q] ** 2 / denom).cpu().numpy()
-    return coords.cpu().numpy(), explained
-
-
-def preprocess_embeddings(X: np.ndarray, mode: str) -> np.ndarray:
-    X = X.astype(np.float32, copy=False)
-    if mode == "raw":
-        return X
-    if mode == "l2":
-        denom = np.linalg.norm(X, axis=1, keepdims=True)
-        return X / np.maximum(denom, 1e-12)
-    if mode == "standardize":
-        mean = X.mean(axis=0, keepdims=True)
-        std = X.std(axis=0, keepdims=True)
-        return (X - mean) / np.maximum(std, 1e-6)
-    raise ValueError(f"unknown embedding preprocess mode: {mode}")
-
 
 def _effective_dims(X: np.ndarray) -> tuple[float, float]:
     """effective dimensionality of an embedding cloud from its full variance

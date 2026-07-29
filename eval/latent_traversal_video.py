@@ -61,6 +61,11 @@ subset that happens to be enriched for behaviorally distinct crops -- so the
 alignment is earned rather than fit, but there is no guarantee PC1 orders the
 classes in any biologically meaningful sequence. on the run above it does not:
 single_cells sits between clumps and aggregate.
+
+the refit is fit on every annotated row and then applied to the deduplicated
+ones, so it matches latent_space.py's annotations_pca_by_label.png, which fits
+the same rows. both now go through eval/pca_utils.py, so they share one exact
+decomposition and one sign convention.
 """
 
 from __future__ import annotations
@@ -84,6 +89,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from configs.config import Config
+
+# same exact-SVD PCA that eval/latent_space.py now uses, so a refit here and the
+# static plots there share one implementation and one sign convention instead of
+# quietly disagreeing.
+from eval.pca_utils import pca_fit, pca_transform, preprocess_embeddings
 from eval.interactive_latent_viewer import (
     add_zarr_remap_args,
     default_embeddings_path,
@@ -175,40 +185,6 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def preprocess_embeddings(X: np.ndarray, mode: str) -> np.ndarray:
-    """mirror of eval.latent_space.preprocess_embeddings, reimplemented here.
-
-    latent_space.py can't be imported for it: that module calls
-    mp.set_start_method("spawn", force=True) at import time and pulls in torch,
-    the dataset and the encoder, none of which this script needs.
-    """
-    X = X.astype(np.float64, copy=False)
-    if mode == "raw":
-        return X
-    if mode == "l2":
-        return X / np.maximum(np.linalg.norm(X, axis=1, keepdims=True), 1e-12)
-    if mode == "standardize":
-        return (X - X.mean(axis=0, keepdims=True)) / np.maximum(
-            X.std(axis=0, keepdims=True), 1e-6
-        )
-    raise ValueError(f"unknown embedding preprocess mode: {mode}")
-
-
-def refit_pca_2d(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """PC1/PC2 of X, fit on exactly the rows given. returns (coords, explained).
-
-    plain numpy SVD rather than torch.pca_lowrank: the annotated subset is a few
-    hundred points by 128 dims, so an exact decomposition is instant and
-    deterministic, with no randomized-algorithm sign or ordering wobble between
-    runs.
-    """
-    Xc = X - X.mean(axis=0, keepdims=True)
-    _, s, Vt = np.linalg.svd(Xc, full_matrices=False)
-    ev = s ** 2
-    explained = ev / max(ev.sum(), 1e-30)
-    return Xc @ Vt[:2].T, explained
-
-
 def label_of(row: dict[str, Any]) -> str:
     """metadata.csv writes unlabeled rows as an empty field, but a csv round-trip
     of a None can also land as the literal string "None"; treat both as absent."""
@@ -274,28 +250,52 @@ def main() -> None:
             )
         print(f"[traversal] {len(keep)} annotated points before dedup")
 
-    # collapse t1/t2 points that reload the same physical crop, so a step's
-    # neighbors are genuinely distinct crops rather than the same one twice.
+    # the PCA refit is fit on the pre-dedup selection but only the deduped points
+    # are walked. fitting on everything keeps this projection comparable to
+    # latent_space.py's annotations_pca_by_label.png, which also fits every
+    # labeled row; fitting on the deduped subset instead would rotate the plane
+    # and the two figures would disagree for no good reason.
+    fit_keep = keep
+
+    # collapse latent points that render the *same* crop figure. t1 and t2 are
+    # the same location at two timepoints frame_gap apart -- genuinely different
+    # images (mean cosine similarity only ~0.46), not duplicate embeddings -- but
+    # either one displays the identical t1/t2 panel pair, so showing both wastes
+    # a montage cell and makes a step look more populated than it is.
     keep = unique_crop_indices(keep, rows, cfg)
+    fit_rows = [rows[i] for i in fit_keep]
     rows = [rows[i] for i in keep]
     coords = coords[keep]
-    if embeddings is not None:
-        embeddings = embeddings[keep]
+    # preprocess every row first and *then* subset, matching the order
+    # latent_space.py uses: it preprocesses all points and indexes the labeled
+    # ones out of the result. under --embedding-preprocess standardize the column
+    # statistics depend on which rows are passed in, so preprocessing a subset
+    # would fit a different basis than the static annotation plot.
+    embeddings_fit = (
+        preprocess_embeddings(embeddings, args.embedding_preprocess)[fit_keep]
+        if embeddings is not None
+        else None
+    )
+    # positions of the walked points within the fit selection, so the walk reuses
+    # the fit set's already-preprocessed rows.
+    walk_in_fit = np.searchsorted(fit_keep, keep)
+    if not np.array_equal(fit_keep[walk_in_fit], keep):
+        raise AssertionError("deduped indices are not a subset of the fit selection")
     print(f"[traversal] {len(rows)} unique crops after dedup")
 
     axis_prefix = "PC"
     if args.labeled_only:
-        assert embeddings is not None
-        # refit AFTER dedup so near-identical t1/t2 pairs don't double-weight
-        # their crop in the decomposition.
-        X = preprocess_embeddings(embeddings, args.embedding_preprocess)
-        coords, explained = refit_pca_2d(X)
+        assert embeddings_fit is not None
+        X_fit = embeddings_fit  # already preprocessed above, before subsetting
+        components, mean, explained = pca_fit(X_fit, 2)
+        coords = pca_transform(X_fit[walk_in_fit], components, mean)
         axis_prefix = "annotation PC"
         print(
-            f"[traversal] refit PCA on {len(rows)} annotated crops "
+            f"[traversal] refit PCA on {len(fit_rows)} annotated points "
             f"(preprocess={args.embedding_preprocess}): "
             f"PC1 {explained[0]*100:.1f}%  PC2 {explained[1]*100:.1f}%"
         )
+        print(f"[traversal] walking the {len(rows)} deduped crops in that basis")
 
     n_bins = args.bins if args.bins is not None else (
         max(10, len(rows) // 5) if args.labeled_only else 150
