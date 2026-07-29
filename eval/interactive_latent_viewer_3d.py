@@ -65,6 +65,7 @@ from configs.config import Config
 from eval.interactive_latent_viewer import (
     LatentCropViewer,
     REQUIRED_COLUMNS,
+    add_zarr_remap_args,
     compute_visible_mask,
     default_embeddings_path,
     estimate_default_radius,
@@ -72,9 +73,10 @@ from eval.interactive_latent_viewer import (
     nearest_annotated_index,
     nearest_indices,
     representative_indices,
+    require_zarrs_exist,
+    resolve_zarr_paths,
     unique_crop_indices,
     validate_dataset_mapping,
-    zarr_paths_from_config,
 )
 
 COORD_3D_COLUMNS = ("coord_x3", "coord_y3", "coord_z3")
@@ -145,6 +147,7 @@ def parse_args() -> argparse.Namespace:
             "nearest-neighbor spacing among plotted points."
         ),
     )
+    add_zarr_remap_args(parser)
     return parser.parse_args()
 
 
@@ -622,8 +625,9 @@ def main() -> None:
     cfg = Config.from_yaml(args.config)
     metadata_path = Path(args.metadata)
     rows, coords = read_metadata_3d(metadata_path)
-    zarr_paths = zarr_paths_from_config(cfg)
+    zarr_paths = resolve_zarr_paths(cfg, args)
     validate_dataset_mapping(rows, zarr_paths)
+    require_zarrs_exist(zarr_paths, rows)
 
     embeddings = None
     gen_radius = args.gen_radius

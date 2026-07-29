@@ -123,6 +123,7 @@ def parse_args() -> argparse.Namespace:
             "median nearest-neighbor spacing among plotted points."
         ),
     )
+    add_zarr_remap_args(parser)
     return parser.parse_args()
 
 
@@ -259,6 +260,151 @@ def zarr_paths_from_config(cfg: Config) -> list[str]:
     if cfg.zarr_path:
         return [cfg.zarr_path]
     raise ValueError("config must define zarr_path or zarr_paths")
+
+
+# ---------------------------------------------------------------------------
+# zarr path remapping, shared by this viewer, the 3D viewer, and
+# eval/latent_traversal_video.py. configs freeze absolute cluster paths at
+# training time, so any of these scripts run off a mounted copy of the same
+# storage needs those prefixes rewritten.
+# ---------------------------------------------------------------------------
+
+# the lab's cluster root and where it lands when the share is mounted on
+# Aran's machine. only the default for --local-mount; override by passing a
+# different root, or use --zarr-root-map for anything else.
+CLUSTER_ZARR_ROOT = "/groups/sgro/sgrolab"
+DEFAULT_LOCAL_ZARR_ROOT = "Z:/"
+
+
+def add_zarr_remap_args(parser: argparse.ArgumentParser) -> None:
+    """attach --zarr-root-map / --local-mount to a parser."""
+    parser.add_argument(
+        "--zarr-root-map",
+        action="append",
+        default=None,
+        metavar="OLD=NEW",
+        help=(
+            "rewrite a prefix of every zarr path from the config, for running "
+            "against a mounted copy of the storage instead of the cluster. "
+            "repeatable; longest matching OLD wins."
+        ),
+    )
+    parser.add_argument(
+        "--local-mount",
+        nargs="?",
+        const=DEFAULT_LOCAL_ZARR_ROOT,
+        default=None,
+        metavar="ROOT",
+        help=(
+            f"shorthand for --zarr-root-map {CLUSTER_ZARR_ROOT}=ROOT, where "
+            f"ROOT defaults to {DEFAULT_LOCAL_ZARR_ROOT}. so a bare "
+            "--local-mount is all that's needed on a machine with the sgrolab "
+            "share mounted there; pass a different root if the drive letter "
+            "differs. explicit --zarr-root-map rules for the same prefix win."
+        ),
+    )
+
+
+def parse_root_map(
+    mappings: list[str] | None, local_mount: str | None = None
+) -> list[tuple[str, str]]:
+    """OLD=NEW strings into prefix rewrite rules, longest OLD first.
+
+    longest-first so overlapping rules behave predictably: given both
+    /groups/sgro and /groups/sgro/sgrolab, the more specific one applies
+    regardless of the order they were typed in. an explicit --zarr-root-map for
+    the same prefix takes precedence over --local-mount's implied rule.
+    """
+    rules: list[tuple[str, str]] = []
+    for mapping in mappings or []:
+        if "=" not in mapping:
+            raise ValueError(
+                f"--zarr-root-map expects OLD=NEW, got {mapping!r} "
+                f"(e.g. --zarr-root-map {CLUSTER_ZARR_ROOT}={DEFAULT_LOCAL_ZARR_ROOT})"
+            )
+        old, new = mapping.split("=", 1)
+        if not old:
+            raise ValueError("--zarr-root-map OLD half must not be empty")
+        rules.append((old, new))
+    if local_mount is not None and not any(old == CLUSTER_ZARR_ROOT for old, _ in rules):
+        rules.append((CLUSTER_ZARR_ROOT, local_mount))
+    return sorted(rules, key=lambda rule: len(rule[0]), reverse=True)
+
+
+def remap_zarr_paths(paths: list[str], rules: list[tuple[str, str]]) -> list[str]:
+    """apply the first matching prefix rule to each path.
+
+    matches on path *boundaries* only, so a rule for /groups/sgro/sgrolab does
+    not fire on /groups/sgro/sgrolab2. joins with exactly one separator, so
+    passing a root with a trailing slash ("Z:/") can't produce a "Z://..."
+    double slash -- which Windows would read as the start of a UNC share name.
+
+    only the prefix changes, so each path's basename -- which is what
+    validate_dataset_mapping checks against metadata.csv's dataset_name -- is
+    untouched and that guard keeps working.
+    """
+    if not rules:
+        return list(paths)
+    out: list[str] = []
+    for path in paths:
+        for old, new in rules:
+            trimmed = old.rstrip("/\\")
+            if path == trimmed:
+                path = new
+                break
+            if path.startswith(trimmed) and path[len(trimmed)] in "/\\":
+                remainder = path[len(trimmed) + 1:]
+                path = new.rstrip("/\\") + "/" + remainder
+                break
+        out.append(path)
+    return out
+
+
+def resolve_zarr_paths(cfg: Config, args: argparse.Namespace) -> list[str]:
+    """config zarr paths with any --zarr-root-map / --local-mount applied."""
+    zarr_paths = zarr_paths_from_config(cfg)
+    rules = parse_root_map(
+        getattr(args, "zarr_root_map", None), getattr(args, "local_mount", None)
+    )
+    if not rules:
+        return zarr_paths
+    remapped = remap_zarr_paths(zarr_paths, rules)
+    for before, after in zip(zarr_paths, remapped):
+        if before != after:
+            print(f"[zarr] remapped {before}\n            -> {after}")
+    unchanged = sum(1 for b, a in zip(zarr_paths, remapped) if b == a)
+    if unchanged:
+        print(
+            f"[zarr] WARNING: {unchanged}/{len(zarr_paths)} zarr paths matched no "
+            "remap rule and were left as-is"
+        )
+    return remapped
+
+
+def require_zarrs_exist(zarr_paths: list[str], rows: list[dict[str, Any]]) -> None:
+    """fail before doing any work if a zarr these rows need isn't readable.
+
+    checks only the datasets actually present in rows, so a filtered subset
+    isn't blocked by an unrelated volume being offline. done up front because
+    the alternative is discovering a bad remap partway through a render, or on
+    the first click into a viewer that took a minute to start.
+    """
+    needed = sorted({int(row["dataset_idx"]) for row in rows})
+    missing = [
+        (i, zarr_paths[i])
+        for i in needed
+        if i < len(zarr_paths) and not Path(zarr_paths[i]).exists()
+    ]
+    if not missing:
+        return
+    lines = "\n".join(f"    dataset_idx={i}: {p}" for i, p in missing)
+    raise FileNotFoundError(
+        f"{len(missing)} of {len(needed)} zarr path(s) needed here do not exist:\n"
+        f"{lines}\n"
+        "if you're running off a mounted copy rather than the cluster, pass "
+        f"--local-mount (or --zarr-root-map OLD=NEW) to rewrite the prefix "
+        "baked into the config."
+    )
 
 
 def temporal_pair(row: dict[str, Any], cfg: Config) -> tuple[int, int]:
@@ -836,8 +982,9 @@ def main() -> None:
 
     cfg = Config.from_yaml(args.config)
     rows, coords = read_metadata(Path(args.metadata))
-    zarr_paths = zarr_paths_from_config(cfg)
+    zarr_paths = resolve_zarr_paths(cfg, args)
     validate_dataset_mapping(rows, zarr_paths)
+    require_zarrs_exist(zarr_paths, rows)
 
     embeddings = None
     gen_radius = args.gen_radius
