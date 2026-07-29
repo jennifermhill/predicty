@@ -445,8 +445,9 @@ def main() -> None:
     fold_train_accs, fold_val_accs, fold_cms = [], [], []
     fold_macro_f1s, fold_bal_accs = [], []
     fold_heads = []  # Store trained heads for later
-    # every (fold, probe restart) pair, for the run-level variance report.
-    all_val_accs, all_macro_f1s = [], []
+    # per-fold spread across probe restarts (same features, same split, different
+    # head init). this is the error bar on comparing two training runs.
+    fold_restart_sds = []
 
     # groups must come from `rows`, which is in X order. df['dataset_idx'] is in
     # annotation-file row order, which interleaves zarrs, so using it made
@@ -489,8 +490,6 @@ def main() -> None:
             seed_va.append(va_s)
             seed_macro.append(macro_s)
             seed_bal.append(bal_s)
-            all_val_accs.append(va_s)
-            all_macro_f1s.append(macro_s)
             cm = cm + cm_s
             if s_i == 0:
                 head = head_s
@@ -513,6 +512,7 @@ def main() -> None:
         fold_heads.append((head.cpu(), va_acc))
         fold_macro_f1s.append(macro)
         fold_bal_accs.append(bal)
+        fold_restart_sds.append(macro_sd)
 
         # --- fold-specific report ---
         print()
@@ -560,14 +560,29 @@ def main() -> None:
     print(f"  val_acc - majority class ({majority_pct:.1f}%) : {(val_mean*100 - majority_pct):+6.2f} percentage points")
     print(f"    (majority baseline = always predict '{label_counts.idxmax()}'; macro_F1 and")
     print(f"     balanced_acc are the metrics to compare across runs, not val_acc)")
-    if len(all_val_accs) > 1:
-        # spread over every (fold, restart) pair: the floor below which a
-        # run-to-run difference is not distinguishable from probe noise.
-        va_all_sd = statistics.stdev(all_val_accs)
-        mf1_all_sd = statistics.stdev(all_macro_f1s)
+    if any(sd > 0 for sd in fold_restart_sds):
+        # the two spreads on this page mean different things and are easy to mix
+        # up, so say plainly which one is the error bar:
+        #   restart spread: refit the head on the SAME features and SAME folds.
+        #     that is the only thing that differs when you compare two training
+        #     runs at the same --seed, so it is the error bar.
+        #   fold spread (the +- next to macro_F1 above): how much the score moves
+        #     with WHICH experiments are held out. large, but identical for both
+        #     runs you're comparing, so it cancels -- not the error bar.
+        restart_sd = statistics.mean(fold_restart_sds)
         print()
-        print(f"  probe/fold noise ({len(all_val_accs)} fits): val_acc sd={va_all_sd*100:.2f}pp  macro_F1 sd={mf1_all_sd:.3f}")
-        print(f"  -> treat differences below ~{2*va_all_sd*100:.1f}pp val_acc / {2*mf1_all_sd:.3f} macro_F1 as noise")
+        print("  " + "-" * 66)
+        print("  COMPARING THIS RUN TO ANOTHER ONE")
+        print("  " + "-" * 66)
+        print(f"  use macro_F1 ({macro_mean:.3f}), and keep --seed {args.seed} the same in both runs.")
+        print()
+        print(f"    re-running this probe on the same encoder moves macro_F1 by  +- {restart_sd:.3f}")
+        print(f"    so another run is genuinely better/worse only if it differs by > {2*restart_sd:.3f}")
+        print()
+        print(f"  the +- {macro_std:.3f} printed above is something else: it's how much the score")
+        print("  varies across folds (i.e. across which experiments are held out). both runs")
+        print("  see the same folds, so ignore it when comparing runs.")
+        print("  " + "-" * 66)
     print()
     print(f"  pooled confusion matrix (summed across all folds x {len(probe_seeds)} restart(s)):")
     print_confusion_matrix(cm_total, sorted(df['label'].unique()))
