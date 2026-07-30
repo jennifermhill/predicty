@@ -176,6 +176,17 @@ class Config:
     # encoder's whole-forward checkpointing, is the main lever against oom. None
     # disables chunking. lower this if you still oom, raise it for speed.
     encoder_chunk_size: int | None = 32
+    # gradient checkpointing, split by half of the encoder.
+    #   checkpoint_stem: the 3D stem + z_pool. its activations are
+    #     full-resolution (stem_channels x Z x H x W per crop) and dominate
+    #     memory, while recomputing them is comparatively cheap. keep on.
+    #   checkpoint_backbone: the 2D ResNet-50. its activations are post-z_pool
+    #     and much smaller, but it holds most of the flops, so checkpointing it
+    #     pays a second full forward for a modest memory saving (this cost ~25%
+    #     throughput when the whole forward was checkpointed as one block).
+    # turn checkpoint_backbone back on if a larger batch or crop count ooms.
+    checkpoint_stem: bool = True
+    checkpoint_backbone: bool = False
 
     # projector (DINO head) discarded after training. K is the prototype count
     # the cross-entropy operates over.
@@ -270,6 +281,21 @@ class Config:
     ckpt_interval: int = 2000
     device: str = "cuda"
     use_amp: bool = True
+    # autocast dtype: "fp16" or "bf16". falls back to fp16 on hardware without
+    # bf16 support.
+    #
+    # default is fp16, deliberately. bf16 has fp32's exponent range (no loss
+    # scaling, no inf-driven skipped steps) but only 8 mantissa bits against
+    # fp16's 10, i.e. ~4x coarser relative precision. that trade is wrong here:
+    # the DINO head emits cosine-scale logits in [-1, 1] which are then divided
+    # by teacher_temp (0.04-0.07) before the softmax, amplifying any logit
+    # quantization ~14-25x. prototypes separated by less than the quantized step
+    # become indistinguishable to the teacher, which shows up as a drop in
+    # effective prototype count -- the exact failure 0727-ThruTuning3 exhibited
+    # (~16 effective prototypes vs 224 for 0720-iBOTPatch4). fp16's inf risk, by
+    # contrast, never actually materialized in 0720's logs beyond the
+    # GradScaler's normal step-0 calibration.
+    amp_dtype: str = "fp16"
 
     # ------------------------------------------------------------------
     # io

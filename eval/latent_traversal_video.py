@@ -29,11 +29,14 @@ usage:
         --metadata latent_space/<run>/pca/metadata.csv \
         --labeled-only --fps 4
 
-    # off-cluster, reading the same storage through the mounted sgrolab share
+    # THE USUAL ONE: straight line through the annotation PCA, every crop
+    # available to the walk, run off the locally mounted share
     python eval/latent_traversal_video.py \
-        --config configs/train.yaml \
+        --config checkpoints/<run>/config.yaml \
         --metadata latent_space/<run>/pca/metadata.csv \
-        --labeled-only --fps 4 --local-mount
+        --labeled-only --include-unannotated \
+        --line --line-band-percentile 2 --bins 90 \
+        --fps 4 --local-mount
 
 this script needs neither a GPU nor torch: it reads the already-computed
 embeddings.npz plus the raw zarrs, so with the storage mounted it runs on a
@@ -72,7 +75,9 @@ from __future__ import annotations
 
 import argparse
 import math
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -179,6 +184,68 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="crops shown per step (the medoid plus its nearest neighbors)",
     )
+    p.add_argument(
+        "--include-unannotated",
+        action="store_true",
+        help=(
+            "with --labeled-only: still fit the projection on the annotated crops "
+            "only, but let every crop be a candidate for the walk. the basis is "
+            "unchanged, so the annotated points land exactly where the static plot "
+            "puts them, while the walk gets ~20x more points to pick from -- which "
+            "decouples frame count from how straight the line is. note most walked "
+            "crops will then be unlabeled."
+        ),
+    )
+    p.add_argument(
+        "--line",
+        action="store_true",
+        help=(
+            "walk a straight line in the PC1/PC2 plane instead of binning PC1. "
+            "keeps only points within a narrow band of the line, so the selection "
+            "stays on the line rather than drifting in PC2. the first montage cell "
+            "is the point on the line; the rest are its nearest neighbors."
+        ),
+    )
+    p.add_argument(
+        "--show-line",
+        action="store_true",
+        help=(
+            "draw the walk line and its band on the map panel. off by default: "
+            "it's a debugging aid for confirming the selection really is "
+            "collinear, not something you want in a figure."
+        ),
+    )
+    p.add_argument(
+        "--line-angle",
+        type=float,
+        default=0.0,
+        help="direction of the line in degrees; 0 = the PC1 axis (default)",
+    )
+    p.add_argument(
+        "--line-offset",
+        type=float,
+        default=0.0,
+        help="shift the line perpendicular to its direction, in coordinate units",
+    )
+    p.add_argument(
+        "--line-band",
+        type=float,
+        default=None,
+        help=(
+            "half-width of the band around the line, in coordinate units. "
+            "default: whatever --line-band-percentile works out to."
+        ),
+    )
+    p.add_argument(
+        "--line-band-percentile",
+        type=float,
+        default=20.0,
+        help=(
+            "used when --line-band is unset: keep the points whose perpendicular "
+            "distance is within this percentile. 20 keeps the closest fifth, which "
+            "reads as a straight line while still leaving enough crops to sample."
+        ),
+    )
     p.add_argument("--fps", type=int, default=15, help="frames per second in the output video")
     p.add_argument("--cmap", default="gray", help="matplotlib colormap for the crop images")
     p.add_argument("--point-size", type=float, default=6.0, help="scatter point size on the map")
@@ -204,6 +271,98 @@ def equal_count_bins(x: np.ndarray, n_bins: int) -> list[np.ndarray]:
     return np.array_split(order, n_bins)
 
 
+def line_basis(angle_deg: float) -> tuple[np.ndarray, np.ndarray]:
+    """unit direction along the walk and unit normal to it, in the PC1/PC2 plane.
+
+    angle 0 is the PC1 axis, so the default walk is exactly horizontal on the
+    scatter you're looking at.
+    """
+    theta = np.radians(float(angle_deg))
+    direction = np.array([np.cos(theta), np.sin(theta)])
+    normal = np.array([-direction[1], direction[0]])
+    return direction, normal
+
+
+def line_walk(
+    coords: np.ndarray,
+    n_samples: int,
+    angle_deg: float,
+    offset: float,
+    band: float | None,
+    band_percentile: float,
+    span: tuple[float, float] = (1.0, 99.0),
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """walk a straight line through the 2D projection, picking real points on it.
+
+    the previous behavior sliced PC1 into quantile bins and took each bin's
+    medoid -- the point nearest that slab's own 2D centroid. that cannot hold PC2
+    steady even in principle: the medoid's PC2 is whatever the slab's mean PC2
+    happens to be, so the marker wanders vertically, and where a slab is bimodal
+    in PC2 the centroid lands in the empty gap and consecutive frames jump
+    between lobes.
+
+    this instead fixes a line, keeps only points within `band` of it, and samples
+    evenly along it. every selected point is therefore within `band` of the line
+    by construction, which is the guarantee the binning approach never made.
+
+    consecutive duplicate picks are collapsed, so each distinct crop occupies
+    exactly one frame and every crop is on screen for the same length of time --
+    dense sampling does not make a crop linger just because it is the nearest
+    real point over a long stretch of the line.
+
+    returns (indices in walk order, info dict for plotting and reporting).
+    """
+    if n_samples < 2:
+        raise ValueError("need at least 2 samples along the line")
+    direction, normal = line_basis(angle_deg)
+    centre = coords.mean(axis=0)
+    along = (coords - centre) @ direction
+    perpendicular = (coords - centre) @ normal - float(offset)
+
+    if band is None:
+        if not 0.0 < band_percentile <= 100.0:
+            raise ValueError("--line-band-percentile must be in (0, 100]")
+        band = float(np.percentile(np.abs(perpendicular), band_percentile))
+    band = max(float(band), 1e-9)
+
+    candidates = np.flatnonzero(np.abs(perpendicular) <= band)
+    if len(candidates) < 2:
+        raise ValueError(
+            f"only {len(candidates)} point(s) lie within {band:.4f} of the line; "
+            "widen --line-band / --line-band-percentile or drop --line-offset"
+        )
+
+    lo, hi = np.percentile(along[candidates], span)
+    if not hi > lo:
+        raise ValueError("line span collapsed to a point; check --line-angle")
+    samples = np.linspace(lo, hi, n_samples)
+    # nearest candidate to each sample, measured along the line. 1D on purpose:
+    # every candidate is already within band perpendicular, so along-line
+    # nearness is what decides order, and progress stays monotonic.
+    picks = candidates[np.argmin(np.abs(along[candidates][None, :] - samples[:, None]), axis=1)]
+
+    ordered: list[int] = [int(picks[0])]
+    for pick in picks[1:]:
+        if int(pick) != ordered[-1]:
+            ordered.append(int(pick))
+    indices = np.asarray(ordered, dtype=np.int64)
+
+    info = {
+        "direction": direction,
+        "normal": normal,
+        "centre": centre,
+        "band": band,
+        "offset": float(offset),
+        "along": along,
+        "perpendicular": perpendicular,
+        "lo": float(lo),
+        "hi": float(hi),
+        "n_candidates": int(len(candidates)),
+        "n_samples": int(n_samples),
+    }
+    return indices, info
+
+
 def crop_anchor(row: dict[str, Any]) -> tuple[int, ...]:
     return (
         int(row["dataset_idx"]),
@@ -217,6 +376,12 @@ def crop_anchor(row: dict[str, Any]) -> tuple[int, ...]:
 
 def main() -> None:
     args = parse_args()
+    if args.include_unannotated and not args.labeled_only:
+        raise ValueError(
+            "--include-unannotated only means something alongside --labeled-only: "
+            "it widens the walk while keeping the annotated-only fit. without "
+            "--labeled-only the walk already uses every crop."
+        )
     cfg = Config.from_yaml(args.config)
     zarr_paths = resolve_zarr_paths(cfg, args)
 
@@ -236,84 +401,116 @@ def main() -> None:
         print(f"[traversal] loading embeddings from {embeddings_path}")
         embeddings = load_real_embeddings(embeddings_path, coords)
 
-    keep = np.arange(len(rows))
+    base = np.arange(len(rows))
     if args.dataset_idx is not None:
-        keep = keep[[int(rows[i]["dataset_idx"]) == args.dataset_idx for i in keep]]
-        if not len(keep):
+        base = base[[int(rows[i]["dataset_idx"]) == args.dataset_idx for i in base]]
+        if not len(base):
             raise ValueError(f"no points with dataset_idx={args.dataset_idx} in the metadata")
+
+    # the projection is fit on the pre-dedup annotated rows. fitting on all of
+    # them keeps it comparable to latent_space.py's annotations_pca_by_label.png,
+    # which fits the same rows; fitting the deduped subset instead would rotate
+    # the plane and the two figures would disagree for no good reason.
+    fit_keep = base
     if args.labeled_only:
-        keep = keep[[bool(label_of(rows[i])) for i in keep]]
-        if not len(keep):
+        fit_keep = base[[bool(label_of(rows[i])) for i in base]]
+        if not len(fit_keep):
             raise ValueError(
                 "--labeled-only but no rows in this metadata.csv carry a label; "
                 "the latent_space.py run needs an annotation-aware extraction"
             )
-        print(f"[traversal] {len(keep)} annotated points before dedup")
+        print(f"[traversal] {len(fit_keep)} annotated points define the projection")
 
-    # the PCA refit is fit on the pre-dedup selection but only the deduped points
-    # are walked. fitting on everything keeps this projection comparable to
-    # latent_space.py's annotations_pca_by_label.png, which also fits every
-    # labeled row; fitting on the deduped subset instead would rotate the plane
-    # and the two figures would disagree for no good reason.
-    fit_keep = keep
+    # what the walk may pick from. widening this to every crop leaves the basis
+    # untouched -- the annotated points still land exactly where the static plot
+    # puts them -- while giving the line far more real points to snap to.
+    walk_source = base if args.include_unannotated else fit_keep
 
     # collapse latent points that render the *same* crop figure. t1 and t2 are
     # the same location at two timepoints frame_gap apart -- genuinely different
     # images (mean cosine similarity only ~0.46), not duplicate embeddings -- but
     # either one displays the identical t1/t2 panel pair, so showing both wastes
-    # a montage cell and makes a step look more populated than it is.
-    keep = unique_crop_indices(keep, rows, cfg)
+    # a frame and makes a step look more populated than it is.
+    keep = unique_crop_indices(walk_source, rows, cfg)
     fit_rows = [rows[i] for i in fit_keep]
     rows = [rows[i] for i in keep]
-    coords = coords[keep]
-    # preprocess every row first and *then* subset, matching the order
-    # latent_space.py uses: it preprocesses all points and indexes the labeled
-    # ones out of the result. under --embedding-preprocess standardize the column
-    # statistics depend on which rows are passed in, so preprocessing a subset
-    # would fit a different basis than the static annotation plot.
-    embeddings_fit = (
-        preprocess_embeddings(embeddings, args.embedding_preprocess)[fit_keep]
-        if embeddings is not None
-        else None
-    )
-    # positions of the walked points within the fit selection, so the walk reuses
-    # the fit set's already-preprocessed rows.
-    walk_in_fit = np.searchsorted(fit_keep, keep)
-    if not np.array_equal(fit_keep[walk_in_fit], keep):
-        raise AssertionError("deduped indices are not a subset of the fit selection")
-    print(f"[traversal] {len(rows)} unique crops after dedup")
 
     axis_prefix = "PC"
     if args.labeled_only:
-        assert embeddings_fit is not None
-        X_fit = embeddings_fit  # already preprocessed above, before subsetting
-        components, mean, explained = pca_fit(X_fit, 2)
-        coords = pca_transform(X_fit[walk_in_fit], components, mean)
+        assert embeddings is not None
+        # preprocess every row first and *then* subset, matching the order
+        # latent_space.py uses: it preprocesses all points and indexes the labeled
+        # ones out of the result. under --embedding-preprocess standardize the
+        # column statistics depend on which rows are passed in, so preprocessing a
+        # subset would fit a different basis than the static annotation plot.
+        X_all = preprocess_embeddings(embeddings, args.embedding_preprocess)
+        components, mean, explained = pca_fit(X_all[fit_keep], 2)
+        coords = pca_transform(X_all[keep], components, mean)
         axis_prefix = "annotation PC"
         print(
             f"[traversal] refit PCA on {len(fit_rows)} annotated points "
             f"(preprocess={args.embedding_preprocess}): "
             f"PC1 {explained[0]*100:.1f}%  PC2 {explained[1]*100:.1f}%"
         )
-        print(f"[traversal] walking the {len(rows)} deduped crops in that basis")
-
-    n_bins = args.bins if args.bins is not None else (
-        max(10, len(rows) // 5) if args.labeled_only else 150
-    )
-    pc1 = coords[:, 0]
-    bins = equal_count_bins(pc1, n_bins)
-    per_bin = len(rows) / max(len(bins), 1)
-    print(
-        f"[traversal] {len(bins)} steps across {axis_prefix}1 "
-        f"[{pc1.min():.3f}, {pc1.max():.3f}]  ({per_bin:.1f} crops/step, "
-        f"{len(bins)/max(args.fps,1):.1f}s at {args.fps} fps)"
-    )
-    if per_bin < args.montage:
+        n_labeled = sum(1 for row in rows if label_of(row))
         print(
-            f"[traversal] WARNING: fewer than --montage={args.montage} crops per "
-            f"step; some montage cells will repeat the bin's few members or sit "
-            f"blank. lower --bins or --montage."
+            f"[traversal] walking {len(rows)} crops in that basis "
+            f"({n_labeled} labeled, {len(rows) - n_labeled} unlabeled)"
         )
+    else:
+        coords = coords[keep]
+        print(f"[traversal] {len(rows)} unique crops after dedup")
+
+    pc1 = coords[:, 0]
+    line_info: dict[str, Any] | None = None
+    bins: list[np.ndarray] = []
+    line_indices: np.ndarray | None = None
+
+    if args.line:
+        # sample densely and let the duplicate collapse decide the frame count;
+        # that is what keeps every crop on screen for the same single frame.
+        n_samples = args.bins if args.bins is not None else max(300, 4 * len(rows))
+        line_indices, line_info = line_walk(
+            coords,
+            n_samples,
+            args.line_angle,
+            args.line_offset,
+            args.line_band,
+            args.line_band_percentile,
+        )
+        picked_perp = np.abs(line_info["perpendicular"][line_indices])
+        print(
+            f"[traversal] line walk at {args.line_angle:g} deg, offset "
+            f"{args.line_offset:g}, band +/-{line_info['band']:.4f} "
+            f"({line_info['n_candidates']}/{len(rows)} crops in band)"
+        )
+        print(
+            f"[traversal] {n_samples} samples along the line collapsed to "
+            f"{len(line_indices)} distinct crops, one frame each "
+            f"({len(line_indices)/max(args.fps,1):.1f}s at {args.fps} fps)"
+        )
+        print(
+            f"[traversal] selected points sit {picked_perp.mean():.4f} from the line "
+            f"on average (max {picked_perp.max():.4f}); "
+            f"{axis_prefix}1 spans [{line_info['lo']:.3f}, {line_info['hi']:.3f}]"
+        )
+    else:
+        n_bins = args.bins if args.bins is not None else (
+            max(10, len(rows) // 5) if args.labeled_only else 150
+        )
+        bins = equal_count_bins(pc1, n_bins)
+        per_bin = len(rows) / max(len(bins), 1)
+        print(
+            f"[traversal] {len(bins)} steps across {axis_prefix}1 "
+            f"[{pc1.min():.3f}, {pc1.max():.3f}]  ({per_bin:.1f} crops/step, "
+            f"{len(bins)/max(args.fps,1):.1f}s at {args.fps} fps)"
+        )
+        if per_bin < args.montage:
+            print(
+                f"[traversal] WARNING: fewer than --montage={args.montage} crops per "
+                f"step; some montage cells will repeat the bin's few members or sit "
+                f"blank. lower --bins or --montage."
+            )
 
     require_zarrs_exist(zarr_paths, rows)
 
@@ -321,10 +518,25 @@ def main() -> None:
     if color_by == "auto":
         color_by = "label" if args.labeled_only else "dataset"
 
-    out_path = Path(args.out) if args.out else metadata_path.parent / (
-        f"pca1_traversal{'_labeled' if args.labeled_only else ''}"
-        f"{'' if args.dataset_idx is None else f'_ds{args.dataset_idx}'}.mp4"
-    )
+    if args.out:
+        out_path = Path(args.out)
+    else:
+        # line-mode names carry the angle and band, so sweeping directions doesn't
+        # silently overwrite the previous render (and doesn't collide with a file
+        # still open in a player, which is what makes cv2 fail to write).
+        tag = ""
+        if args.line:
+            band_tag = (
+                f"b{args.line_band:g}" if args.line_band is not None
+                else f"p{args.line_band_percentile:g}"
+            )
+            tag = f"_line_a{args.line_angle:g}_{band_tag}"
+        out_path = metadata_path.parent / (
+            f"pca1_traversal{tag}"
+            f"{'_labeled' if args.labeled_only else ''}"
+            f"{'_all' if args.include_unannotated else ''}"
+            f"{'' if args.dataset_idx is None else f'_ds{args.dataset_idx}'}.mp4"
+        )
 
     # crop reconstruction is the slow part (a dask read per crop), so cache the
     # projected crop by its physical anchor. arrays caches the open zarr handles.
@@ -341,17 +553,36 @@ def main() -> None:
         mip_cache[anchor] = mip
         return mip
 
-    # per step: medoid (nearest the bin centroid) first, then nearest neighbors.
     steps: list[dict[str, Any]] = []
-    for members in bins:
-        member_coords = coords[members]
-        centroid = member_coords.mean(axis=0)
-        order = np.argsort(np.linalg.norm(member_coords - centroid, axis=1))
-        chosen = members[order[: args.montage]]
-        medoid = int(members[order[0]])
-        steps.append({"medoid": medoid, "chosen": [int(i) for i in chosen]})
+    if line_indices is not None:
+        # the point on the line drives the frame; the remaining montage cells show
+        # its nearest neighbors in the projection, same idea as the bin mode's
+        # "medoid plus neighbors". a 2x2 grid also upscales each 128px crop about
+        # 2x rather than 4x, so it reads far sharper than one big panel.
+        for idx in line_indices:
+            chosen = [int(idx)]
+            if args.montage > 1:
+                order = np.argsort(np.linalg.norm(coords - coords[idx], axis=1))
+                ranked = unique_crop_indices(order, rows, cfg)
+                for candidate in ranked:
+                    if len(chosen) >= args.montage:
+                        break
+                    if int(candidate) != int(idx):
+                        chosen.append(int(candidate))
+            steps.append({"medoid": int(idx), "chosen": chosen})
+    else:
+        # per step: medoid (nearest the bin centroid) first, then nearest neighbors.
+        for members in bins:
+            member_coords = coords[members]
+            centroid = member_coords.mean(axis=0)
+            order = np.argsort(np.linalg.norm(member_coords - centroid, axis=1))
+            chosen = members[order[: args.montage]]
+            medoid = int(members[order[0]])
+            steps.append({"medoid": medoid, "chosen": [int(i) for i in chosen]})
 
-    _render_video(args, cfg, rows, coords, steps, crop_mip, out_path, color_by, axis_prefix)
+    _render_video(
+        args, cfg, rows, coords, steps, crop_mip, out_path, color_by, axis_prefix, line_info
+    )
     print(f"[traversal] wrote {len(steps)} frames to {out_path}")
 
 
@@ -365,6 +596,7 @@ def _render_video(
     out_path: Path,
     color_by: str = "dataset",
     axis_prefix: str = "PC",
+    line_info: dict[str, Any] | None = None,
 ) -> None:
     import cv2
 
@@ -411,6 +643,32 @@ def _render_video(
                 label=f"{ds}: {rows[int(np.flatnonzero(mask)[0])]['dataset_name'][:20]}",
             )
         legend_title = "dataset"
+    if line_info is not None:
+        # the line and band are a debugging overlay, off unless asked for: the
+        # useful thing to see is the marker tracking a straight path, not the
+        # scaffolding that put it there.
+        if getattr(args, "show_line", False):
+            centre = line_info["centre"]
+            direction = line_info["direction"]
+            normal = line_info["normal"]
+            base = centre + normal * line_info["offset"]
+            start = base + direction * line_info["lo"]
+            end = base + direction * line_info["hi"]
+            ax_map.plot(
+                [start[0], end[0]], [start[1], end[1]],
+                color="red", linewidth=1.2, alpha=0.9, zorder=4, label="walk line",
+            )
+            for sign in (-1.0, 1.0):
+                edge_start = start + normal * sign * line_info["band"]
+                edge_end = end + normal * sign * line_info["band"]
+                ax_map.plot(
+                    [edge_start[0], edge_end[0]], [edge_start[1], edge_end[1]],
+                    color="red", linewidth=0.7, alpha=0.45, linestyle="--", zorder=4,
+                )
+        # equal aspect regardless: the points are meant to read as collinear, and
+        # they won't if the two axes are scaled differently.
+        ax_map.set_aspect("equal", adjustable="datalim")
+
     ax_map.legend(
         fontsize=6, frameon=False, loc="upper left", markerscale=1.6,
         title=legend_title, title_fontsize=6,
@@ -436,11 +694,25 @@ def _render_video(
 
     fig.canvas.draw()
     height, width = fig.canvas.get_width_height()[::-1]
+
+    # render to a local temp file and copy into place at the end. writing an mp4
+    # straight onto the mounted share is what fails when the previous render is
+    # still open in a player or Explorer preview -- Windows denies the write and
+    # cv2 reports only "could not open", with no reason. a local scratch file also
+    # avoids per-frame round trips over SMB.
+    tmp_dir = tempfile.mkdtemp(prefix="latent_traversal_")
+    tmp_video = Path(tmp_dir) / out_path.name
     writer = cv2.VideoWriter(
-        str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (width, height)
+        str(tmp_video), cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (width, height)
     )
     if not writer.isOpened():
-        raise RuntimeError(f"could not open video writer for {out_path}")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise RuntimeError(
+            f"could not open a video writer even locally at {tmp_video}. that points "
+            f"at the OpenCV build rather than the destination: check that cv2 has the "
+            f"mp4v encoder (frame size {width}x{height}, fps {args.fps})."
+        )
+    print(f"[traversal] rendering to {tmp_video}, will copy to {out_path}")
 
     try:
         for step_idx, step in enumerate(steps):
@@ -466,10 +738,20 @@ def _render_video(
                     spine.set_color("red" if is_medoid else "0.7")
                     spine.set_linewidth(2.0 if is_medoid else 0.8)
 
+            if line_info is not None:
+                idx = step["medoid"]
+                text = (
+                    f"line walk  step {step_idx + 1}/{len(steps)}  "
+                    f"{axis_prefix}1={coords[idx, 0]:.3f}  {axis_prefix}2={coords[idx, 1]:.3f}  "
+                    f"off-line={line_info['perpendicular'][idx]:+.3f}"
+                )
+            else:
+                text = (
+                    f"{axis_prefix}1 sweep  step {step_idx + 1}/{len(steps)}  "
+                    f"{axis_prefix}1={coords[step['medoid'], 0]:.3f}"
+                )
             suptitle.set_text(
-                f"{axis_prefix}1 sweep  step {step_idx + 1}/{len(steps)}  "
-                f"{axis_prefix}1={coords[step['medoid'], 0]:.3f}"
-                + (f"  [{label_of(medoid_row)}]" if label_of(medoid_row) else "")
+                text + (f"  [{label_of(medoid_row)}]" if label_of(medoid_row) else "")
             )
 
             fig.canvas.draw()
@@ -482,6 +764,24 @@ def _render_video(
     finally:
         writer.release()
         plt.close(fig)
+
+    try:
+        # release() has to have happened before the copy, hence doing this after
+        # the finally block rather than inside it.
+        shutil.copyfile(tmp_video, out_path)
+    except PermissionError as exc:
+        raise RuntimeError(
+            f"rendered {len(steps)} frames but could not write {out_path}: {exc}. "
+            f"the file is almost certainly open somewhere -- close it in your video "
+            f"player or Explorer preview pane, or pass a different --out. the "
+            f"finished video is still at {tmp_video}."
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"rendered {len(steps)} frames but could not write {out_path}: {exc}. "
+            f"the finished video is still at {tmp_video}."
+        ) from exc
+    shutil.rmtree(tmp_video.parent, ignore_errors=True)
 
 
 if __name__ == "__main__":

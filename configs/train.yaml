@@ -195,7 +195,7 @@ aug_rotation:
 # to fetch crops in parallel. each worker reopens its own zarr handle and
 # pulls samples independently, then hands batches back to the main process.
 # 0 means "load in the main process" (slower but easier to debug).
-num_workers: 22
+num_workers: 14
 
 # seed: base integer used to make sampling reproducible. each worker derives
 # its own rng from (seed + worker_id), and numpy/torch are seeded the same way.
@@ -212,7 +212,9 @@ seed: 0
 #                discarded after training; only the encoder ships.
 stem_channels: 64
 latent_dim: 128 # reduced dimensionality since microscopy data is less complex than ImageNet.
-encoder_chunk_size: 32
+encoder_chunk_size: 16
+checkpoint_stem: True
+checkpoint_backbone: True
 projector_hidden: 512
 projector_bottleneck: 64
 projector_k: 2048
@@ -246,7 +248,7 @@ center_momentum: 0.9
 # 3.0 -> 1.0, so effective pressure drops 0.3 -> 0.02. keep it weak until DINO is
 # stable, then ramp pressure back up gradually. watch dataset_adversary/acc
 # trending toward chance (1/n_datasets) and collapse/embedding_var off the floor.
-dataset_adversary_enabled: true
+dataset_adversary_enabled: false
 dataset_adversary_weight: 0.02
 dataset_adversary_grl_start: 0.0
 dataset_adversary_grl_scale: 2.0
@@ -328,6 +330,7 @@ log_interval: 50
 ckpt_interval: 500
 device: cuda
 use_amp: true
+amp_dtype: fp16
 
 # ---------------------------------------------------------------------------
 # io
