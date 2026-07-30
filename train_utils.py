@@ -163,5 +163,15 @@ def load_checkpoint(
                     param_state = optimizer.state[p]
                     param_state.clear()
     if scaler is not None:
-        scaler.load_state_dict(state["scaler_state_dict"])
+        # a bf16 run has no gradient scaler, so its checkpoints carry an empty
+        # scaler state. loading that into an fp16 run would raise; just start the
+        # scale factor fresh (it re-calibrates within a few steps).
+        scaler_state = state.get("scaler_state_dict") or {}
+        if scaler_state:
+            scaler.load_state_dict(scaler_state)
+        elif scaler.is_enabled():
+            print(
+                "[checkpoint] no gradient scaler state in checkpoint (bf16 run?); "
+                "starting the fp16 loss scale from its default"
+            )
     return int(state["step"])

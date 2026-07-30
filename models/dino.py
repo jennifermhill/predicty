@@ -149,6 +149,8 @@ class DINOWrapper(nn.Module):
             latent_dim=cfg.latent_dim,
             norm_groups=cfg.norm_groups,
             chunk_size=getattr(cfg, "encoder_chunk_size", None),
+            checkpoint_stem=getattr(cfg, "checkpoint_stem", True),
+            checkpoint_backbone=getattr(cfg, "checkpoint_backbone", False),
         )
         student_proj = DINOHead(
             in_dim=cfg.latent_dim,
@@ -309,12 +311,22 @@ class DINOWrapper(nn.Module):
         self.student.last_features = student_features.detach()
 
         with torch.no_grad():
-            # teacher: split encode and project so masking head can reuse encoding
-            t_g_feat = self.teacher.encode(g_flat)
-            t_g = self.teacher.project(t_g_feat)
             t_g_ibot = None
             if do_ibot:
-                t_g_ibot = project_grid(self.teacher.masking_head, self.teacher.encoder.forward_tokens(g_flat, layer=self.ibot_layer))
+                # one encoder pass for both teacher targets. previously
+                # teacher.encode(g_flat) and forward_tokens(g_flat) each ran the
+                # full stem + layer1-4 on the *same* unmasked input, so the whole
+                # teacher forward over every global crop was computed twice.
+                t_g_feat, t_tokens = self.teacher.encoder.forward_with_tokens(
+                    g_flat, layer=self.ibot_layer
+                )
+                # encode() sets this as a side effect; keep parity for anything
+                # that reads the teacher's stashed features.
+                self.teacher.last_features = t_g_feat.detach()
+                t_g_ibot = project_grid(self.teacher.masking_head, t_tokens)
+            else:
+                t_g_feat = self.teacher.encode(g_flat)
+            t_g = self.teacher.project(t_g_feat)
         
         koleo = None
         if self.koleo_enabled:

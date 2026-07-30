@@ -158,7 +158,26 @@ def main() -> None:
     # amp is only supported on cuda. silently disable on cpu.
     use_amp = cfg.use_amp and device.type == "cuda"
 
-    print(f"[train] device={device}  use_amp={use_amp}")
+    # bf16 carries fp32's exponent range, so it needs no gradient scaling and
+    # can't lose a step to an inf/NaN overflow the way fp16 can. fall back to
+    # fp16 where bf16 isn't supported in hardware.
+    amp_dtype_name = str(getattr(cfg, "amp_dtype", "fp16")).lower()
+    if amp_dtype_name not in ("bf16", "bfloat16", "fp16", "float16"):
+        raise ValueError(
+            f"cfg.amp_dtype must be 'bf16' or 'fp16'; got {cfg.amp_dtype!r}"
+        )
+    want_bf16 = amp_dtype_name in ("bf16", "bfloat16")
+    if want_bf16 and use_amp and not torch.cuda.is_bf16_supported():
+        print("[train] WARNING: bf16 unsupported on this gpu, falling back to fp16")
+        want_bf16 = False
+    amp_dtype = torch.bfloat16 if want_bf16 else torch.float16
+    # the scaler only exists for fp16; with bf16 every call is a no-op passthrough.
+    use_scaler = use_amp and amp_dtype is torch.float16
+
+    print(
+        f"[train] device={device}  use_amp={use_amp}  "
+        f"amp_dtype={'bf16' if want_bf16 else 'fp16'}  grad_scaler={use_scaler}"
+    )
     if device.type == "cuda":
         # confirms we actually got the gpu we asked the cluster for.
         idx = device.index if device.index is not None else 0
@@ -234,7 +253,7 @@ def main() -> None:
         lr=cfg.base_lr,
         betas=(0.9, 0.999),
     )
-    scaler = GradScaler(device.type, enabled=use_amp)
+    scaler = GradScaler(device.type, enabled=use_scaler)
 
     # ---- io ----
     # each invocation writes to its own timestamped subdirectory so multiple
@@ -307,8 +326,8 @@ def main() -> None:
             if g.get("wd_scheduled"): # skip the no-decay group
                 g["weight_decay"] = wd
 
-        # forward + loss under autocast (fp16 ops on cuda).
-        with autocast(device.type, dtype=torch.float16, enabled=use_amp):
+        # forward + loss under autocast (bf16/fp16 ops on cuda).
+        with autocast(device.type, dtype=amp_dtype, enabled=use_amp):
             out = model(batch)
             dino = dino_loss(
                 out["student_globals"],
@@ -370,6 +389,9 @@ def main() -> None:
                 loss = loss + koleo_weight * koleo_val
 
         # backward, unscale grads to apply clipping in fp32, step + update.
+        # under bf16 the scaler is disabled and every call here is a passthrough
+        # (scale/unscale_/update no-op, step forwards straight to the optimizer),
+        # so the clipping still sees true-scale gradients.
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -400,9 +422,9 @@ def main() -> None:
                 entropy = -(t_probs * t_probs.clamp(min=1e-8).log()).sum(dim=-1).mean()
                 # embedding variance: stashed from the last student forward.
                 # drops near 0 -> all crops mapping to the same point.
-                # cast to fp32 because under autocast last_features is fp16,
-                # and var of small fp16 values can underflow right when we
-                # most need to see collapse coming.
+                # cast to fp32 because under autocast last_features is fp16
+                # (or bf16), and var of small reduced-precision values can
+                # underflow right when we most need to see collapse coming.
                 feats = model.student.last_features
                 emb_var = (
                     feats.float().var(dim=0).mean()
