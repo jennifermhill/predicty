@@ -85,6 +85,17 @@ def parse_args() -> argparse.Namespace:
         help="z-score features using train-fold statistics before fitting the head",
     )
     p.add_argument(
+        "--restrict", choices=("all", "seen", "unseen"), default="all",
+        help="which experiments to evaluate on, relative to the ones the encoder "
+        "was trained on (the zarr_paths in --config). 'unseen' keeps only "
+        "annotations from experiments absent from SSL training, so the encoder "
+        "provably never saw those pixels -- a stronger guarantee than the spatial "
+        "holdout, which partitions crop top-left positions rather than image area "
+        "and therefore leaves held-out crops overlapping training crops at the "
+        "tile boundaries. 'seen' is the complement. comparing the two says whether "
+        "encoder exposure inflates the headline number.",
+    )
+    p.add_argument(
         "--class-weighted", action=argparse.BooleanOptionalAction, default=True,
         help="weight the probe loss by inverse class frequency so rare classes aren't ignored",
     )
@@ -384,6 +395,11 @@ def main() -> None:
     print(f"[probe] logging to  : {log_path}")
 
     cfg = Config.from_yaml(args.config)
+    # snapshot the SSL training set BEFORE the probe overwrites cfg.zarr_paths
+    # below with the annotation file's (larger) path list. this is the only
+    # place the two are distinguishable, and --restrict needs the difference.
+    ssl_train_paths = set(cfg.zarr_paths or [])
+
     df = pd.read_json(cfg.annotation_path, lines=True)
     df = df[df['label'] != 'empty']
     df = df.drop(columns = ['timestamp'])
@@ -394,6 +410,34 @@ def main() -> None:
             df[col] = pd.to_numeric(df[col])
         except (ValueError, TypeError):
             pass
+
+    # applied before cfg.zarr_paths / dataset_idx are derived, so the extraction
+    # loop opens only the retained experiments and the fold groups stay aligned.
+    if args.restrict != "all":
+        if not ssl_train_paths:
+            raise ValueError(
+                f"--restrict {args.restrict} needs the encoder's training set, but "
+                f"{args.config} has no zarr_paths. pass a run's frozen "
+                "checkpoints/<run>/config.yaml, not a bare config."
+            )
+        was_seen = df["zarr_path"].isin(ssl_train_paths)
+        n_before = len(df)
+        df = df[was_seen] if args.restrict == "seen" else df[~was_seen]
+        if df.empty:
+            raise ValueError(
+                f"--restrict {args.restrict} left no annotations "
+                f"(of {n_before}); check that --config matches this encoder."
+            )
+        print(
+            f"[probe] restrict    : {args.restrict}  "
+            f"({len(df)}/{n_before} annotations, "
+            f"{df['zarr_path'].nunique()} experiments)"
+        )
+        print(f"[probe] label counts: {df['label'].value_counts().to_dict()}")
+        if args.restrict == "unseen":
+            print("[probe] these experiments were absent from SSL training, so the "
+                  "encoder has never seen these pixels in any form.")
+
     cfg.zarr_paths = list(df['zarr_path'].unique())
     # Create dataset_idx mapping for stratified k-fold splitting
     zarr_path_to_idx = {p: i for i, p in enumerate(cfg.zarr_paths)}
