@@ -31,7 +31,7 @@ zarr_paths:
 
 annotation_path: /groups/sgro/sgrolab/Aran/predicty/index.jsonl
 overrepresent_classes: true
-rep_alpha: 0.15
+rep_alpha: 0.06
 
 
 # balanced batches contain floor(batch_size / dataset_count) samples from
@@ -195,7 +195,7 @@ aug_rotation:
 # to fetch crops in parallel. each worker reopens its own zarr handle and
 # pulls samples independently, then hands batches back to the main process.
 # 0 means "load in the main process" (slower but easier to debug).
-num_workers: 14
+num_workers: 10
 
 # seed: base integer used to make sampling reproducible. each worker derives
 # its own rng from (seed + worker_id), and numpy/torch are seeded the same way.
@@ -248,7 +248,7 @@ center_momentum: 0.9
 # 3.0 -> 1.0, so effective pressure drops 0.3 -> 0.02. keep it weak until DINO is
 # stable, then ramp pressure back up gradually. watch dataset_adversary/acc
 # trending toward chance (1/n_datasets) and collapse/embedding_var off the floor.
-dataset_adversary_enabled: false
+dataset_adversary_enabled: true
 dataset_adversary_weight: 0.02
 dataset_adversary_grl_start: 0.0
 dataset_adversary_grl_scale: 2.0

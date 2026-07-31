@@ -19,7 +19,7 @@
 #BSUB -J predicty_train              # job name (shows in bjobs)
 #BSUB -q gpu_a100                   # A100 queue: 12 slots/GPU, 40GB ram/slot, 141GB VRAM
 #BSUB -gpu "num=1"                   # request 1 GPU
-#BSUB -n 24                           # 8 slots = 8 cores + 320 GB ram (slot-implied)
+#BSUB -n 12                           # 8 slots = 8 cores + 320 GB ram (slot-implied)
 #BSUB -W 72:00                       # 72 hour walltime
 #BSUB -oo logs/lsf/default/train.out # stdout log (overwritten on each submit; -oo not -o)
 #BSUB -eo logs/lsf/default/train.err # stderr log (overwritten on each submit)
@@ -47,13 +47,42 @@ if [ ! -f "${config_path}" ]; then
     exit 1
 fi
 
-# cap per-process threading. without these, every numerical library detects
-# the full node's core count and spawns that many threads per process. with
-# 4 dataloader workers + 1 main process, value of 2 keeps total threads at
-# ~10 across the 8 slots we requested.
-export OMP_NUM_THREADS=2
-export MKL_NUM_THREADS=2
-export OPENBLAS_NUM_THREADS=2
+# guard against oversubscribing the slot allocation. every dataloader worker is
+# its own process and the main process needs a core too, so num_workers must be
+# strictly below the slot count. LSB_DJOB_NUMPROC is what LSF actually granted,
+# counted in physical cores -- do not size against /proc/cpuinfo or
+# os.cpu_count(), which report the node's logical count (2x, hyperthreading) and
+# would silently let e.g. 22 workers land on a 16-slot allocation.
+# awk (not grep) so a config without the key yields empty instead of tripping
+# `set -o pipefail`.
+n_workers=$(awk '/^[[:space:]]*num_workers:/ {print $2; exit}' "${config_path}")
+if [ -n "${n_workers:-}" ] && [ -n "${LSB_DJOB_NUMPROC:-}" ]; then
+    if [ "${n_workers}" -ge "${LSB_DJOB_NUMPROC}" ]; then
+        echo "ERROR: num_workers=${n_workers} in ${config_path} needs at least" >&2
+        echo "       $((n_workers + 1)) slots, but LSF granted ${LSB_DJOB_NUMPROC}." >&2
+        echo "       lower num_workers or raise '#BSUB -n' before resubmitting." >&2
+        exit 1
+    fi
+    echo "[submit] slots=${LSB_DJOB_NUMPROC}  num_workers=${n_workers}  (ok)"
+fi
+
+# cap per-process threading at 1. without these, every numerical library detects
+# the *node's* core count (48-128 here, and 2x that in logical CPUs because
+# hyperthreading is on) rather than the slots LSF granted, and spawns that many
+# threads per process -- which then multiplies by num_workers. these workers do
+# nfs reads and blosc decompression, no BLAS, so 1 apiece is right.
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export TBB_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
+# let the caching allocator grow segments instead of fragmenting into fixed-size
+# blocks it can't reuse. matters on a 24GB L4, where the 3D stem's transient
+# activations (~84MB per crop for one 64ch x 10z x 256^2 map, x encoder_chunk_size
+# crops at once) leave little slack -- fragmentation alone can be the difference
+# between fitting and an OOM. harmless on an 80GB A100.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # node-local scratch for any temp files (matplotlib cache, dask spills, etc.)
 # never use /tmp on compute nodes per cluster policy.
