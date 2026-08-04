@@ -63,6 +63,15 @@ class ZarrCellDataset(IterableDataset):
             raise ValueError("cfg.zarr_path must be set before constructing ZarrCellDataset")
         self.cfg = cfg
 
+        # allowed top-left positions under cfg.max_train_footprint_overlap.
+        # built lazily on first use so each dataloader worker computes its own
+        # copy rather than inheriting a large array across fork, and so it can
+        # be invalidated when MultiZarrDataset rebuilds the region set.
+        # see the TEMPORARY block in configs/config.py -- this is scaffolding
+        # until the holdout partitions image area instead of top-left positions.
+        self._allowed_offsets: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        self._allowed_offsets_built = False
+
         # open once here to read shape and resolve ranges.
         self._open_zarr()
         # Initialized before range resolution because content-aware holdout
@@ -448,8 +457,80 @@ class ZarrCellDataset(IterableDataset):
             )
         return regions
 
+    def _build_allowed_offsets(self) -> None:
+        """precompute top-left positions passing max_train_footprint_overlap.
+
+        TEMPORARY -- see configs/config.py. exact rather than rejection-looped:
+        the whole candidate grid is scored in one vectorised pass against a
+        summed-area table of the training regions' pixel footprint, so sampling
+        afterwards is O(1) with no retry loop.
+        """
+        cfg = self.cfg
+        self._allowed_offsets_built = True
+        self._allowed_offsets = None
+        thr = cfg.max_train_footprint_overlap
+        # only meaningful while sampling the held-out regions. training leaves
+        # the field None and never reaches this.
+        if thr is None or cfg.spatial_region_mode != "holdout":
+            return
+
+        crop = cfg.global_crop_size
+        gy, gx = cfg.spatial_region_grid_y, cfg.spatial_region_grid_x
+        holdout = set(self._spatial_holdout_regions)
+        train = np.zeros((self.Y, self.X), dtype=bool)
+        for idx in range(gy * gx):
+            if idx in holdout:
+                continue
+            y0, y1, x0, x1 = region_bounds_for_top_left(
+                self.Y, self.X, crop, gy, gx, idx
+            )
+            # bands are top-left ranges; a crop at y1-1 reaches y1-1+crop.
+            train[y0 : y1 - 1 + crop, x0 : x1 - 1 + crop] = True
+        sat = np.pad(train.cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+
+        ys_keep, xs_keep, regs_keep = [], [], []
+        for idx, y0, y1, x0, x1 in self._spatial_regions:
+            yy, xx = np.meshgrid(
+                np.arange(y0, y1), np.arange(x0, x1), indexing="ij"
+            )
+            yy, xx = yy.ravel(), xx.ravel()
+            overlap = (
+                sat[yy + crop, xx + crop]
+                - sat[yy, xx + crop]
+                - sat[yy + crop, xx]
+                + sat[yy, xx]
+            ) / float(crop * crop)
+            keep = overlap <= thr
+            ys_keep.append(yy[keep].astype(np.int32))
+            xs_keep.append(xx[keep].astype(np.int32))
+            regs_keep.append(np.full(int(keep.sum()), idx, dtype=np.int32))
+
+        ys = np.concatenate(ys_keep)
+        if ys.size == 0:
+            raise ValueError(
+                f"max_train_footprint_overlap={thr} leaves no legal crop "
+                f"position in {cfg.zarr_path!r} (frame {self.Y}x{self.X}, crop "
+                f"{crop}, holdout {sorted(holdout)}). raise the threshold: with "
+                "a 3x3 grid and a 256px crop the achievable floor is ~11% on a "
+                "978px frame and 0% only on the larger frames."
+            )
+        self._allowed_offsets = (
+            ys, np.concatenate(xs_keep), np.concatenate(regs_keep)
+        )
+
     def _sample_global_offset(self, rng: random.Random) -> tuple[int, int, int]:
         cfg = self.cfg
+        # TEMPORARY overlap-capped sampling (configs/config.py). rejection
+        # happens here, before _load_crop_raw is ever called, because the test
+        # is purely geometric -- so a filtered run reads only crops it keeps.
+        if cfg.max_train_footprint_overlap is not None:
+            if not self._allowed_offsets_built:
+                self._build_allowed_offsets()
+            if self._allowed_offsets is not None:
+                ys, xs, regs = self._allowed_offsets
+                i = rng.randrange(len(ys))
+                return int(ys[i]), int(xs[i]), int(regs[i])
+
         if cfg.spatial_region_mode == "all":
             y_off = rng.randrange(0, self.Y - cfg.global_crop_size + 1)
             x_off = rng.randrange(0, self.X - cfg.global_crop_size + 1)
@@ -565,13 +646,29 @@ class ZarrCellDataset(IterableDataset):
         local_offsets: list[tuple[int, int]] = []
         locals_: list[torch.Tensor] = []
         for _parent in local_parents:
-            t_local = rng.randrange(t_lo, t_hi + 1)
+            if cfg.local_time_endpoints:
+                t_local = t1 if rng.random() < 0.5 else t2
+            else:
+                t_local = rng.randrange(t_lo, t_hi + 1)
             lz = rng.randrange(z, lz_start_max + 1)
             ly = rng.randrange(y_off, y_off + g_size - l_size + 1)
             lx = rng.randrange(x_off, x_off + g_size - l_size + 1)
-            raw_l = self._load_crop_raw(
-                t_local, lz, ly, lx, l_size, l_size, z_thickness=l_z
-            )
+            if cfg.local_time_endpoints:
+                # the local is already nested inside its parent global in z, y
+                # and x, so an endpoint timepoint makes it a slice of an array
+                # already in memory: no zarr read. parent origin is
+                # (z, y_off, x_off). compared against t1 by value, so this is
+                # correct for temporal_direction "backward" too.
+                src = raw_t1 if t_local == t1 else raw_t2
+                raw_l = np.ascontiguousarray(src[
+                    lz - z : lz - z + l_z,
+                    ly - y_off : ly - y_off + l_size,
+                    lx - x_off : lx - x_off + l_size,
+                ])
+            else:
+                raw_l = self._load_crop_raw(
+                    t_local, lz, ly, lx, l_size, l_size, z_thickness=l_z
+                )
             local_ts.append(t_local)
             local_zs.append(lz)
             local_offsets.append((ly, lx))
@@ -711,13 +808,29 @@ class ZarrCellDataset(IterableDataset):
         local_offsets: list[tuple[int, int]] = []
         locals_: list[torch.Tensor] = []
         for _parent in local_parents:
-            t_local = rng.randrange(t_lo, t_hi + 1)
+            if cfg.local_time_endpoints:
+                t_local = t1 if rng.random() < 0.5 else t2
+            else:
+                t_local = rng.randrange(t_lo, t_hi + 1)
             lz = rng.randrange(z, lz_start_max + 1)
             ly = rng.randrange(y_off, y_off + g_size - l_size + 1)
             lx = rng.randrange(x_off, x_off + g_size - l_size + 1)
-            raw_l = self._load_crop_raw(
-                t_local, lz, ly, lx, l_size, l_size, z_thickness=l_z
-            )
+            if cfg.local_time_endpoints:
+                # the local is already nested inside its parent global in z, y
+                # and x, so an endpoint timepoint makes it a slice of an array
+                # already in memory: no zarr read. parent origin is
+                # (z, y_off, x_off). compared against t1 by value, so this is
+                # correct for temporal_direction "backward" too.
+                src = raw_t1 if t_local == t1 else raw_t2
+                raw_l = np.ascontiguousarray(src[
+                    lz - z : lz - z + l_z,
+                    ly - y_off : ly - y_off + l_size,
+                    lx - x_off : lx - x_off + l_size,
+                ])
+            else:
+                raw_l = self._load_crop_raw(
+                    t_local, lz, ly, lx, l_size, l_size, z_thickness=l_z
+                )
             local_ts.append(t_local)
             local_zs.append(lz)
             local_offsets.append((ly, lx))
@@ -954,6 +1067,10 @@ class MultiZarrDataset(IterableDataset):
             )
             child._spatial_holdout_regions = selected
             child._spatial_regions = child._build_spatial_regions()
+            # the allowed-offset set depends on which regions are held out, so
+            # it must be recomputed now that they are resolved.
+            child._allowed_offsets = None
+            child._allowed_offsets_built = False
 
     def _log_open(self) -> None:
         mode = (

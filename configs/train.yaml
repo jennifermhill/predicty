@@ -1,3 +1,24 @@
+# =============================================================================
+# RUN A of 2 -- ibot_weight 0.1. THE NEW BASELINE.
+#
+# This is the reference run under the new sampler: 2x2 spatial holdout,
+# local_time_endpoints, rep_alpha 0.06. Everything in CLAUDE.md §1 was measured
+# under the OLD sampler, so nothing there is comparable to this -- run A is what
+# future levers get compared against.
+#
+# train1.yaml is this file with ibot_weight 0.2 and nothing else changed.
+# launch.sh only ever reads configs/train.yaml, so to run the second one:
+#   ./launch.sh 0804-A-NewBaseline         # this file
+#   rm configs/train.yaml && mv configs/train1.yaml configs/train.yaml
+#   ./launch.sh 0804-B-iBOTw02             # the other one
+# launch.sh snapshots the config into checkpoints/<run>/config.yaml at submit
+# time, so swapping the file afterwards cannot disturb an already-queued run.
+#
+# rep_alpha is 0.06 in BOTH runs and is not under test. It is kept low on
+# eval-integrity grounds (see the note at rep_alpha below), which is true by
+# construction and does not need an experiment -- and could not get a clean one
+# anyway, since lowering it removes leakage that inflates the behavior probe.
+# =============================================================================
 # starter training config. unspecified keys keep their python defaults.
 # leave zarr_path null so the file picker (or --zarr-path) chooses it at runtime.
 
@@ -31,6 +52,12 @@ zarr_paths:
 
 annotation_path: /groups/sgro/sgrolab/Aran/predicty/index.jsonl
 overrepresent_classes: true
+# Same in both runs -- NOT under test. This is the fraction of TRAINING samples
+# drawn straight from annotated probe-crop coordinates, on a branch that bypasses
+# _spatial_regions entirely, so every one is a probe crop the encoder sees at its
+# exact coordinates. 0720 ran 0.15; kept at 0.06 to cut that leakage. The only
+# measurement of 0.06 (0729-C) regressed, but it moved z_edge_bias 0.85->0.5 at
+# the same time, so it says nothing about rep_alpha on its own.
 rep_alpha: 0.06
 
 
@@ -48,12 +75,17 @@ local_z_thickness: 5    # number of z slices per local; contiguous sub-slab of t
 # ---------------------------------------------------------------------------
 # WS-DINO multi-crop: exactly 2 globals (one at t1, one at t2, sharing the same
 # (y, x) offset and z slab) and n_local_crops locals split evenly between the
-# two globals as spatial parents. each local picks its time uniformly from
-# [t1, t2] and a contiguous local_z_thickness sub-slab inside the global z
-# window. n_local_crops must be even.
+# two globals as spatial parents. each local picks its time (see
+# local_time_endpoints below) and a contiguous local_z_thickness sub-slab
+# inside the global z window. n_local_crops must be even.
 n_local_crops: 6
 global_crop_size: 256
 local_crop_size: 96
+
+# draw each local's time from {t1, t2} instead of uniformly over [t1, t2], so
+# it is a slice of the parent global already in memory rather than its own
+# read. 50 -> 20 plane reads per sample. false restores the old draw.
+local_time_endpoints: true
 
 # minimum crop intensity, as a fraction of the mean intensity over the active
 # z slab at t1. a global crop is accepted only if its mean is at least
@@ -66,20 +98,29 @@ intensity_max_attempts: 1000
 # spatial holdout
 # ---------------------------------------------------------------------------
 # Regions are defined as a row-major grid over legal global-crop top-left
-# positions in each dataset. For this 3x3 grid, content-based selection scores
-# each tile by crop intensity relative to its frame/slab mean. In multi-zarr
-# runs, scores are aggregated across datasets and the same three high-content,
-# non-adjacent tile indices are held out everywhere. DINO training excludes
-# those selected tiles. The dataset-ID probe overrides spatial_region_mode to
-# "holdout", samples only those selected tiles from every dataset, then splits
-# each held-out tile spatially into probe train/val.
-spatial_region_grid_y: 3
-spatial_region_grid_x: 3
+# positions in each dataset. Content-based selection scores each tile by crop
+# intensity relative to its frame/slab mean. In multi-zarr runs, scores are
+# aggregated across datasets and the same high-content tile indices are held
+# out everywhere. DINO training excludes those selected tiles. The dataset-ID
+# probe overrides spatial_region_mode to "holdout", samples only those selected
+# tiles from every dataset, then splits each held-out tile spatially into probe
+# train/val.
+#
+# 3x3 -> 2x2: the grid partitions legal TOP-LEFT positions, but a crop reaches
+# global_crop_size px past its top-left, so 3x3's 241 px bands are narrower than
+# the 256 px crop and six of nine training frames had ZERO clean probe
+# positions. 2x2 tiles are ~361 px: 670,578 clean positions (>=11,130 on every
+# frame) vs 373,906, and 75% of training positions retained vs 66.7%. Cost is
+# location bias. Does not rescue a 512x512 frame (tile ~128 px < crop).
+spatial_region_grid_y: 2
+spatial_region_grid_x: 2
 spatial_holdout_region: null
 spatial_holdout_regions: null
 spatial_region_mode: exclude_holdout
 spatial_holdout_selection: content
-spatial_holdout_region_count: 3
+# MUST be 1 on a 2x2 grid: all four tiles are pairwise Chebyshev-adjacent, so
+# no two of them satisfy nonadjacent_gap 1 and any higher count is unsatisfiable.
+spatial_holdout_region_count: 1
 spatial_holdout_nonadjacent_gap: 1
 spatial_holdout_min_content: 0.95
 spatial_holdout_content_samples_per_region: 8
@@ -195,7 +236,9 @@ aug_rotation:
 # to fetch crops in parallel. each worker reopens its own zarr handle and
 # pulls samples independently, then hands batches back to the main process.
 # 0 means "load in the main process" (slower but easier to debug).
-num_workers: 10
+# must stay strictly below the LSF slot count (submit_train.sh enforces this and
+# exits if violated). 22 workers -> #BSUB -n 24.
+num_workers: 22
 
 # seed: base integer used to make sampling reproducible. each worker derives
 # its own rng from (seed + worker_id), and numpy/torch are seeded the same way.
@@ -212,9 +255,10 @@ seed: 0
 #                discarded after training; only the encoder ships.
 stem_channels: 64
 latent_dim: 128 # reduced dimensionality since microscopy data is less complex than ImageNet.
-encoder_chunk_size: 16
-checkpoint_stem: True
-checkpoint_backbone: True
+encoder_chunk_size: 32   # 0720's value; it peaked at 41 of 80 GB, so headroom.
+# checkpoint_stem / checkpoint_backbone deliberately unset -> python defaults
+# (stem True, backbone False). checkpointing the backbone cost ~25% throughput
+# for memory we do not need at 41/80 GB.
 projector_hidden: 512
 projector_bottleneck: 64
 projector_k: 2048
@@ -281,6 +325,12 @@ mae_norm_pix_loss: true
 # 1 = patch-wise, 2 = 2x2 blocks, etc.
 ibot_enabled: true
 ibot_p: 1.0
+# >>> THE ONLY LINE THAT DIFFERS FROM train1.yaml <<<
+# 0720's value, held here as the baseline. train1.yaml raises it to 0.2, the last
+# untested point in the safe range: >=0.3 starves the DINO head into uniform
+# collapse. WATCH teacher_entropy / ln(projector_k) on the 0.2 run -- 0720 sat at
+# 0.71; a climb toward 1.0 is the collapse signature, and it shows up early, so
+# check by ~step 1000 rather than burning the full run.
 ibot_weight: 0.1
 ibot_mask_ratio: [0.4, 0.4]
 ibot_layer: layer4

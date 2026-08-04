@@ -58,6 +58,15 @@ class Config:
     global_crop_size: int = 256
     local_crop_size: int = 96
 
+    # draw each local's timepoint from {t1, t2} instead of uniformly over
+    # [t1, t2]. a local is already nested inside its parent global in z, y and
+    # x, so an endpoint timepoint makes it a slice of an array already in
+    # memory -- no zarr read. chunks here are full XY planes, so this drops
+    # per-sample plane reads from 50 to 20. cross-time invariance is
+    # unaffected: local_parent is assigned independently of the timepoint.
+    # false restores the old uniform draw for an ablation.
+    local_time_endpoints: bool = True
+
     # accept a global crop only if its mean is at least this fraction of the
     # mean intensity over the active z slab at t1. lower values are more permissive.
     intensity_min_frac: float = 0.95
@@ -84,6 +93,42 @@ class Config:
     spatial_holdout_min_content: float = 0.95
     spatial_holdout_content_samples_per_region: int = 8
     spatial_holdout_seed: int = 0
+
+    # ------------------------------------------------------------------
+    # PERMANENT -- this is the probe-side half of the contamination fix.
+    # ------------------------------------------------------------------
+    # the spatial region grid partitions crop TOP-LEFT positions, but a crop
+    # occupies global_crop_size px beyond its top-left, so each region's pixel
+    # footprint is its band widened by global_crop_size - 1 and adjacent bands
+    # overlap by exactly that much. a crop drawn from a "held-out" region can
+    # therefore be built largely -- sometimes entirely -- out of pixels the
+    # encoder trained on. measured on this cohort: ~78% mean overlap on the
+    # 978x976 frames, ~48% on the 1906x1443 ones.
+    #
+    # when set (0-1), the sampler only draws global crops whose footprint
+    # overlaps the training regions' footprint by at most this fraction. it is
+    # applied BEFORE any read, since the test is purely geometric -- a function
+    # of (y, x, frame dims, grid, crop size) with no dependence on pixels -- so
+    # rejected candidates cost nothing. this also keeps rejection upstream of
+    # balance_datasets, so per-experiment counts stay even; filtering after
+    # extraction skews them badly, because the achievable overlap floor differs
+    # per frame size (11.4% at 978px vs 0% at 1906px).
+    #
+    # eval-only. left None for training, where it is a no-op -- the sampler
+    # takes exactly the path it always did and consumes the same rng draws.
+    #
+    # THIS DOES NOT GO AWAY. an earlier note here said the real fix was to
+    # repartition by image area and delete this field. that is backwards. the
+    # grid geometry decides whether a zero-overlap position EXISTS; this field
+    # is what SELECTS it. on a 3x3 with a 256px crop the tiles are 240px and no
+    # clean position exists at all (which is why grid_y/x moved to 2, where
+    # tiles are ~361px and 106 positions per axis clear the boundary). but even
+    # at 2x2 only ~8% of the held-out tile is clean, so the cap is still what
+    # picks those crops out. the only alternative -- pushing TRAINING top-lefts
+    # back from the boundary instead -- costs far more, since training holds
+    # three of four tiles and a 256px gutter would cut the adjacent band from
+    # 361 to ~105 positions per axis. filter the probe side, not training.
+    max_train_footprint_overlap: float | None = None
     # Internal override used by MultiZarrDataset after aggregating content
     # scores across datasets, so every dataset holds out the same tile indices.
     spatial_holdout_resolved_regions: list[int] | None = None
