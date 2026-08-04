@@ -28,6 +28,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 # allow running as `python eval/probe_dataset.py` from project root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -58,6 +60,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--probe-batch-size", type=int, default=512)
     p.add_argument("--probe-weight-decay", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=42, help="seed for sampling + train/val split")
+    p.add_argument(
+        "--max-contamination", type=float, default=None,
+        help=(
+            "drop probe crops whose pixels overlap the training regions' "
+            "footprint by more than this fraction (0-1). the spatial holdout "
+            "partitions crop TOP-LEFT positions, not image area, and every crop "
+            "extends global_crop_size-1 px past its top-left -- so a 'held-out' "
+            "crop can still be built largely from pixels training saw. the "
+            "overlap fraction is always reported; pass this to also filter on "
+            "it. note the achievable floor is not 0: with a 3x3 grid, 3 held-out "
+            "regions and a 256px crop the uncontaminated area is three 241px "
+            "corners, which cannot contain a 256px crop at all (floor ~11%). "
+            "compare an unfiltered run against a filtered one to see how much "
+            "of the reported leakage is crop memorisation."
+        ),
+    )
     p.add_argument(
         "--split",
         choices=("spatial-holdout", "random"),
@@ -196,6 +214,63 @@ def random_split(
     X, y = X[perm], y[perm]
     n_train = int(0.8 * X.size(0))
     return X[:n_train], y[:n_train], X[n_train:], y[n_train:]
+
+
+def training_footprint_overlap(
+    rows: list[dict[str, Any]],
+    cfg: Config,
+    holdout_regions: list[int],
+) -> torch.Tensor:
+    """per-crop fraction of pixels that training-region crops could also cover.
+
+    the spatial holdout partitions crop top-left positions into a grid, but a
+    crop occupies `global_crop_size` px beyond its top-left, so each region's
+    pixel footprint is its top-left band widened by global_crop_size - 1.
+    adjacent bands therefore overlap by exactly that much, and a crop drawn from
+    a held-out band can consist largely -- sometimes entirely -- of pixels a
+    training crop could also have covered. this quantifies that per crop so the
+    probe number can be read against it instead of assumed clean.
+
+    returns a float tensor in [0, 1], aligned with `rows`.
+    """
+    grid_y, grid_x = cfg.spatial_region_grid_y, cfg.spatial_region_grid_x
+    crop = cfg.global_crop_size
+    frame_y = int(rows[0]["frame_y"]) if rows else 0
+    frame_x = int(rows[0]["frame_x"]) if rows else 0
+
+    # union of the training regions' pixel footprints, as a boolean mask.
+    train = np.zeros((frame_y, frame_x), dtype=bool)
+    for idx in range(grid_y * grid_x):
+        if idx in holdout_regions:
+            continue
+        y0, y1, x0, x1 = region_bounds_for_top_left(
+            frame_y, frame_x, crop, grid_y, grid_x, idx
+        )
+        # bands are top-left ranges; a crop starting at y1-1 reaches y1-1+crop.
+        train[y0 : y1 - 1 + crop, x0 : x1 - 1 + crop] = True
+
+    # summed-area table so each crop's overlap is 4 lookups.
+    sat = np.pad(train.cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+    out = torch.empty(len(rows), dtype=torch.float32)
+    for i, row in enumerate(rows):
+        y, x = int(row["global_y"]), int(row["global_x"])
+        y2, x2 = min(y + crop, frame_y), min(x + crop, frame_x)
+        covered = sat[y2, x2] - sat[y, x2] - sat[y2, x] + sat[y, x]
+        out[i] = covered / max(1, (y2 - y) * (x2 - x))
+    return out
+
+
+def report_contamination(overlap: torch.Tensor) -> None:
+    q = torch.tensor([0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0])
+    vals = torch.quantile(overlap, q)
+    print("[probe] training-footprint overlap per probe crop "
+          "(fraction of each crop's pixels that training could also see):")
+    print("        " + "  ".join(f"p{int(p*100):<3d}={v*100:5.1f}%"
+                                 for p, v in zip(q.tolist(), vals.tolist())))
+    print(f"        mean={overlap.mean()*100:.1f}%   "
+          f">99% contaminated: {(overlap > 0.99).float().mean()*100:.1f}% of crops")
+    print("        higher overlap inflates this probe (memorised crops are more "
+          "identifiable), so it biases the reported leakage UP, not down.")
 
 
 def spatial_holdout_split(
@@ -355,6 +430,30 @@ def main() -> None:
     print(f"[probe] extracted in {time.time()-t0:.1f}s.  X.shape={tuple(X.shape)}  y.shape={tuple(y.shape)}")
     print(f"[probe] dataset_idx counts: {torch.bincount(y, minlength=n_datasets).tolist()}")
     print()
+
+    # --- how much of this "held-out" data did the encoder actually see? ---
+    if args.split == "spatial-holdout" and rows:
+        # in holdout mode the sampler only visits held-out regions, so the
+        # regions present in `rows` ARE the resolved holdout set -- read it off
+        # the data rather than plumbing it out of the dataset object.
+        holdout_regions = sorted({int(r["spatial_region_idx"]) for r in rows})
+        print(f"[probe] holdout regions present in sample: {holdout_regions}")
+        overlap = training_footprint_overlap(rows, cfg, holdout_regions)
+        report_contamination(overlap)
+        if args.max_contamination is not None:
+            keep = overlap <= args.max_contamination
+            if not bool(keep.any()):
+                raise ValueError(
+                    f"--max-contamination {args.max_contamination} left no crops; "
+                    f"the minimum achievable here is {overlap.min():.3f}. see the "
+                    "flag's help text for why the floor is above zero."
+                )
+            X, y = X[keep], y[keep]
+            rows = [r for r, k in zip(rows, keep.tolist()) if k]
+            print(f"[probe] --max-contamination {args.max_contamination}: kept "
+                  f"{int(keep.sum())}/{keep.numel()} crops "
+                  f"(mean overlap now {overlap[keep].mean()*100:.1f}%)")
+        print()
 
     # --- train/val split ---
     if args.split == "spatial-holdout":

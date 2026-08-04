@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import itertools
+import math
+
 
 def region_row_col(region_idx: int, grid_x: int) -> tuple[int, int]:
     return region_idx // grid_x, region_idx % grid_x
@@ -120,8 +123,40 @@ def select_nonadjacent_regions(
                 if len(selected) == count:
                     return selected
 
+    # the greedy pass above commits to its first pick and never reconsiders, so
+    # it can paint itself into a corner even when a feasible set exists. the
+    # canonical case is a 3x3 grid at min_gap=1, where the centre tile is
+    # adjacent to all eight others: picking it first strands the selection at
+    # one region, and neither loop above can back out of that choice. (only
+    # subsets of the four corners, e.g. {0,2,6,8}, are feasible there.) fall
+    # back to an exhaustive search, which is exact and cheap at these sizes.
+    # greedy is left first and untouched so configs it already satisfies keep
+    # selecting exactly the same regions as before.
+    if len(selected) < count:
+        ranked = [idx for idx, _ in sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))]
+        if math.comb(len(ranked), count) <= 200_000:
+            best_combo: tuple[int, ...] | None = None
+            best_key: tuple[float, float] | None = None
+            for combo in itertools.combinations(ranked, count):
+                if any(
+                    regions_are_adjacent(a, b, grid_x, min_gap)
+                    for a, b in itertools.combinations(combo, 2)
+                ):
+                    continue
+                # maximise the weakest region first, then the total, matching
+                # greedy's intent of preferring high-content regions.
+                key = (min(scores[i] for i in combo), sum(scores[i] for i in combo))
+                if best_key is None or key > best_key:
+                    best_key, best_combo = key, combo
+            if best_combo is not None:
+                return sorted(best_combo, key=lambda i: (-scores[i], i))
+
     if len(selected) < count:
         raise ValueError(
-            f"could only select {len(selected)} non-adjacent regions; requested {count}"
+            f"could only select {len(selected)} non-adjacent regions; requested "
+            f"{count}. no set of {count} regions in this {len(scores)}-region "
+            f"grid is pairwise more than {min_gap} tile(s) apart -- lower "
+            "spatial_holdout_region_count or spatial_holdout_nonadjacent_gap, "
+            "or use a coarser grid."
         )
     return selected
