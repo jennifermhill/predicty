@@ -1,13 +1,12 @@
-"""interactively inspect the raw crops represented by points in a 3D latent map.
+"""the viewer shows the raw crops for the points in a 3D latent map.
 
-this is the 3D counterpart of eval/interactive_latent_viewer.py and keeps the
-same workflow: pick points on the latent map, see their exact raw temporal crops
-in a second window, optionally decode blended latents in Generate mode. It reads
-the coord_x3/coord_y3/coord_z3 columns written by eval/latent_space.py (the 3D
-fit), leaving coord_x/coord_y -- the 2D fit used by the 2D viewer -- untouched.
+the module is the 3D counterpart of eval/interactive_latent_viewer.py. see that
+module for the shared workflow, the label rings, the checkboxes and Generate
+mode. this module reads the coord_x3/coord_y3/coord_z3 columns from
+latent_space.py's 3D fit, and it leaves the 2D coord_x/coord_y alone.
 
-Mouse handling differs from the 2D viewer because matplotlib's 3D axes already
-claim mouse drags for camera control, and there is no lasso in 3D:
+only the mouse behavior differs, because matplotlib's 3D axes already claim the
+drags for the camera and there is no 3D lasso:
 
     left-drag            rotate the camera (matplotlib's own behavior)
     right-drag           zoom (matplotlib's own behavior)
@@ -16,23 +15,16 @@ claim mouse drags for camera control, and there is no lasso in 3D:
     right-click          every point within --pick-radius pixels of the click
     C                    clear the selection
 
-A "click" is a press and release that moved less than --click-tolerance pixels,
-so ordinary rotating and zooming never trigger a selection. Both selections work
-in *screen space*, i.e. distance as it appears on your monitor at the current
-camera angle, which is the only notion of "near the thing I clicked" that
-matches what you actually see. Rotate and the same click selects different
-points -- that is the point of having a 3D view.
+a "click" is a press and release pair that moved less than --click-tolerance
+pixels. a rotation and a zoom therefore never select. the selection works in
+*screen space* at the current camera angle. screen space is the only measure of
+"near what I clicked" that matches what you see. after a rotation, the same
+click picks different points.
 
-Everything else mirrors the 2D viewer: points are colored by dataset, annotated
-points get a colored ring by behavior label, the two "Annotated"/"Unannotated"
-checkboxes hide points from both drawing and selection, and a left-click always
-reserves one slot for the nearest annotated crop so clicking near a ring doesn't
-surface only unlabeled neighbors.
-
-With --decoder-checkpoint, Generate mode appears. A 2D click is a ray in 3D, not
-a point, so the click is unprojected at the depth of the nearest visible real
-point -- meaning you generate on the surface of the cloud you can see, not at an
-arbitrary distance along the line of sight. Blending then uses true 3D distances.
+in Generate mode a 2D click is a ray and not a point. the viewer therefore
+unprojects the click at the depth of the nearest visible real point. you
+generate on the visible surface of the cloud, and not at an arbitrary position
+along the line of sight. the blend then uses true 3D distances.
 
 Example:
     python eval/interactive_latent_viewer_3d.py \
@@ -154,17 +146,17 @@ def parse_args() -> argparse.Namespace:
 def read_metadata_3d(path: Path) -> tuple[list[dict[str, Any]], np.ndarray]:
     """rows plus the (N, 3) coordinate array from the 3D fit.
 
-    prefers coord_x3/coord_y3/coord_z3 (eval/latent_space.py's 3D fit) and falls
-    back to a plain coord_x/coord_y/coord_z trio so a hand-built or externally
-    projected metadata.csv still works.
+    the function prefers coord_x3/coord_y3/coord_z3. the function falls back to
+    a plain coord_x/coord_y/coord_z trio, so that an externally projected
+    metadata.csv works.
     """
     with path.open(newline="") as handle:
         rows = list(csv.DictReader(handle))
     if not rows:
         raise ValueError(f"metadata is empty: {path}")
 
-    # coord_x/coord_y are part of REQUIRED_COLUMNS but describe the 2D fit; the
-    # 3D coords are checked separately below.
+    # coord_x/coord_y are part of REQUIRED_COLUMNS, but they describe the 2D
+    # fit. the code checks the 3D coords separately below.
     missing = (REQUIRED_COLUMNS - {"coord_x", "coord_y"}).difference(rows[0])
     if missing:
         raise ValueError(f"metadata is missing required columns: {sorted(missing)}")
@@ -190,11 +182,11 @@ def read_metadata_3d(path: Path) -> tuple[list[dict[str, Any]], np.ndarray]:
 
 
 def load_real_embeddings_3d(embeddings_path: Path, coords: np.ndarray) -> np.ndarray:
-    """load high-dim embeddings and confirm they belong to this metadata.csv.
+    """the function loads the high-dim embeddings and confirms that they belong
+    to this metadata.csv.
 
-    same guard as the 2D viewer, against the coords_<method>_3d arrays: a
-    mismatched embeddings.npz would otherwise silently blend vectors from a
-    different run or a different row order.
+    the guard is the same as in interactive_latent_viewer.load_real_embeddings.
+    the function matches against the coords_<method>_3d arrays instead.
     """
     if not embeddings_path.exists():
         raise FileNotFoundError(
@@ -224,10 +216,10 @@ def load_real_embeddings_3d(embeddings_path: Path, coords: np.ndarray) -> np.nda
 
 
 def axis_labels(metadata_path: Path) -> tuple[str, str, str]:
-    """label axes after the projection method, taken from the containing dir.
+    """the function labels the axes after the projection method.
 
-    eval/latent_space.py writes <run>/<method>/metadata.csv, so the parent
-    directory name is the method (umap, pca, tsne).
+    latent_space.py writes <run>/<method>/metadata.csv, so the name of the
+    parent directory is the method (umap, pca, tsne).
     """
     method = metadata_path.resolve().parent.name.upper()
     if not method or len(method) > 8:
@@ -238,10 +230,9 @@ def axis_labels(metadata_path: Path) -> tuple[str, str, str]:
 def project_to_screen(ax: Any, coords: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """(N, 2) display-pixel positions and (N,) camera depths for 3D points.
 
-    matplotlib's 3D artists work by projecting their data with ax.get_proj() and
-    then drawing the result through the ordinary 2D transData, so doing the same
-    two steps here gives exactly the pixels the points were drawn at -- which is
-    what makes screen-space picking agree with what the user sees.
+    the function repeats what matplotlib's own 3D artists do: ax.get_proj(),
+    then transData. the result is exactly the pixels of the drawn points. a
+    screen-space selection therefore agrees with what the user sees.
     """
     M = ax.get_proj()
     xs, ys, zs = proj3d.proj_transform(coords[:, 0], coords[:, 1], coords[:, 2], M)
@@ -252,13 +243,10 @@ def project_to_screen(ax: Any, coords: np.ndarray) -> tuple[np.ndarray, np.ndarr
 def unproject_from_screen(ax: Any, x: float, y: float, depth: float) -> np.ndarray:
     """3D data point that projects to display pixel (x, y) at camera `depth`.
 
-    a 2D click only determines a ray through the scene, so a depth has to come
-    from somewhere; callers pass the depth of the nearest real point, putting the
-    result on the visible surface of the cloud instead of somewhere arbitrary
-    along the line of sight.
-
-    written out rather than calling proj3d.inv_transform because that helper's
-    signature has moved between matplotlib versions.
+    a click is only a ray, so the depth must come from somewhere. the caller
+    passes the depth of the nearest real point. the code writes the math out and
+    does not call proj3d.inv_transform, whose signature moved between matplotlib
+    versions.
     """
     xp, yp = ax.transData.inverted().transform((x, y))
     inv_M = np.linalg.inv(ax.get_proj())
@@ -269,11 +257,11 @@ def unproject_from_screen(ax: Any, x: float, y: float, depth: float) -> np.ndarr
 
 
 def set_3d_offsets(artist: Any, points: np.ndarray) -> None:
-    """move a 3D scatter's points, including down to zero points.
+    """the function moves the points of a 3D scatter, down to zero points.
 
-    Path3DCollection has no public setter for its 3D offsets. Artists are all
-    created with depthshade=False and a single scalar color so that changing the
-    point count can't desync a per-point color array.
+    Path3DCollection has no public setter for its 3D offsets. the code creates
+    every artist with depthshade=False and one scalar color. a change of the
+    point count therefore cannot desync a per-point color array.
     """
     points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
     artist._offsets3d = (points[:, 0], points[:, 1], points[:, 2])
@@ -287,12 +275,9 @@ def select_click_indices_screen(
     nearest: int,
     visible_mask: np.ndarray | None = None,
 ) -> np.ndarray:
-    """screen-space version of the 2D viewer's select_click_indices.
-
-    identical logic -- nearest N unique crops, with the last slot reserved for
-    the nearest annotated crop when one exists -- but ranked by pixel distance at
-    the current camera angle rather than by distance in latent coordinates.
-    """
+    """screen-space version of interactive_latent_viewer.select_click_indices.
+    the logic is identical, but the rank comes from the pixel distance at the
+    current camera angle."""
     ranked = nearest_indices(display, target, len(display))
     if visible_mask is not None:
         ranked = ranked[visible_mask[ranked]]
@@ -320,12 +305,12 @@ def indices_within_pixels(
 
 
 class LatentCropViewer3D(LatentCropViewer):
-    """3D map window; crop rendering and Generate decoding come from the 2D viewer.
+    """3D map window. the crop render and the Generate decode come from the 2D viewer.
 
-    __init__ deliberately does not call super().__init__ -- that builds the 2D
-    figure -- but establishes the same attribute names so the inherited
-    render_crops / render_generated / crop-window plumbing works unchanged. Only
-    the methods that touch map coordinates are overridden.
+    __init__ deliberately skips super().__init__, because super().__init__
+    builds the 2D figure. __init__ sets the same attribute names, so the
+    inherited render_crops and render_generated plumbing works without a change.
+    the class overrides only the methods that touch map coordinates.
     """
 
     def __init__(
@@ -469,8 +454,9 @@ class LatentCropViewer3D(LatentCropViewer):
 
         self.crop_fig = None
         self._create_crop_figure()
-        # no LassoSelector: matplotlib has no 3D lasso, and left-drag belongs to
-        # the camera. press/release are paired manually to tell clicks from drags.
+        # there is no LassoSelector in 3D, and the left-drag belongs to the
+        # camera. the code therefore pairs press and release manually, to tell a
+        # click from a drag.
         self.map_fig.canvas.mpl_connect("button_press_event", self.on_press)
         self.map_fig.canvas.mpl_connect("button_release_event", self.on_release)
         self.map_fig.canvas.mpl_connect("key_press_event", self.on_key)
@@ -512,7 +498,7 @@ class LatentCropViewer3D(LatentCropViewer):
             return
         self.set_status(description)
 
-    # --- mouse handling ------------------------------------------------------
+    # --- mouse events --------------------------------------------------------
 
     def on_press(self, event: Any) -> None:
         if event.inaxes is not self.map_ax or event.x is None or event.y is None:
@@ -529,7 +515,7 @@ class LatentCropViewer3D(LatentCropViewer):
             return
         moved = float(np.hypot(event.x - px, event.y - py))
         if moved > self.click_tolerance:
-            return  # a camera rotate/zoom/pan, not a click
+            return  # a camera rotate, zoom or pan, and not a click
         toolbar = getattr(self.map_fig.canvas, "toolbar", None)
         if toolbar is not None and getattr(toolbar, "mode", ""):
             return
@@ -564,8 +550,8 @@ class LatentCropViewer3D(LatentCropViewer):
             )
             return
         unique = unique_crop_indices(selected, self.rows, self.cfg)
-        # rank by screen distance from the click, so "displaying N of M" keeps
-        # the ones nearest what was actually clicked.
+        # the rank comes from the screen distance, so that a truncated selection
+        # keeps the points nearest the actual click.
         shown = representative_indices(display, unique, self.max_crops)
         detail = (
             f"region selected {len(selected)} points / {len(unique)} unique crops "
@@ -658,8 +644,7 @@ def main() -> None:
         decoder_checkpoint=args.decoder_checkpoint,
         gen_radius=gen_radius,
     )
-    # Keep the viewer and its weakly-referenced Matplotlib callbacks alive until
-    # all GUI windows have closed.
+    # see interactive_latent_viewer.main for the reason to hold the viewer here.
     plt.show()
     del viewer
 

@@ -1,38 +1,43 @@
 """Expected Gradients: input-space attribution for the frozen encoder + probe.
 
+warning: plain integrated gradients against a single fixed all-zeros baseline
+does NOT work on this encoder. groupnorm makes the encoder scale invariant, so a
+straight-line path from zeros collapses through a near-discontinuity at the
+origin. no practical step count can then satisfy the completeness axiom. the
+fixed-baseline code is gone rather than left as a tempting alternative. real
+crops as baselines keep every path inside the natural, normalized regime, and
+they restore a well-behaved estimate. if you reintroduce a fixed baseline, check
+the reported completeness error before you believe any map from it.
+
+`ExpectedGradients` is the only entry point.
+
 expected gradients (Erion et al. 2021), "Improving performance of deep learning
-models with axiomatic attribution priors": https://arxiv.org/abs/1906.10670. it
-generalizes integrated gradients (Sundararajan et al. 2017,
+models with axiomatic attribution priors": https://arxiv.org/abs/1906.10670.
+expected gradients generalizes integrated gradients (Sundararajan et al. 2017,
 https://arxiv.org/abs/1703.01365) from a single fixed baseline to an expectation
 over a baseline distribution.
 
-unlike grad-cam, which weights a conv feature map and lives at that layer's
-coarse resolution, EG attributes the target class logit all the way back to the
-raw input voxels (1, Z, H, W). two consequences that matter for this pipeline:
-  - attribution is already at input resolution, so there is no upsampling step.
+grad-cam weights a conv feature map and lives at that layer's coarse resolution.
+EG instead attributes the target class logit all the way back to the raw input
+voxels (1, Z, H, W). two consequences matter for this pipeline:
+  - the attribution is already at input resolution, so no upsampling step is
+    necessary.
   - the z axis survives. grad-cam hooks the 2d backbone, which sits after
-    ZAttentionPool has already collapsed depth, so it has zero z resolution. EG
+    ZAttentionPool collapses depth, so grad-cam has zero z resolution. EG
     differentiates through the pool and recovers per-slice attribution.
 
-attribution is signed: positive voxels push the logit toward the class, negative
-voxels push away. that is why the visualizers here use a diverging colormap
-rather than the positive-only jet scale the grad-cam viz uses.
-
-use `ExpectedGradients` as the entry point, not the fixed-baseline
-`IntegratedGradients` kept below. groupnorm makes this encoder scale invariant,
-so a straight-line path from an all-zeros baseline collapses through a
-near-discontinuity at the origin and the completeness axiom cannot be satisfied
-at any practical step count. sampling real crops as baselines keeps every path
-inside the natural, normalized regime and restores a well-behaved estimate.
+the attribution is signed: positive voxels push the logit toward the class,
+negative voxels push the logit away. therefore the visualizers here use a
+diverging colormap rather than the positive-only jet scale of the grad-cam
+visualizers.
 """
 
 from __future__ import annotations
 
 import matplotlib
 
-# force the non-interactive backend before pyplot loads. on headless compute
-# nodes the default tk backend tears its objects down on the wrong thread at
-# exit, which aborts with "main thread is not in main loop". we only save pngs.
+# the matplotlib.use call must precede the pyplot import, because tk aborts at
+# exit on headless nodes.
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
@@ -42,157 +47,13 @@ from pathlib import Path
 from typing import Optional
 
 
-class IntegratedGradients:
-    """integrated gradients with a single fixed baseline.
-
-    kept as the fixed-reference base case that `ExpectedGradients` generalizes,
-    but prefer `ExpectedGradients` on this encoder: a zero baseline fails the
-    completeness axiom here because groupnorm is scale invariant (see the module
-    docstring). check the returned `completeness` before trusting a fixed-
-    baseline map.
-    """
-
-    def __init__(
-        self,
-        encoder: nn.Module,
-        classifier: nn.Module,
-        device: torch.device,
-    ) -> None:
-        """
-        Args:
-            encoder: feature extractor (e.g. HybridEncoder)
-            classifier: classification head (e.g. linear probe)
-            device: torch device
-        """
-        self.encoder = encoder
-        self.classifier = classifier
-        self.device = device
-
-    def _logit(self, x: torch.Tensor, target_class: int) -> torch.Tensor:
-        # target class logit summed over the batch, so a single backward gives
-        # the per-sample input gradient for every interpolation step at once.
-        return self.classifier(self.encoder(x))[:, target_class].sum()
-
-    def attribute(
-        self,
-        input_tensor: torch.Tensor,
-        target_class: int,
-        baseline: Optional[torch.Tensor] = None,
-        steps: int = 32,
-        chunk_size: int = 8,
-    ) -> dict[str, object]:
-        """
-        compute integrated gradients for one crop and one target class.
-
-        Args:
-            input_tensor: input crop, shape (1, C, Z, H, W)
-            target_class: index of the class to explain
-            baseline: reference input of "absence"; defaults to zeros (black).
-                microscopy background is ~0, so a zero baseline is a reasonable
-                default. any near-zero voxel gets ~0 attribution though (IG
-                multiplies by input - baseline), so switch to a blurred baseline
-                if background suppression looks wrong.
-            steps: riemann steps along the baseline -> input path. more steps
-                tighten the completeness error; validate with `completeness`.
-            chunk_size: interpolation steps per forward/backward. lower this if
-                a full-resolution global crop OOMs the backbone.
-
-        Returns:
-            dict with:
-              attribution: signed (Z, H, W) numpy array
-              completeness: relative error of the completeness axiom (see below)
-              delta: signed (sum attribution) - (F(x) - F(baseline))
-              target_score: target logit at the input
-              baseline_score: target logit at the baseline
-        """
-        self.encoder.eval()
-        self.classifier.eval()
-
-        if input_tensor.size(0) != 1:
-            raise ValueError(f"expected batch size 1, got {input_tensor.size(0)}")
-        if steps < 1:
-            raise ValueError(f"steps must be >= 1, got {steps}")
-
-        x = input_tensor.to(self.device)
-        if baseline is None:
-            baseline = torch.zeros_like(x)
-        else:
-            baseline = baseline.to(self.device)
-            if baseline.shape != x.shape:
-                raise ValueError(
-                    f"baseline shape {tuple(baseline.shape)} != input "
-                    f"{tuple(x.shape)}"
-                )
-
-        delta_input = x - baseline
-
-        # midpoint riemann: alphas at (k + 0.5) / steps, each weighted 1/steps.
-        # the midpoint rule converges faster than left/right for the same step
-        # count, which keeps the completeness error small at low `steps`.
-        alphas = (torch.arange(steps, device=self.device) + 0.5) / steps
-
-        grad_sum = torch.zeros_like(x)
-        with torch.enable_grad():
-            for start in range(0, steps, chunk_size):
-                chunk_alphas = alphas[start : start + chunk_size]
-                # interpolate: (n_chunk, C, Z, H, W). broadcast alpha over voxels.
-                a = chunk_alphas.view(-1, 1, 1, 1, 1)
-                interp = (baseline + a * delta_input).detach().requires_grad_(True)
-                score = self._logit(interp, target_class)
-                grads = torch.autograd.grad(score, interp)[0]
-                # sum over the chunk; the 1/steps averaging happens once below.
-                grad_sum += grads.sum(dim=0, keepdim=True)
-
-        avg_grad = grad_sum / steps
-        attribution = (delta_input * avg_grad)[0, 0]  # (Z, H, W)
-
-        # completeness axiom: sum of attributions should equal the logit gap
-        # between input and baseline. the relative error is a free convergence
-        # check grad-cam cannot offer; if it is large, raise `steps`.
-        with torch.no_grad():
-            target_score = self._logit(x, target_class)
-            baseline_score = self._logit(baseline, target_class)
-        score_gap = (target_score - baseline_score).item()
-        attr_sum = attribution.sum().item()
-        delta = attr_sum - score_gap
-        completeness = abs(delta) / (abs(score_gap) + 1e-8)
-
-        return {
-            "attribution": attribution.detach().cpu().numpy(),
-            "completeness": completeness,
-            "delta": delta,
-            "target_score": target_score.item(),
-            "baseline_score": baseline_score.item(),
-        }
-
-    def attribute_multiclass(
-        self,
-        input_tensor: torch.Tensor,
-        num_classes: int,
-        baseline: Optional[torch.Tensor] = None,
-        steps: int = 32,
-        chunk_size: int = 8,
-    ) -> dict[int, dict[str, object]]:
-        """attribute every class for one crop; returns {class_idx: attribute()}."""
-        return {
-            class_idx: self.attribute(
-                input_tensor, class_idx, baseline, steps, chunk_size
-            )
-            for class_idx in range(num_classes)
-        }
-
-
 class ExpectedGradients:
-    """expected gradients (Erion et al. 2021): IG generalized over a baseline
-    distribution instead of one fixed reference.
+    """expected gradients (Erion et al. 2021), see the module docstring.
 
     EG(x)_i = E_{x'~D, a~U(0,1)} [ (x - x')_i * dF_c/dx_i (x' + a (x - x')) ]
 
-    the expectation folds the baseline choice and the path position into one
-    monte-carlo estimate. drawing baselines x' from real crops keeps every path
-    inside the natural, normalized data regime, which is what makes this the
-    right variant for a groupnorm (scale-invariant) encoder where a zero
-    baseline is degenerate.
+    one monte-carlo estimate folds in both the baseline choice and the path
+    position.
     """
 
     def __init__(
@@ -201,26 +62,20 @@ class ExpectedGradients:
         classifier: nn.Module,
         device: torch.device,
     ) -> None:
-        """
-        Args:
-            encoder: feature extractor (e.g. HybridEncoder)
-            classifier: classification head (e.g. linear probe)
-            device: torch device
-        """
         self.encoder = encoder
         self.classifier = classifier
         self.device = device
 
     def _logit(self, x: torch.Tensor, target_class: int) -> torch.Tensor:
-        # target class logit summed over the batch, so one backward gives the
-        # per-sample input gradient for every (baseline, alpha) draw at once.
+        # the method sums the target class logit over the batch. one backward
+        # pass then gives the per-sample input gradient for every
+        # (baseline, alpha) draw at once.
         return self.classifier(self.encoder(x))[:, target_class].sum()
 
     def _pool_scores(
         self, baselines: torch.Tensor, target_class: int, chunk_size: int
     ) -> torch.Tensor:
-        # target logit F(x') for each baseline in the pool, on cpu. used to score
-        # the sampled draws for the completeness diagnostic.
+        # F(x') per baseline, on cpu, for the completeness diagnostic.
         scores = []
         with torch.no_grad():
             for start in range(0, baselines.size(0), chunk_size):
@@ -243,25 +98,19 @@ class ExpectedGradients:
         Args:
             input_tensor: input crop, shape (1, C, Z, H, W)
             target_class: index of the class to explain
-            baselines: pool of reference crops, shape (M, C, Z, H, W), drawn from
-                the data distribution. paths run from a sampled baseline to the
-                input, so structurally-different crops give the best coverage.
-            n_samples: monte-carlo (baseline, alpha) draws. estimator error
-                shrinks ~1/sqrt(n_samples); raise it if the map looks noisy.
-            chunk_size: draws per forward/backward. lower this if a full-
-                resolution global crop OOMs the backbone.
-            seed: optional seed for the baseline/alpha sampling, for reproducible
-                maps. sampling is done on cpu so it is device-independent.
+            baselines: pool of reference crops (M, C, Z, H, W) from the data
+                distribution. structurally-different crops cover best.
+            n_samples: number of monte-carlo (baseline, alpha) draws. the error
+                shrinks as ~1/sqrt(n_samples). raise n_samples if the map looks
+                noisy.
+            chunk_size: draws per forward and backward pass. lower chunk_size if
+                a full-resolution global crop OOMs the backbone.
+            seed: seed for the baseline draws and the alpha draws. a fixed seed
+                makes the maps reproducible.
 
-        Returns:
-            dict with:
-              attribution: signed (Z, H, W) numpy array
-              completeness: relative error of the EG completeness identity
-                  E[sum attr] = F(x) - E_{x'}[F(x')]
-              delta: signed (sum attribution) - (F(x) - mean baseline score)
-              target_score: target logit at the input
-              baseline_score: mean target logit over the sampled baselines
-              n_samples: draws used
+        the method returns a dict of: attribution (signed (Z, H, W) array),
+        completeness (relative error of E[sum attr] = F(x) - E_{x'}[F(x')]),
+        delta, target_score, baseline_score, n_samples.
         """
         self.encoder.eval()
         self.classifier.eval()
@@ -281,9 +130,8 @@ class ExpectedGradients:
         baselines = baselines.to(self.device)
         n_baselines = baselines.size(0)
 
-        # sample on cpu so the run is reproducible and device-independent (mps
-        # lacks a generator). draw baseline indices with replacement and a
-        # uniform path position per draw.
+        # the code draws the samples on cpu, so that the run is
+        # device-independent. mps has no generator.
         cpu_gen = torch.Generator()
         if seed is not None:
             cpu_gen.manual_seed(seed)
@@ -296,20 +144,21 @@ class ExpectedGradients:
                 chunk_idx = idx[start : start + chunk_size]
                 a = alphas[start : start + chunk_size].view(-1, 1, 1, 1, 1)
                 bl = baselines[chunk_idx]  # (n_chunk, C, Z, H, W)
-                diff = x - bl  # broadcast the single input against the baselines
+                diff = x - bl  # the single input broadcasts against the baselines
                 interp = (bl + a * diff).detach().requires_grad_(True)
                 score = self._logit(interp, target_class)
                 grads = torch.autograd.grad(score, interp)[0]
-                # accumulate (x - x') * grad per draw; the 1/n mean is applied once.
+                # the loop accumulates (x - x') * grad per draw. the code applies
+                # the 1/n mean once.
                 attr_sum += (diff * grads).sum(dim=0, keepdim=True)
 
         attribution = (attr_sum / n_samples)[0, 0]  # (Z, H, W)
 
-        # completeness identity for EG: E[sum attr] = F(x) - E_{x'}[F(x')]. score
-        # it against the mean over the *sampled* baselines (not the full pool) so
-        # it measures path-integration error alone and is not polluted by the
-        # baseline-sampling noise between the drawn set and the pool. relative
-        # error is the monte-carlo convergence signal; raise n_samples if large.
+        # completeness: E[sum attr] = F(x) - E_{x'}[F(x')]. the code scores
+        # against the mean over the *sampled* baselines rather than over the
+        # full pool. the check therefore measures the path-integration error
+        # alone, and not the noise from the baseline draws. a large relative
+        # error means that you must raise n_samples.
         with torch.no_grad():
             target_score = self._logit(x, target_class).item()
             pool_scores = self._pool_scores(baselines, target_class, chunk_size)
@@ -337,10 +186,11 @@ class ExpectedGradients:
         chunk_size: int = 8,
         seed: Optional[int] = None,
     ) -> dict[int, dict[str, object]]:
-        """attribute every class for one crop; returns {class_idx: attribute()}.
+        """the method attributes every class for one crop.
 
-        a fixed seed is reused across classes so every class map is explained
-        with the same sampled paths, keeping them comparable.
+        the method returns {class_idx: attribute()}. the method reuses one fixed
+        seed across the classes. every class map therefore uses the same sampled
+        paths, and the maps stay comparable.
         """
         return {
             class_idx: self.attribute(
@@ -356,12 +206,12 @@ class ExpectedGradients:
 
 
 def reduce_over_z(attribution: np.ndarray, mode: str = "sum") -> np.ndarray:
-    """collapse a signed (Z, H, W) attribution to a (H, W) heatmap.
+    """the function collapses a signed (Z, H, W) attribution to a (H, W) heatmap.
 
-    "sum" preserves the completeness intuition: summing the reduced map equals
-    summing the full volume. "max_abs" keeps, per pixel, the slice with the
-    largest magnitude (sign preserved), which is sharper when the informative
-    depth varies across the crop.
+    "sum" preserves the completeness intuition: the sum of the reduced map
+    equals the sum of the full volume. "max_abs" keeps, for each pixel, the
+    slice with the largest magnitude, and it keeps the sign. "max_abs" is
+    sharper when the informative depth varies across the crop.
     """
     if attribution.ndim != 3:
         raise ValueError(f"expected (Z, H, W), got shape {attribution.shape}")
@@ -376,10 +226,10 @@ def reduce_over_z(attribution: np.ndarray, mode: str = "sum") -> np.ndarray:
 
 
 def _symmetric_vmax(maps: list[np.ndarray], percentile: float = 99.0) -> float:
-    """shared symmetric color limit so signed maps are comparable in one figure.
+    """shared symmetric color limit, so that signed maps are comparable in one figure.
 
-    a high percentile rather than the raw max keeps a few hot voxels from
-    flattening the rest of the scale.
+    the function uses a high percentile rather than the raw max. a few hot
+    voxels therefore cannot flatten the rest of the scale.
     """
     stacked = np.concatenate([np.abs(m).ravel() for m in maps])
     vmax = float(np.percentile(stacked, percentile)) if stacked.size else 0.0
@@ -393,11 +243,11 @@ def _signed_overlay(
     cmap_name: str = "seismic",
     max_alpha: float = 0.7,
 ) -> np.ndarray:
-    """blend a signed heatmap over a grayscale crop.
+    """the function blends a signed heatmap over a grayscale crop.
 
-    alpha scales with attribution magnitude so near-zero regions stay
-    transparent and the cell shows through, while strong positive/negative
-    voxels read as saturated diverging colors.
+    alpha scales with the attribution magnitude. near-zero regions therefore
+    stay transparent and the cell shows through. strong positive voxels and
+    strong negative voxels read as saturated diverging colors.
     """
     cmap = plt.get_cmap(cmap_name)
     norm = np.clip(heatmap / vmax, -1.0, 1.0)
@@ -423,20 +273,21 @@ def visualize_eg_multiclass(
     probs: Optional[dict[int, float]] = None,
     completeness: Optional[dict[int, float]] = None,
 ) -> None:
-    """signed EG panel: overlay row + raw diverging-heatmap row per class.
+    """signed EG panel: one overlay row and one raw diverging-heatmap row per class.
 
-    the leading column is the original crop. top row overlays each class's
-    signed attribution on the crop; bottom row shows the raw signed heatmap on a
-    shared symmetric red/blue scale (one colorbar) so classes are comparable.
-    red pushes the logit toward the class, blue pushes away.
+    the leading column is the original crop. the bottom row shares one symmetric
+    red and blue scale, so that the classes are comparable. red pushes the logit
+    toward the class, blue pushes the logit away.
 
     Args:
         crop_2d: max-projected crop (H, W)
         attributions: {class_idx: z-reduced signed heatmap (H, W)}
         class_names: class name per index
-        pred_class: predicted class index to highlight
-        probs: {class_idx: probability} shown in titles
-        completeness: {class_idx: relative completeness error} shown in titles
+        pred_class: index of the predicted class. the function highlights that
+            column.
+        probs: {class_idx: probability}. the titles show these values.
+        completeness: {class_idx: relative completeness error}. the titles show
+            these values.
     """
     n_classes = len(attributions)
     n_cols = n_classes + 1
@@ -503,16 +354,11 @@ def visualize_eg_zslices(
     title: Optional[str] = None,
     save_path: Optional[str] = None,
 ) -> None:
-    """per-z-slice signed attribution, the detail grad-cam cannot produce.
+    """per-z-slice signed attribution, the detail that grad-cam cannot produce.
 
-    one column per z slice: the crop slice on top, its signed EG below on a
-    shared symmetric scale. surfaces which depths drove the decision, which
-    matters for anisotropic microscopy where z is the low-resolution axis.
-
-    Args:
-        crop: input volume (Z, H, W)
-        attribution: signed attribution (Z, H, W)
-        class_name: class being explained, for the title
+    there is one column per z slice. the crop is on top and its signed EG is
+    below, on a shared symmetric scale. you can then see which depths drove the
+    decision.
     """
     if crop.shape != attribution.shape:
         raise ValueError(

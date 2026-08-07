@@ -1,22 +1,23 @@
 """sliced-Wasserstein batch-effect probe over cached embeddings.
 
-reuses the `embeddings.npz` that `latent_space.py` already writes, so you can
-get (or re-run) the batch-effect report without re-embedding crops through the
-encoder. computes the pairwise sliced-Wasserstein distance between per-dataset
-embedding clouds in the full latent space and writes a formatted report next to
-the embeddings.
+this probe reuses the `embeddings.npz` that `latent_space.py` writes. therefore
+you can get the batch-effect report, or run it again, and not embed the crops
+through the encoder a second time. the probe computes the pairwise
+sliced-Wasserstein distance between the per-dataset embedding clouds in the full
+latent space. the probe then writes a report next to the embeddings.
 
-lower distance = clouds overlap = dataset identity scrubbed (good mixing);
-higher = datasets stay separable = residual batch effect.
+a lower distance means that the clouds overlap, that is, the encoder scrubbed
+dataset identity and the mixing is good. a higher distance means that the
+datasets stay separable, that is, a residual batch effect remains.
 
 usage:
-    # point at an existing latent_space run folder (the one that contains the embeddings.npz)
+    # point at an existing latent_space run folder (the folder that contains the embeddings.npz)
     python eval/probe_wasserstein.py --config configs/train.yaml --run-dir latent_space/final_20260711_161004
 
-    # or at the npz directly; report is written alongside it
+    # or point at the npz directly. the probe writes the report next to the npz
     python eval/probe_wasserstein.py --config configs/train.yaml --embeddings latent_space/final_20260711_161004/embeddings.npz
 
-    # or let it auto-find the newest cached run for a checkpoint
+    # or let the probe auto-find the newest cached run for a checkpoint
     python eval/probe_wasserstein.py --config configs/train.yaml --checkpoint checkpoints/z_filtering/latest.pt
 """
 
@@ -27,7 +28,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# allow running as `python eval/probe_wasserstein.py` from project root.
+# the path insert lets you run `python eval/probe_wasserstein.py` from the project root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
@@ -65,7 +66,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def find_cached_run(checkpoint: str) -> Path | None:
-    """newest latent_space/<run>_* folder for this checkpoint that has embeddings."""
+    """the newest latent_space/<run>_* folder for this checkpoint that has embeddings."""
     base = Path("latent_space")
     if not base.is_dir():
         return None
@@ -94,7 +95,11 @@ def resolve_npz(args: argparse.Namespace) -> Path:
 
 
 def preprocess_embeddings(X: np.ndarray, mode: str) -> np.ndarray:
-    # mirrors latent_space.preprocess_embeddings so distances match a full run.
+    # warning: this function is a duplicate of
+    # eval/pca_utils.preprocess_embeddings, which latent_space.py uses. keep the
+    # two functions the same, or the distances here no longer match a full run.
+    # note also that this copy works in float32 and that the pca_utils copy
+    # works in float64.
     X = X.astype(np.float32, copy=False)
     if mode == "raw":
         return X
@@ -109,10 +114,11 @@ def preprocess_embeddings(X: np.ndarray, mode: str) -> np.ndarray:
 
 
 def load_dataset_rows(npz_path: Path, cfg: Config) -> tuple[np.ndarray, list[dict[str, Any]]]:
-    """load raw embeddings and the minimal per-point rows the metric needs.
+    """load raw embeddings and the minimal per-point rows that the metric needs.
 
-    print_batch_effect_wasserstein only reads dataset_idx and dataset_name, so we
-    skip reconstructing the full metadata that latent_space carries.
+    print_batch_effect_wasserstein reads only dataset_idx and dataset_name.
+    therefore this function does not rebuild the full metadata that latent_space
+    carries.
     """
     if not npz_path.exists():
         raise FileNotFoundError(f"embeddings not found at {npz_path}")

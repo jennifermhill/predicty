@@ -1,10 +1,20 @@
+"""interactive .zarr chooser for single-zarr CLI runs only.
+
+the current multi-zarr training path cannot reach this module. that path sets
+`cfg.zarr_paths` from the config and never calls `pick_zarr_path`. the chooser
+applies only when you run a script with a single `--zarr-path`. the chooser
+also applies when you give no `--zarr-path` on a machine with a display. on a
+headless node with no `--zarr-path`, the chooser prints a message and exits
+with status 2.
+"""
+
 import argparse
 import os
 import sys
 
 
 def pick_zarr_path() -> str:
-    """return the .zarr root from cli or tkinter.
+    """return the .zarr root from the cli or from tkinter.
 
     the dataset adds the pyramid path internally.
     """
@@ -20,7 +30,7 @@ def pick_zarr_path() -> str:
         )
         sys.exit(2)
 
-    # import lazily so headless workers skip tk.
+    # import tk here, not at module level, so headless workers skip tk.
     import tkinter as tk
     from tkinter import filedialog
 
@@ -41,7 +51,7 @@ def pick_zarr_path() -> str:
 
 
 def _parse_cli_zarr_path() -> str | None:
-    """peek at --zarr-path without consuming other args."""
+    """read --zarr-path but do not consume the other arguments."""
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--zarr-path", type=str, default=None)
     args, _ = parser.parse_known_args()
@@ -49,7 +59,7 @@ def _parse_cli_zarr_path() -> str | None:
 
 
 def _is_headless() -> bool:
-    # macos tk works without display.
+    # on macos, tk works without a display.
     if sys.platform == "darwin":
         return False
     return not os.environ.get("DISPLAY")

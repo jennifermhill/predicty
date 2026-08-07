@@ -14,3 +14,4 @@ umap-learn==0.5.12
 notebook==7.3.2
 ipykernel==6.29.5
 tensorboard==2.20.0
+pytest==8.4.2

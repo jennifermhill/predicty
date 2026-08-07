@@ -1,9 +1,10 @@
-"""dataloader smoke test and throughput benchmark (not a training entry point).
+"""dataloader smoke test and throughput benchmark. not a training entry point.
 
-pulls a handful of batches through the same MultiZarrDataset / ZarrCellDataset
-pipeline that train.py uses and prints per-crop timing plus batch shapes. use it
-to confirm the data path works and to spot data-loading bottlenecks before
-committing a GPU to a real run. the actual training entry point is train.py.
+the script pulls a few batches through the same dataset pipeline that train.py
+uses. the script prints the per-crop time and the batch shapes. run the script
+before you commit a GPU. training throughput here is NFS-I/O bound. see README
+"Training" > "Throughput is NFS-I/O bound, not compute bound" for the meaning of
+the numbers.
 
 usage:
     python benchmark_dataloader.py --config configs/train.yaml
@@ -29,7 +30,7 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="optional path to a yaml config (e.g. configs/train.yaml).",
     )
-    # peek only at --config; picker.py reads --zarr-path itself.
+    # peek only at --config. picker.py reads --zarr-path itself.
     args, _ = parser.parse_known_args()
     return args
 
@@ -39,7 +40,7 @@ def main() -> None:
     batch_size = 4
     cfg.batch_size = batch_size
 
-    # multi-zarr training takes precedence; single-zarr falls back to the picker.
+    # multi-zarr training takes precedence. single-zarr falls back to the picker.
     if cfg.zarr_paths:
         if cfg.zarr_path is not None:
             print(
@@ -61,7 +62,7 @@ def main() -> None:
 
     per_crop_ms: list[float] = []
     n_batches = 20
-    # crops per sample: 2 globals (one at t1, one at t2) + n_locals.
+    # 2 globals (t1 and t2) + n_locals.
     crops_per_sample = 2 + cfg.n_local_crops
     print(
         f"[benchmark] pulling {n_batches} batches of {batch_size} samples "
@@ -71,7 +72,7 @@ def main() -> None:
     t_loop = time.time()
     for i, batch in zip(range(n_batches), loader):
         t0 = time.time()
-        # globals: (B, 2, 1, Z, H, W); dim 1 indexes (t1, t2).
+        # globals: (B, 2, 1, Z, H, W). dim 1 indexes (t1, t2).
         globals_ = batch["globals"]
         g_t1 = globals_[:, 0]
         g_t2 = globals_[:, 1]

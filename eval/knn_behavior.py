@@ -1,34 +1,35 @@
 """non-parametric k-NN evaluation of behavior identity on a frozen encoder.
 
-this mirrors eval/probe_behavior.py but replaces the trainable nn.Linear head
-with a parameter-free k-nearest-neighbor vote. the encoder is frozen, we extract
-t1 global-crop embeddings over all annotated samples, split with the same
-StratifiedGroupKFold (grouped by zarr volume, stratified by label), and for each
-val embedding predict its label by a cosine vote over its k nearest neighbors in
-the fold's train embeddings.
+this module mirrors eval/probe_behavior.py, but it replaces the trainable
+nn.Linear head with a parameter-free k-nearest-neighbor vote. the encoder stays
+frozen. the module extracts t1 global-crop embeddings over all annotated
+samples, then splits them with the same StratifiedGroupKFold: the groups are
+zarr volumes, and the split is stratified by label. for each val embedding, a
+cosine vote over the k nearest neighbors in the train embeddings of the fold
+gives the predicted label.
 
-k-NN is the standard frozen-feature SSL benchmark (DINO/iBOT), so the number is
-comparable to the literature and has no lr/steps/weight-decay to tune.
+k-NN is the standard frozen-feature SSL benchmark (DINO/iBOT). therefore the
+number compares to the literature, and it has no lr, no steps and no
+weight-decay to tune.
 
---weighted gives closer neighbors a bigger say (softmax over cosine sim),
-which helps the rare classes without ignoring larger k.
+--weighted gives a closer neighbor a bigger vote (softmax over cosine sim).
+--weighted helps the rare classes and keeps a larger k useful.
 
-alongside accuracy this reports two purity metrics off the same k-NN graph:
+next to accuracy, this module reports two purity metrics from the same k-NN
+graph:
 
-  label purity  fraction of a val point's neighbors sharing its label, folded
-                exactly like the accuracy. the continuous quantity underneath
-                accuracy -- it moves when neighborhoods improve without any
-                prediction flipping, so it ranks runs more stably on a small
-                annotated set.
-  batch purity  fraction of a point's neighbors from its own zarr volume,
-                pooled over everything rather than folded (see batch_purity).
-                high values mean the local geometry encodes which experiment a
-                crop came from, so a behavior gain arriving together with a
-                batch-purity gain is probably not a behavior gain.
+  label purity  the fraction of the neighbors of a val point that share its
+                label, folded like the accuracy. label purity is the continuous
+                quantity under accuracy, so it ranks runs more stably on a
+                small annotated set.
+  batch purity  the fraction of the neighbors of a point that come from its own
+                zarr volume, pooled and not folded (see batch_purity). a
+                behavior gain that arrives together with a batch-purity gain is
+                probably not a behavior gain.
 
-both are reported normalized against their chance baseline, because raw purity
-is dominated by the class prior (and by volume sizes) and is not comparable
-between runs, folds, or datasets without it.
+this module normalizes both metrics against their chance baseline. the class
+prior and the volume sizes dominate raw purity, so raw purity alone does not
+compare across runs.
 
 usage:
     python eval/knn_behavior.py --config configs/train.yaml --checkpoint checkpoints/z_filtering/latest.pt
@@ -45,7 +46,7 @@ from pathlib import Path
 
 import pandas as pd
 
-# allow running as `python eval/knn_behavior.py` from project root.
+# the path insert lets you run `python eval/knn_behavior.py` from the project root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
@@ -54,8 +55,9 @@ import torch.nn.functional as F
 from configs.config import Config
 from models.encoder import HybridEncoder
 
-# reuse the probe's extraction + splitting + reporting verbatim so the two evals
-# see identical embeddings, folds, and confusion-matrix formatting.
+# reuse the extraction, the split and the report of the probe without a change,
+# so the two evals see identical embeddings, identical folds and an identical
+# confusion-matrix layout.
 from eval.probe_behavior import (
     disable_augmentations,
     extract_embeddings,
@@ -65,9 +67,12 @@ from eval.probe_behavior import (
 
 
 def setup_logging(checkpoint_path: str) -> Path:
-    """derive a log directory from the checkpoint's parent folder name and tee
-    stdout to both the terminal and a knn_eval_*.log file inside it. mirrors
-    probe_behavior.setup_logging but with a knn-specific filename."""
+    """derive a log directory from the name of the parent folder of the checkpoint.
+
+    this function tees stdout to the terminal and to a knn_eval_*.log file in
+    that directory. the function mirrors probe_behavior.setup_logging, but the
+    filename is knn-specific.
+    """
     run_name = Path(checkpoint_path).parent.name
     candidates = [p for p in Path("latent_space").glob(f"{run_name}_*") if p.is_dir()]
 
@@ -121,12 +126,9 @@ def knn_predict(
     """predict a label for every row of X_val by a cosine vote over its k nearest
     neighbors in X_train. returns (preds (n_val,) long, neighbor_labels (n_val, k)).
 
-    k is clamped to the train size so tiny folds don't crash. each neighbor
-    contributes to its label's score: a plain vote gives every neighbor weight 1;
-    --weighted gives closer neighbors more via softmax over cosine similarity.
-
-    neighbor_labels is returned so label_purity can reduce the same neighbor
-    matrix a different way without paying for a second cosine product.
+    this function clamps k to the train size, so a tiny fold does not crash it.
+    the function also returns neighbor_labels, so label_purity can reduce the
+    same neighbor matrix and not pay for a second cosine product.
     """
     k = min(k, X_train.size(0))
     sim = F.normalize(X_val, dim=1) @ F.normalize(X_train, dim=1).t()  # higher = closer
@@ -137,8 +139,8 @@ def knn_predict(
     scores = torch.zeros(X_val.size(0), n_classes)
     scores.scatter_add_(1, neighbor_labels, weights)
     if class_balanced:
-        # prior correction: divide each class's vote by its train frequency so a
-        # rare class isn't outvoted just for being scarce among the neighbors.
+        # a prior correction, so the other classes do not outvote a rare class
+        # only because the rare class is scarce.
         counts = torch.bincount(y_train, minlength=n_classes).float().clamp(min=1)
         scores = scores / counts
     return scores.argmax(dim=1), neighbor_labels
@@ -152,8 +154,11 @@ def confusion(y_true: torch.Tensor, y_pred: torch.Tensor, n_classes: int) -> tor
 
 
 def macro_f1(cm: torch.Tensor) -> tuple[float, list[float]]:
-    """macro-averaged F1 from a confusion matrix (rows=true, cols=pred). classes
-    absent from val (empty row) are skipped so they don't drag the mean down."""
+    """macro-averaged F1 from a confusion matrix (rows=true, cols=pred).
+
+    this function skips a class that is absent from val (an empty row), so that
+    class does not drag the mean down.
+    """
     per_class: list[float] = []
     present: list[float] = []
     for c in range(cm.size(0)):
@@ -170,7 +175,7 @@ def macro_f1(cm: torch.Tensor) -> tuple[float, list[float]]:
 
 
 def balanced_acc(cm: torch.Tensor) -> float:
-    """mean per-class recall over classes present in val (balanced accuracy)."""
+    """the mean per-class recall over the classes present in val (balanced accuracy)."""
     recs = [int(cm[c, c]) / int(cm[c, :].sum()) for c in range(cm.size(0)) if cm[c, :].sum() > 0]
     return statistics.mean(recs) if recs else 0.0
 
@@ -181,18 +186,16 @@ def label_purity(
     y_train: torch.Tensor,
     n_classes: int,
 ) -> tuple[float, float, float, list[float]]:
-    """fraction of each val point's k neighbors that share its label.
+    """the fraction of the k neighbors of each val point that share its label.
 
-    this is the continuous quantity underneath k-NN accuracy: accuracy asks
-    whether the vote came out right, purity asks how lopsided the vote was. a
-    run can improve from 3-of-10 matching neighbors to 5-of-10 without a single
-    prediction flipping, so purity separates runs that accuracy scores as tied
-    -- useful when the annotated set is small enough that fold-to-fold accuracy
-    noise rivals the effect being measured.
+    accuracy asks whether the vote came out right. purity asks how lopsided the
+    vote was. therefore purity separates two runs that accuracy scores as tied,
+    which matters at this annotated-set size. see README "How to read the
+    metrics" section 5.
 
-    deliberately unweighted even when --weighted is set: purity describes the
-    neighborhood, not the voting rule, so it stays comparable across flag
-    settings.
+    purity stays unweighted on purpose, even when --weighted is set. purity
+    describes the neighborhood and not the vote rule, so purity stays comparable
+    across the flags.
 
     returns (purity, normalized, baseline, per_class_purity).
     """
@@ -200,12 +203,11 @@ def label_purity(
     per_point = matches.mean(dim=1)
     purity = per_point.mean().item()
 
-    # chance baseline: a random train neighbor matches a val point of class c
-    # with probability p_train[c], so the baseline is the class-frequency
-    # weighted mean over the val set. raw purity is NOT comparable without
-    # this -- on an imbalanced 4-class split a useless embedding still scores
-    # far above 25%, and the baseline itself moves fold to fold because the
-    # grouped split changes the train class mix.
+    # chance baseline: a random train neighbor matches a class-c val point with
+    # probability p_train[c]. therefore the baseline is the class-frequency
+    # weighted mean over val. the baseline moves from fold to fold, because the
+    # grouped split changes the train class mix. compute the baseline for every
+    # fold. do not assume 1/n.
     p_train = torch.bincount(y_train, minlength=n_classes).float() / y_train.numel()
     baseline = p_train[y_val].mean().item()
     normalized = (purity - baseline) / (1.0 - baseline) if baseline < 1.0 else 0.0
@@ -218,21 +220,18 @@ def label_purity(
 
 
 def batch_purity(X: torch.Tensor, groups: list[int], k: int) -> tuple[float, float, float]:
-    """fraction of each point's k neighbors drawn from its own zarr volume.
+    """the fraction of the k neighbors of each point that come from its own zarr volume.
 
-    high values mean the local geometry encodes which experiment a crop came
-    from rather than what the animal was doing -- the local counterpart to the
-    Wasserstein cloud-separation check and to the training-time dataset
-    adversary, and more sensitive than either: two volumes can overlap almost
-    perfectly in aggregate while still being locally segregated into
-    interleaved single-volume filaments that no global metric will flag.
+    a high value means that the local geometry encodes which experiment a crop
+    came from. batch purity is more sensitive than the Wasserstein cloud check.
+    two volumes can overlap almost perfectly in total, and stay locally separate
+    in interleaved single-volume filaments.
 
-    pooled over every annotated embedding on purpose. the cross-validation
-    folds are grouped by zarr volume, so inside a fold a val point's train
-    neighbors can never come from its own volume and same-volume purity is
-    structurally zero -- it would report perfect integration no matter how bad
-    the batch effect actually is. pooling with self excluded is what kBET/LISI
-    do and is the only framing where the number means anything.
+    this metric pools every annotated embedding and excludes the point itself,
+    on purpose. the folds group by zarr volume, so inside a fold the train
+    neighbors of a val point never share its volume. a folded same-volume purity
+    is therefore zero by construction, and it would report perfect integration
+    for any batch effect, however bad. kBET and LISI also pool.
 
     returns (purity, normalized, baseline).
     """
@@ -252,10 +251,9 @@ def batch_purity(X: torch.Tensor, groups: list[int], k: int) -> tuple[float, flo
     top_idx = sim.topk(k, dim=1).indices
     per_point = (g[top_idx] == g[:, None]).float().mean(dim=1)
 
-    # chance baseline: for a point in a volume holding n_g annotated crops, a
-    # random *other* point shares its volume with probability
-    # (n_g - 1) / (n - 1). volumes differ a lot in annotation count, so this is
-    # averaged per point rather than assumed uniform.
+    # the chance baseline per point is (n_g - 1) / (n - 1). take the mean of the
+    # per-point values. do not assume a uniform value, because the volumes
+    # differ a lot in annotation count.
     counts = torch.bincount(g).float()
     baseline = ((counts[g] - 1.0) / (n - 1)).mean().item()
     purity = per_point.mean().item()
@@ -309,11 +307,17 @@ def main() -> None:
 
     cfg = Config.from_yaml(args.config)
 
-    # identical df preprocessing to probe_behavior so the folds line up exactly.
+    # this module prepares df exactly as probe_behavior does, so the folds line
+    # up exactly.
     df = pd.read_json(cfg.annotation_path, lines=True)
     df = df[df["label"] != "empty"]
     df = df.drop(columns=["timestamp"])
     df = df[df["label"] != "slug"]
+    # warning: eval/probe_behavior.py hardcodes the same literal path. change
+    # both files together, or the two evals no longer see identical folds.
+    # mixin49 is a bad acquisition and is not part of the data of this project.
+    # no run trains on mixin49. the line below drops its 31 annotations, so they
+    # cannot leak into the --restrict unseen pool.
     df = df[df["zarr_path"] != "/groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test49_2024-02-08/mixin49_wellB2_24hr_ERH Red FarRed.zarr"]
     for col in df.columns:
         try:
@@ -365,28 +369,29 @@ def main() -> None:
     print(f"[knn] label counts: {torch.bincount(y, minlength=n_classes).tolist()}  ({classes})")
     print()
 
-    # per-k accumulators across folds
+    # the per-k accumulators across the folds
     accs = {k: [] for k in args.k_values}
     macros = {k: [] for k in args.k_values}
     bals = {k: [] for k in args.k_values}
     purs = {k: [] for k in args.k_values}
     pur_norms = {k: [] for k in args.k_values}
-    # per-class purity per fold; entries are nan for classes absent from that
-    # fold's val split, which the pooled report skips rather than counts as 0.
+    # the per-class purity for each fold. an entry is nan for a class that is
+    # absent from the val split of that fold. the pooled report skips a nan
+    # entry and does not count it as 0.
     pur_classes: dict[int, list[list[float]]] = {k: [] for k in args.k_values}
     cms = {k: torch.zeros(n_classes, n_classes, dtype=torch.long) for k in args.k_values}
 
-    # groups come from `rows` (X order), not df["dataset_idx"] (annotation-file
-    # row order). extract_embeddings fills X zarr-by-zarr while index.jsonl
-    # interleaves zarrs, so the df ordering grouped the wrong rows and the
-    # leave-experiment-out split degenerated into a near-random one.
+    # warning: the groups must come from `rows`, which is in X order, and not
+    # from df["dataset_idx"], which is in annotation-file order. the trap is the
+    # same as in probe_behavior.py: df grouped the wrong rows once, and the
+    # leave-experiment-out split became near-random.
     groups = [r["dataset_idx"] for r in rows]
 
-    for fold_idx, (X_train, y_train, X_val, y_val) in enumerate(
+    for fold_idx, (X_train, y_train, X_val, y_val, held_out) in enumerate(
         stratified_group_kfold_split(X, y, groups, args.seed, args.n_splits)
     ):
         print(f"[knn] fold {fold_idx+1}/{args.n_splits}  (grouped by zarr volume, stratified by label)")
-        print(f"[knn] train n={X_train.size(0)}  val n={X_val.size(0)}")
+        print(f"[knn] train n={X_train.size(0)}  val n={X_val.size(0)}  held out: {held_out}")
         for k in args.k_values:
             preds, neighbor_labels = knn_predict(X_train, y_train, X_val, k, n_classes, args.weighted, args.temperature, args.class_balanced)
             cm = confusion(y_val, preds, n_classes)
@@ -436,10 +441,11 @@ def main() -> None:
     print("  are anti-correlated with the label. compare runs on this, not raw purity.")
     print()
 
-    # --- pooled batch purity: is the local geometry organized by experiment? ---
-    # not folded, and not optional reading: a behavior gain that arrives together
-    # with a batch-purity gain is probably the encoder getting better at telling
-    # experiments apart. see batch_purity's docstring for why this must be pooled.
+    # --- pooled batch purity: does the local geometry organize by experiment? ---
+    # this block is not folded, and you must read it. a behavior gain that
+    # arrives together with a batch-purity gain probably means only that the
+    # encoder tells the experiments apart better. the docstring of batch_purity
+    # explains why the metric must be pooled.
     print("=" * 70)
     print("  BATCH PURITY by zarr volume (pooled over all annotated crops, self excluded)")
     print("=" * 70)
@@ -466,8 +472,9 @@ def main() -> None:
     print()
     print("  per-class F1 and neighborhood purity (pooled):")
     for c, (name, f1) in enumerate(zip(classes, per_class_f1)):
-        # average each class's purity over the folds where it actually appeared
-        # in val; a class missing from every fold prints "n/a" instead of 0.
+        # take the mean purity of each class over the folds where the class
+        # appeared in val. a class that is absent from every fold prints "n/a"
+        # and not 0.
         seen = [fold[c] for fold in pur_classes[best_k] if fold[c] == fold[c]]
         purity_str = f"purity={statistics.mean(seen)*100:6.2f}%" if seen else "purity=   n/a"
         print(f"    {name:30s}  F1={f1:.3f}  {purity_str}")

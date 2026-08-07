@@ -1,33 +1,24 @@
-"""sweep the latent space left to right along PC1 and render it as a video.
+"""the script sweeps the latent space left to right along PC1 and renders a video.
 
-walks the first PCA axis (coord_x in a pca/ metadata.csv) from its minimum to
-its maximum, and at each step shows the crop that lives there plus a few of its
-nearest neighbors. the result is a video of how the encoder's representation
-changes as you move across PC1, with a marker riding the scatter so you can see
-where on the map each frame comes from.
+warning: nothing guarantees that PC1 orders the behavior classes in a
+biologically meaningful way. on 0720-iBOTPatch4, single_cells sits between
+clumps and aggregate. PCA is unsupervised and never sees the labels.
 
-this reads an existing pca/metadata.csv written by eval/latent_space.py (no
-re-embedding) and reconstructs the raw crops from the zarrs with the same code
-path the interactive viewer uses.
+the script walks the first PCA axis (coord_x in a pca/ metadata.csv) from its
+minimum to its maximum. at each step the script shows the crop that lives there
+plus a few of its nearest neighbors. the result is a video of the change in the
+encoder's representation as you move across PC1. a marker rides the scatter, so
+you can see where on the map each frame comes from.
+
+the script reads an existing pca/metadata.csv from eval/latent_space.py and does
+no re-embedding. the script reconstructs the raw crops from the zarrs with the
+same code path as the interactive viewer.
 
 usage:
-    # pooled sweep over every dataset in the run
+    # pooled sweep over every dataset in the run (add --dataset-idx N for one)
     python eval/latent_traversal_video.py \
         --config configs/train.yaml \
         --metadata latent_space/<run>/pca/metadata.csv
-
-    # sweep a single experiment
-    python eval/latent_traversal_video.py \
-        --config configs/train.yaml \
-        --metadata latent_space/<run>/pca/metadata.csv \
-        --dataset-idx 3
-
-    # walk only the annotated crops, on a PCA refit to that subset, with the
-    # map panel colored by behavior label
-    python eval/latent_traversal_video.py \
-        --config configs/train.yaml \
-        --metadata latent_space/<run>/pca/metadata.csv \
-        --labeled-only --fps 4
 
     # THE USUAL ONE: straight line through the annotation PCA, every crop
     # available to the walk, run off the locally mounted share
@@ -38,37 +29,24 @@ usage:
         --line --line-band-percentile 2 --bins 90 \
         --fps 4 --local-mount
 
-this script needs neither a GPU nor torch: it reads the already-computed
-embeddings.npz plus the raw zarrs, so with the storage mounted it runs on a
-laptop. --zarr-root-map rewrites the cluster paths baked into the config.
+the script needs neither a GPU nor torch. the script reads embeddings.npz plus
+the raw zarrs, so it runs on a laptop with the storage mounted (see
+--local-mount).
 
-point --metadata at the pca/ metadata.csv specifically: PC1 is an ordered,
-deterministic axis, so a left-to-right walk is meaningful. a umap/ metadata.csv
-has arbitrary axes and the sweep would not mean anything.
+point --metadata at the pca/ metadata.csv specifically. PC1 is an ordered,
+deterministic axis, so a left-to-right walk means something. umap/ axes are
+arbitrary, and a sweep along them would mean nothing.
 
---labeled-only restricts the walk to annotated crops and *refits* PCA on just
-that subset (from embeddings.npz), which is a much better axis than the
-full-cloud PC1. measured on 0720-iBOTPatch4, the fraction of an axis's variance
-that sits between behavior classes was:
+--labeled-only refits PCA on the annotated subset. the refit axis is much better
+than the full-cloud PC1. on 0720-iBOTPatch4 the between-behavior share of axis
+variance was 0.052 for full-cloud PC1 restricted to labeled crops, against 0.281
+for the refit. the refit axis is also more about behavior than about experiment
+(0.281 against 0.160). full-cloud UMAP1 is the reverse (0.258 against 0.325).
 
-    full-cloud PC1, restricted to labeled crops   0.052
-    PCA refit on the labeled crops only           0.281
-
-so the refit matters: filtering the full-cloud coord_x down to annotated rows
-walks an axis that barely knows the labels exist. the refit axis is also more
-about behavior than about experiment (0.281 vs 0.160 for zarr volume), unlike
-full-cloud UMAP1, which is the reverse (0.258 vs 0.325).
-
-note this is still unsupervised -- PCA never sees the labels, it just gets a
-subset that happens to be enriched for behaviorally distinct crops -- so the
-alignment is earned rather than fit, but there is no guarantee PC1 orders the
-classes in any biologically meaningful sequence. on the run above it does not:
-single_cells sits between clumps and aggregate.
-
-the refit is fit on every annotated row and then applied to the deduplicated
-ones, so it matches latent_space.py's annotations_pca_by_label.png, which fits
-the same rows. both now go through eval/pca_utils.py, so they share one exact
-decomposition and one sign convention.
+the script fits the refit on every annotated row and applies it to the
+deduplicated rows. the fit matches latent_space.py's
+annotations_pca_by_label.png. both go through eval/pca_utils.py, so they share
+one decomposition and one sign convention.
 """
 
 from __future__ import annotations
@@ -81,13 +59,13 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-# allow running as `python eval/latent_traversal_video.py` from the repo root.
+# this line lets you run `python eval/latent_traversal_video.py` from the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import matplotlib
 
-# headless rendering; must be selected before pyplot is imported anywhere,
-# including transitively via the interactive viewer import below.
+# the matplotlib.use call must come before any pyplot import, and the transitive
+# import below is one of them.
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
@@ -95,9 +73,9 @@ import numpy as np
 
 from configs.config import Config
 
-# same exact-SVD PCA that eval/latent_space.py now uses, so a refit here and the
-# static plots there share one implementation and one sign convention instead of
-# quietly disagreeing.
+# the same exact-SVD PCA that latent_space.py uses. a refit here and the static
+# plots there therefore cannot quietly disagree on the sign or the
+# implementation.
 from eval.pca_utils import pca_fit, pca_transform, preprocess_embeddings
 from eval.interactive_latent_viewer import (
     add_zarr_remap_args,
@@ -112,8 +90,8 @@ from eval.interactive_latent_viewer import (
     validate_dataset_mapping,
 )
 
-# same palette as latent_space.py's annotations_*_by_label.png, so the video's
-# colors match the still plots for the same run.
+# the same palette as latent_space.py's annotations_*_by_label.png, so that the
+# video colors match the still plots for the same run.
 LABEL_COLORS = [
     "#e41a1c", "#377eb8", "#4daf4a", "#984ea3",
     "#ff7f00", "#ffff33", "#a65628", "#f781bf",
@@ -253,18 +231,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def label_of(row: dict[str, Any]) -> str:
-    """metadata.csv writes unlabeled rows as an empty field, but a csv round-trip
-    of a None can also land as the literal string "None"; treat both as absent."""
+    """unlabeled rows have an empty field. a csv round-trip of None can land as
+    the literal string "None". the function treats both as absent."""
     value = (row.get("label") or "").strip()
     return "" if value in ("", "None", "nan") else value
 
 
 def equal_count_bins(x: np.ndarray, n_bins: int) -> list[np.ndarray]:
-    """split point indices into n_bins contiguous groups sorted by x (PC1).
+    """the function splits the point indices into n_bins contiguous groups, sorted by x (PC1).
 
-    equal-count (quantile) bins guarantee every step has crops to show and the
-    sweep stays monotonic in PC1, unlike fixed-width bins which leave the sparse
-    tails empty and make the video stutter.
+    equal-count bins keep every step populated and the sweep monotonic in PC1.
+    fixed-width bins leave the sparse tails empty, and the video then stutters.
     """
     order = np.argsort(x, kind="stable")
     n_bins = max(1, min(n_bins, len(order)))
@@ -274,8 +251,7 @@ def equal_count_bins(x: np.ndarray, n_bins: int) -> list[np.ndarray]:
 def line_basis(angle_deg: float) -> tuple[np.ndarray, np.ndarray]:
     """unit direction along the walk and unit normal to it, in the PC1/PC2 plane.
 
-    angle 0 is the PC1 axis, so the default walk is exactly horizontal on the
-    scatter you're looking at.
+    angle 0 is the PC1 axis, so the default walk is horizontal on the scatter.
     """
     theta = np.radians(float(angle_deg))
     direction = np.array([np.cos(theta), np.sin(theta)])
@@ -292,25 +268,21 @@ def line_walk(
     band_percentile: float,
     span: tuple[float, float] = (1.0, 99.0),
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """walk a straight line through the 2D projection, picking real points on it.
+    """the function walks a straight line through the 2D projection and picks real points on it.
 
-    the previous behavior sliced PC1 into quantile bins and took each bin's
-    medoid -- the point nearest that slab's own 2D centroid. that cannot hold PC2
-    steady even in principle: the medoid's PC2 is whatever the slab's mean PC2
-    happens to be, so the marker wanders vertically, and where a slab is bimodal
-    in PC2 the centroid lands in the empty gap and consecutive frames jump
-    between lobes.
+    the alternative is bin mode. bin mode takes the medoid of each PC1 slab,
+    which cannot hold PC2 steady even in principle. the marker wanders
+    vertically with the mean PC2 of each slab. a slab that is bimodal in PC2
+    puts the centroid in the empty gap, so consecutive frames jump between
+    lobes. a fixed line, plus only the points within `band` of that line,
+    guarantees what bin mode never could.
 
-    this instead fixes a line, keeps only points within `band` of it, and samples
-    evenly along it. every selected point is therefore within `band` of the line
-    by construction, which is the guarantee the binning approach never made.
+    the function collapses consecutive duplicate picks. each distinct crop
+    therefore gets exactly one frame, however long the stretch of line that it
+    was nearest to.
 
-    consecutive duplicate picks are collapsed, so each distinct crop occupies
-    exactly one frame and every crop is on screen for the same length of time --
-    dense sampling does not make a crop linger just because it is the nearest
-    real point over a long stretch of the line.
-
-    returns (indices in walk order, info dict for plotting and reporting).
+    the function returns (indices in walk order, info dict for the plot and the
+    report).
     """
     if n_samples < 2:
         raise ValueError("need at least 2 samples along the line")
@@ -336,9 +308,9 @@ def line_walk(
     if not hi > lo:
         raise ValueError("line span collapsed to a point; check --line-angle")
     samples = np.linspace(lo, hi, n_samples)
-    # nearest candidate to each sample, measured along the line. 1D on purpose:
-    # every candidate is already within band perpendicular, so along-line
-    # nearness is what decides order, and progress stays monotonic.
+    # the comparison is 1D on purpose. every candidate is already within band
+    # perpendicular, so the along-line nearness decides the order and the
+    # progress stays monotonic.
     picks = candidates[np.argmin(np.abs(along[candidates][None, :] - samples[:, None]), axis=1)]
 
     ordered: list[int] = [int(picks[0])]
@@ -389,10 +361,8 @@ def main() -> None:
     rows, coords = read_metadata(metadata_path)
     validate_dataset_mapping(rows, zarr_paths)
 
-    # embeddings must be loaded before any filtering so the npz row order still
-    # lines up with the metadata; the same index selection is then applied to
-    # both. load_real_embeddings also verifies the npz belongs to this
-    # metadata.csv by matching its stored coords.
+    # the code loads before any filter, so that the npz row order still lines up
+    # with the metadata. one index selection can then apply to both.
     embeddings: np.ndarray | None = None
     if args.labeled_only:
         embeddings_path = (
@@ -407,10 +377,9 @@ def main() -> None:
         if not len(base):
             raise ValueError(f"no points with dataset_idx={args.dataset_idx} in the metadata")
 
-    # the projection is fit on the pre-dedup annotated rows. fitting on all of
-    # them keeps it comparable to latent_space.py's annotations_pca_by_label.png,
-    # which fits the same rows; fitting the deduped subset instead would rotate
-    # the plane and the two figures would disagree for no good reason.
+    # the fit uses the pre-dedup annotated rows, the same rows that
+    # annotations_pca_by_label.png uses. a fit on the deduped subset would
+    # rotate the plane, and the two figures would then disagree for no reason.
     fit_keep = base
     if args.labeled_only:
         fit_keep = base[[bool(label_of(rows[i])) for i in base]]
@@ -421,16 +390,14 @@ def main() -> None:
             )
         print(f"[traversal] {len(fit_keep)} annotated points define the projection")
 
-    # what the walk may pick from. widening this to every crop leaves the basis
-    # untouched -- the annotated points still land exactly where the static plot
-    # puts them -- while giving the line far more real points to snap to.
+    # the set that the walk can pick from. an expansion to every crop leaves the
+    # basis untouched, and it gives the line far more real points to snap to.
     walk_source = base if args.include_unannotated else fit_keep
 
-    # collapse latent points that render the *same* crop figure. t1 and t2 are
-    # the same location at two timepoints frame_gap apart -- genuinely different
-    # images (mean cosine similarity only ~0.46), not duplicate embeddings -- but
-    # either one displays the identical t1/t2 panel pair, so showing both wastes
-    # a frame and makes a step look more populated than it is.
+    # the code collapses the latent points that render the *same* crop figure.
+    # t1 and t2 are genuinely different images, but each one displays the
+    # identical t1/t2 panel pair. both points together therefore waste a frame
+    # and inflate the apparent population of a step.
     keep = unique_crop_indices(walk_source, rows, cfg)
     fit_rows = [rows[i] for i in fit_keep]
     rows = [rows[i] for i in keep]
@@ -438,11 +405,11 @@ def main() -> None:
     axis_prefix = "PC"
     if args.labeled_only:
         assert embeddings is not None
-        # preprocess every row first and *then* subset, matching the order
-        # latent_space.py uses: it preprocesses all points and indexes the labeled
-        # ones out of the result. under --embedding-preprocess standardize the
-        # column statistics depend on which rows are passed in, so preprocessing a
-        # subset would fit a different basis than the static annotation plot.
+        # the code preprocesses every row and *then* takes the subset, the order
+        # that latent_space.py uses. under --embedding-preprocess standardize,
+        # the column statistics depend on which rows go in. a preprocess of a
+        # subset would therefore fit a different basis than the static
+        # annotation plot.
         X_all = preprocess_embeddings(embeddings, args.embedding_preprocess)
         components, mean, explained = pca_fit(X_all[fit_keep], 2)
         coords = pca_transform(X_all[keep], components, mean)
@@ -467,8 +434,8 @@ def main() -> None:
     line_indices: np.ndarray | None = None
 
     if args.line:
-        # sample densely and let the duplicate collapse decide the frame count;
-        # that is what keeps every crop on screen for the same single frame.
+        # the code samples densely and lets the duplicate collapse decide the
+        # frame count. every crop then gets the same single frame.
         n_samples = args.bins if args.bins is not None else max(300, 4 * len(rows))
         line_indices, line_info = line_walk(
             coords,
@@ -521,9 +488,9 @@ def main() -> None:
     if args.out:
         out_path = Path(args.out)
     else:
-        # line-mode names carry the angle and band, so sweeping directions doesn't
-        # silently overwrite the previous render (and doesn't collide with a file
-        # still open in a player, which is what makes cv2 fail to write).
+        # a line-mode name carries the angle and the band. a sweep of several
+        # directions therefore cannot overwrite the previous render, and it
+        # cannot collide with a file that is open in a player.
         tag = ""
         if args.line:
             band_tag = (
@@ -538,8 +505,9 @@ def main() -> None:
             f"{'' if args.dataset_idx is None else f'_ds{args.dataset_idx}'}.mp4"
         )
 
-    # crop reconstruction is the slow part (a dask read per crop), so cache the
-    # projected crop by its physical anchor. arrays caches the open zarr handles.
+    # the crop reconstruction is the slow part, because each crop is one dask
+    # read. the code therefore caches the projection by physical anchor. arrays
+    # caches the open zarr handles.
     arrays: dict[int, Any] = {}
     mip_cache: dict[tuple[int, ...], np.ndarray] = {}
 
@@ -555,10 +523,10 @@ def main() -> None:
 
     steps: list[dict[str, Any]] = []
     if line_indices is not None:
-        # the point on the line drives the frame; the remaining montage cells show
-        # its nearest neighbors in the projection, same idea as the bin mode's
-        # "medoid plus neighbors". a 2x2 grid also upscales each 128px crop about
-        # 2x rather than 4x, so it reads far sharper than one big panel.
+        # the point on the line drives the frame. the rest of the montage is its
+        # nearest neighbors, the "medoid plus neighbors" idea of bin mode. a 2x2
+        # grid also upscales a 128px crop 2x rather than 4x, so the grid reads
+        # sharper than one big panel.
         for idx in line_indices:
             chosen = [int(idx)]
             if args.montage > 1:
@@ -571,7 +539,7 @@ def main() -> None:
                         chosen.append(int(candidate))
             steps.append({"medoid": int(idx), "chosen": chosen})
     else:
-        # per step: medoid (nearest the bin centroid) first, then nearest neighbors.
+        # per step: the medoid first, nearest the bin centroid, then the nearest neighbors.
         for members in bins:
             member_coords = coords[members]
             centroid = member_coords.mean(axis=0)
@@ -609,10 +577,10 @@ def _render_video(
     ax_map = fig.add_subplot(outer[0, 0])
     inner = outer[0, 1].subgridspec(grid_rows, cols, wspace=0.05, hspace=0.25)
 
-    # static scatter of the cloud being walked. colored by dataset for a
-    # full-cloud sweep, or by behavior label for an annotation walk -- with far
-    # fewer points, bigger dots and the annotation palette read better and the
-    # label gradient along PC1 is the thing worth seeing.
+    # static scatter of the cloud that the marker walks. the color comes from
+    # the dataset for a full-cloud sweep. the color comes from the behavior
+    # label for an annotation walk, where the label gradient along PC1 is the
+    # thing worth a look.
     if color_by == "label":
         labels = np.asarray([label_of(r) for r in rows])
         values = sorted(v for v in set(labels.tolist()) if v)
@@ -644,9 +612,8 @@ def _render_video(
             )
         legend_title = "dataset"
     if line_info is not None:
-        # the line and band are a debugging overlay, off unless asked for: the
-        # useful thing to see is the marker tracking a straight path, not the
-        # scaffolding that put it there.
+        # a debug overlay, off by default. the thing worth a look is the marker
+        # on a straight path, not the scaffolding behind it.
         if getattr(args, "show_line", False):
             centre = line_info["centre"]
             direction = line_info["direction"]
@@ -665,8 +632,8 @@ def _render_video(
                     [edge_start[0], edge_end[0]], [edge_start[1], edge_end[1]],
                     color="red", linewidth=0.7, alpha=0.45, linestyle="--", zorder=4,
                 )
-        # equal aspect regardless: the points are meant to read as collinear, and
-        # they won't if the two axes are scaled differently.
+        # the aspect is equal in every case, because axes with different scales
+        # hide the collinearity of the points.
         ax_map.set_aspect("equal", adjustable="datalim")
 
     ax_map.legend(
@@ -677,7 +644,7 @@ def _render_video(
     ax_map.set_ylabel(f"{axis_prefix}2")
     marker = ax_map.scatter([], [], s=140, facecolor="none", edgecolor="red", linewidths=2.0, zorder=5)
 
-    # crop image axes, initialized with blanks and updated in place each frame.
+    # the crop image axes start blank. each frame updates them in place.
     blank = np.zeros((crop_size, crop_size), dtype=np.float32)
     img_axes = []
     ims = []
@@ -695,11 +662,10 @@ def _render_video(
     fig.canvas.draw()
     height, width = fig.canvas.get_width_height()[::-1]
 
-    # render to a local temp file and copy into place at the end. writing an mp4
-    # straight onto the mounted share is what fails when the previous render is
-    # still open in a player or Explorer preview -- Windows denies the write and
-    # cv2 reports only "could not open", with no reason. a local scratch file also
-    # avoids per-frame round trips over SMB.
+    # the code renders locally and copies the file into place at the end. a
+    # direct mp4 write to the mounted share fails if the previous render is open
+    # in a player. Windows denies the write, and cv2 reports only "could not
+    # open". a local scratch file also avoids per-frame round trips over SMB.
     tmp_dir = tempfile.mkdtemp(prefix="latent_traversal_")
     tmp_video = Path(tmp_dir) / out_path.name
     writer = cv2.VideoWriter(
@@ -732,7 +698,8 @@ def _render_video(
                 else:
                     ims[k].set_data(blank)
                     ax.set_title("", fontsize=8)
-                # medoid cell gets a red border, neighbors a faint gray one.
+                # the medoid cell gets a red border. the neighbor cells get a
+                # faint gray border.
                 is_medoid = k == 0
                 for spine in ax.spines.values():
                     spine.set_color("red" if is_medoid else "0.7")
@@ -766,8 +733,8 @@ def _render_video(
         plt.close(fig)
 
     try:
-        # release() has to have happened before the copy, hence doing this after
-        # the finally block rather than inside it.
+        # this copy comes after the finally block and not inside it, because
+        # release() must happen first.
         shutil.copyfile(tmp_video, out_path)
     except PermissionError as exc:
         raise RuntimeError(

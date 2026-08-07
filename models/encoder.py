@@ -5,18 +5,18 @@ input  : (B, 1, Z, H, W)   Z is the slab depth (10 globals, 5 locals)
 output : (B, latent_dim)    latent_dim is 2048 for ResNet-50
 
 design:
-  - a small 3D stem learns depth-aware features over the z slab.
-  - ZAttentionPool collapses z using learned per-slice attention weights; one
-    set of encoder weights handles both globals (Z=10) and locals (Z=5).
-  - the 2D backbone is a ResNet-50 with its first conv adapted to take
-    `stem_channels` inputs and its classification head removed. weights
-    are randomly initialized; ImageNet pretraining doesn't transfer to
-    microscopy at the scale of this dataset.
-  - normalization is groupnorm, not batchnorm. groupnorm computes statistics
-    per-sample over channel groups, so there are no running-stat buffers. this
-    is deliberate: the ssl training loop pushes masked and multi-scale crops
-    through this encoder, whose degenerate statistics would corrupt batchnorm
-    running stats and then ship in the frozen eval checkpoint.
+  - a 3D stem runs first. then ZAttentionPool collapses z with learned
+    per-slice weights. one set of weights handles both globals (Z=10) and
+    locals (Z=5).
+  - the 2D backbone is a ResNet-50. the first conv adapts to `stem_channels`,
+    the classifier goes away, and the weights start random. ImageNet
+    pretrained weights do not transfer to microscopy at the scale of this
+    dataset.
+  - warning: batchnorm is unsafe here. the ssl loop sends masked and
+    multi-scale crops through this encoder. the degenerate statistics of those
+    crops corrupt the running stats of batchnorm. the corrupt stats then ship
+    in the frozen eval checkpoint. this encoder therefore uses groupnorm, which
+    keeps no running-stat buffers.
 """
 
 from __future__ import annotations
@@ -28,11 +28,9 @@ from torchvision.models import resnet50
 
 
 class ZAttentionPool(nn.Module):
-    """learned z-aggregation: replaces fixed average-pool over the depth axis.
-
-    computes one attention weight per z-slice (spatially averaged), softmaxes
-    over z, then returns a weighted sum -- preserving depth structure the model
-    found informative rather than discarding it uniformly.
+    """learned z-aggregation. the module computes one softmaxed weight per
+    z-slice, then the module makes a weighted sum. a fixed average-pool discards
+    depth structure uniformly, so this module replaces the average-pool.
     """
 
     def __init__(self, channels: int) -> None:
@@ -40,8 +38,8 @@ class ZAttentionPool(nn.Module):
         self.score = nn.Conv3d(channels, 1, kernel_size=1, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, Z, H, W)
-        # average over spatial dims to get one score per z-slice
+        # x: (B, C, Z, H, W). the module averages over space for one score per
+        # z-slice.
         w = self.score(x).mean(dim=(-1, -2), keepdim=True)  # (B, 1, Z, 1, 1)
         w = w.softmax(dim=2)
         return (x * w).sum(dim=2, keepdim=True)  # (B, C, 1, H, W)
@@ -67,41 +65,32 @@ class HybridEncoder(nn.Module):
         if chunk_size is not None and chunk_size < 1:
             raise ValueError(f"chunk_size must be >= 1 or None; got {chunk_size}")
 
-        # the dino wrapper flattens all crops into one batch (e.g. batch_size *
-        # 2 globals), then pushes them through the 3D stem at full resolution.
-        # the stem's activations dominate memory (a 64-channel 256x256x10 map is
-        # ~20 GiB in fp32 for 128 crops), so cap how many crops flow through the
-        # stem at once. None means no chunking.
+        # the dino wrapper flattens all crops into one batch. the
+        # full-resolution 3D activations of the stem then dominate memory
+        # (~20 GiB fp32 for 128 crops at 64ch/256x256x10). chunk_size caps the
+        # crops per stem pass. None means no chunking.
         self.chunk_size = chunk_size
 
-        # gradient checkpointing is split into two independently-controlled
-        # halves because their cost/benefit is wildly different.
-        #
-        #   stem + z_pool: activations are 3D and full-resolution
-        #     (stem_channels x Z x H x W per crop), so they dominate memory.
-        #     recomputing them is cheap relative to what they save -- keep on.
-        #   2D backbone: activations are post-z_pool and much smaller, while a
-        #     ResNet-50 forward is most of the flops. checkpointing it pays a
-        #     second full forward for a modest memory saving, which is why the
-        #     old whole-forward checkpointing cost ~25-33% throughput.
-        #
-        # default is therefore stem-only. flip checkpoint_backbone back on if a
-        # larger batch/crop count ooms.
+        # the two checkpointing halves have separate flags because their trade
+        # is very different. the 3D full-res activations of the stem are the
+        # memory hog. these activations are cheap to recompute. the backbone
+        # holds much less memory, although the backbone holds most of the flops.
+        # checkpointing of the backbone cost ~25-33% throughput. the default is
+        # therefore stem only: enable checkpoint_backbone only on an oom.
         self.checkpoint_stem = bool(checkpoint_stem)
         self.checkpoint_backbone = bool(checkpoint_backbone)
 
         def make_norm(num_channels: int) -> nn.GroupNorm:
-            # clamp groups to the largest divisor of num_channels that is
-            # <= norm_groups so groupnorm is valid for any channel count.
-            # groupnorm handles 3D (stem) and 2D (backbone) tensors alike.
+            # make_norm clamps groups to the largest divisor of num_channels
+            # that is <= norm_groups. groupnorm then stays valid for any
+            # channel count.
             groups = min(norm_groups, num_channels)
             while num_channels % groups != 0:
                 groups -= 1
             return nn.GroupNorm(groups, num_channels)
 
-        # 3D stem: two conv layers that preserve (Z, H, W) and grow channels.
-        # ZAttentionPool then collapses z with learned weights so the 2D
-        # backbone sees a single feature plane per sample.
+        # the 3D stem keeps (Z, H, W) and grows the channel count. z_pool then
+        # collapses z, so the 2D backbone sees one feature plane per sample.
         self.stem = nn.Sequential(
             nn.Conv3d(1, 32, kernel_size=3, padding=1, bias=False),
             make_norm(32),
@@ -112,31 +101,29 @@ class HybridEncoder(nn.Module):
         )
         self.z_pool = ZAttentionPool(stem_channels)
 
-        # 2D ResNet-50 backbone. swap the input conv (3 -> stem_channels) and
-        # drop the classifier (we want the 2048-d pre-classifier feature). the
-        # norm_layer factory replaces every backbone batchnorm with groupnorm.
+        # the code swaps the input conv (3 -> stem_channels) and drops the
+        # classifier, because the encoder must output the 2048-d
+        # pre-classifier feature. make_norm puts groupnorm everywhere.
         self.backbone = resnet50(weights=None, norm_layer=make_norm)
         self.backbone.conv1 = nn.Conv2d(
             stem_channels, 64, kernel_size=7, stride=2, padding=3, bias=False
         )
-        # Keep the default checkpoint layout unchanged. For an explicitly
-        # smaller/larger representation, use ResNet's final projection layer.
+        # nn.Identity at 2048 keeps the default checkpoint layout unchanged.
+        # the final projection of resnet gives any other latent_dim.
         self.backbone.fc = (
             nn.Identity() if latent_dim == 2048 else nn.Linear(2048, latent_dim)
         )
 
-    # ---- pieces of the forward, so checkpointing can be applied per-half ----
+    # ---- pieces of the forward, so each half can use checkpointing alone ----
 
     def _stem_forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, 1, Z, H, W) -> stem -> (B, stem_channels, Z, H, W)
+        # (B, 1, Z, H, W) -> (B, stem_channels, H, W) for the 2D backbone
         x = self.stem(x)
-        # learned z collapse -> (B, stem_channels, 1, H, W)
         x = self.z_pool(x)
-        # drop trivial z axis -> (B, stem_channels, H, W) for ResNet
         return x.squeeze(2)
 
     def _backbone_pooled(self, x: torch.Tensor) -> torch.Tensor:
-        # (B, latent_dim); fc is Identity when latent_dim == 2048.
+        # returns (B, latent_dim). fc is Identity when latent_dim == 2048.
         return self.backbone(x)
 
     def _backbone_tokens(self, x: torch.Tensor, layer: str) -> torch.Tensor:
@@ -156,11 +143,11 @@ class HybridEncoder(nn.Module):
     def _backbone_pooled_and_tokens(
         self, x: torch.Tensor, layer: str
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """one backbone pass yielding both the pooled feature and `layer` tokens.
+        """one backbone pass that returns both the pooled feature and `layer`
+        tokens.
 
-        the callers that need both (the iBOT teacher: pooled feature for the DINO
-        target, patch tokens for the masked-prediction target) used to run the
-        whole stem+backbone twice on the same input.
+        the iBOT teacher needs both targets from the same input. without this
+        method the teacher runs the whole stem+backbone twice.
         """
         b = self.backbone
         x = b.conv1(x); x = b.bn1(x); x = b.relu(x); x = b.maxpool(x)
@@ -173,16 +160,16 @@ class HybridEncoder(nn.Module):
         if tok is None and layer == "layer3":
             tok = x
         x = b.layer4(x)
-        if tok is None:  # "layer4" (and any unrecognized value, as before)
+        if tok is None:  # "layer4", and any unrecognized value, as before
             tok = x
         z = torch.flatten(b.avgpool(x), 1)
         return b.fc(z), tok
 
     def _ckpt_stem(self, x: torch.Tensor) -> torch.Tensor:
-        # groupnorm retains its activations (it recomputes nothing in backward,
-        # unlike the fused cudnn batchnorm it replaced), and the stem's are 3D at
-        # full resolution, so this is where checkpointing earns its keep.
-        # training only: there is no backward pass to trade against at inference.
+        # groupnorm keeps its activations, unlike the fused cudnn batchnorm that
+        # it replaced. the activations of the stem are 3D at full resolution.
+        # checkpointing therefore earns its keep here. the code checkpoints in
+        # training only, because inference has no backward to trade against.
         if self.training and self.checkpoint_stem:
             return checkpoint(self._stem_forward, x, use_reentrant=False)
         return self._stem_forward(x)
@@ -196,14 +183,12 @@ class HybridEncoder(nn.Module):
     def _fuse_checkpoints(self) -> bool:
         """checkpoint stem+backbone as ONE region when both halves are enabled.
 
-        checkpointing them separately forces the boundary tensor -- the stem's 2D
-        output, fp32 because groupnorm upcasts under autocast -- to be retained
-        for every crop across the whole forward, since it is the input the second
-        region needs to recompute from. at 256^2 that is 64*256*256*4 = 16.8 MB
-        per global and 2.4 MB per local, so ~5 GB for a batch of 64 (globals +
-        locals + the iBOT masked pass) that a single fused region never holds.
-        fusing recomputes the stem inside the same region instead, which is what
-        this encoder did before the two flags were split apart.
+        separate regions must keep the boundary tensor for every crop, because
+        the second region recomputes from the boundary tensor. the boundary
+        tensor is the 2D output of the stem, and it is fp32 because groupnorm
+        upcasts under autocast. the cost is ~5 GB for a batch of 64. one fused
+        region never holds the boundary tensor, because the fused region
+        recomputes the stem inside itself.
         """
         return self.training and self.checkpoint_stem and self.checkpoint_backbone
 
@@ -227,7 +212,8 @@ class HybridEncoder(nn.Module):
             self._backbone_pooled_and_tokens, self._ckpt_stem(x), layer
         )
 
-    # fused stem+backbone bodies, used when both checkpoint flags are on.
+    # fused stem+backbone bodies. the code uses them when both checkpoint flags
+    # are on.
     def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
         return self._backbone_pooled(self._stem_forward(x))
 
@@ -238,10 +224,11 @@ class HybridEncoder(nn.Module):
         return self._backbone_pooled_and_tokens(self._stem_forward(x), layer)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # split the crop batch so the stem never materializes all crops at once.
-        # chunking runs in eval too (bounds the teacher's forward memory); only
-        # the checkpointing inside _run is training-gated. concatenating chunk
-        # outputs is exact: each crop is encoded independently.
+        # forward splits the crop batch, so the stem never materializes all
+        # crops at once. chunking runs in eval too, because it bounds the
+        # forward memory of the teacher. only the checkpointing inside _run is
+        # training-gated. the result is exact either way, because the encoder
+        # handles each crop independently.
         if self.chunk_size is not None and x.shape[0] > self.chunk_size:
             return torch.cat(
                 [self._run(chunk) for chunk in x.split(self.chunk_size, dim=0)],
@@ -250,7 +237,8 @@ class HybridEncoder(nn.Module):
         return self._run(x)
 
     def forward_tokens(self, x, layer="layer4"):
-        # chunk like forward() so the stem never materializes all crops at once
+        # forward_tokens chunks like forward(), so the stem never materializes
+        # all crops at once
         if self.chunk_size is not None and x.shape[0] > self.chunk_size:
             return torch.cat(
                 [self._run_tokens(chunk, layer) for chunk in x.split(self.chunk_size, dim=0)],
@@ -271,8 +259,7 @@ class HybridEncoder(nn.Module):
 
 
 if __name__ == "__main__":
-    # smoke test: verify the encoder accepts both global and local shapes
-    # without needing any zarr files. run as: python -m models.encoder
+    # smoke test, no zarr needed. run as: python -m models.encoder
     enc = HybridEncoder()
     enc.eval()
     with torch.no_grad():
@@ -285,8 +272,8 @@ if __name__ == "__main__":
     assert z_g.shape == (2, 2048), f"unexpected global output shape: {z_g.shape}"
     assert z_l.shape == (2, 2048), f"unexpected local output shape: {z_l.shape}"
 
-    # forward_with_tokens must be exactly the two separate calls it replaces,
-    # since the iBOT teacher now takes the fused path for both of its targets.
+    # the iBOT teacher takes the fused path for both targets. the fused path
+    # must therefore match the two separate calls that it replaces exactly.
     small = HybridEncoder(stem_channels=16, latent_dim=64, chunk_size=2)
     small.eval()
     x = torch.randn(3, 1, 6, 64, 64)
@@ -300,8 +287,7 @@ if __name__ == "__main__":
         print(f"  forward_with_tokens == (forward, forward_tokens) at {layer}  "
               f"pooled={tuple(z_fused.shape)} tokens={tuple(tok_fused.shape)}")
 
-    # checkpointing is a memory/compute trade only: gradients must not depend on
-    # which half (if either) is checkpointed.
+    # checkpointing is a memory/compute trade only: gradients must not change.
     grads = {}
     for ckpt_stem, ckpt_bb in ((False, False), (True, False), (True, True)):
         torch.manual_seed(0)

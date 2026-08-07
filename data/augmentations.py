@@ -1,16 +1,23 @@
 """visual augmentations for single-channel float crops.
 
-transforms work on `[1, H, W]` or `[1, Z, H, W]` float32 tensors.
-each transform reads its own `AugCfg` and applies with probability `p`.
+a transform works on a `[1, H, W]` or a `[1, Z, H, W]` float32 tensor. each
+transform reads its own `AugCfg`. each transform applies with the probability
+`p`.
 
-pipeline order:
+`build_augmentations` assembles the pipeline in this order. the dataset
+rescales the inputs to [0, 1] before the pipeline runs.
 
-    rescale to [0, 1]
-      -> random gamma
+    random gamma
       -> random intensity
       -> gaussian noise
       -> gaussian blur
       -> per-crop normalize
+      -> random flip
+      -> random 90-degree rotation
+
+the geometric transforms run after per-crop normalize. a flip and a rot90 are
+permutations of the pixels. therefore they keep the mean and the std, and the
+normalization stays correct.
 """
 
 from __future__ import annotations
@@ -27,7 +34,7 @@ _EPS = 1e-6
 
 
 class _Aug:
-    """apply `_apply` with probability `cfg.p`."""
+    """apply `_apply` with the probability `cfg.p`."""
 
     def __init__(self, cfg: AugCfg) -> None:
         self.cfg = cfg
@@ -44,7 +51,7 @@ class _Aug:
 
 
 class RandomIntensity(_Aug):
-    """multiply intensity by a small random scale."""
+    """multiply the intensity by a small random scale."""
 
     def _apply(self, x: Tensor) -> Tensor:
         s = float(self.cfg.strength)
@@ -53,7 +60,7 @@ class RandomIntensity(_Aug):
 
 
 class RandomGamma(_Aug):
-    """apply gamma correction to [0, 1] inputs."""
+    """apply a gamma correction to inputs in [0, 1]."""
 
     def _apply(self, x: Tensor) -> Tensor:
         gmin, gmax = self.cfg.gamma_range
@@ -73,7 +80,7 @@ class GaussianNoise(_Aug):
 
 
 class GaussianBlur(_Aug):
-    """blur y/x with a sampled sigma."""
+    """blur y and x with a sampled sigma."""
 
     def _apply(self, x: Tensor) -> Tensor:
         from torchvision.transforms.functional import gaussian_blur
@@ -89,25 +96,22 @@ class GaussianBlur(_Aug):
 
 
 class RandomFlip2D(_Aug):
-    """random horizontal or vertical flip of spatial dimensions (H, W)."""
+    """apply a random horizontal flip or vertical flip to the spatial dimensions (H, W)."""
 
     def _apply(self, x: Tensor) -> Tensor:
-        # x is [1, H, W] or [1, Z, H, W]
-        # flip H or W dimension (last two spatial dims)
+        # H and W are the last two dims for both [1, H, W] and [1, Z, H, W].
         if torch.rand(()) < 0.5:
-            x = torch.flip(x, dims=[-2])  # flip H (second-to-last)
+            x = torch.flip(x, dims=[-2])
         else:
-            x = torch.flip(x, dims=[-1])  # flip W (last)
+            x = torch.flip(x, dims=[-1])
         return x
 
 
 class Rotation2D(_Aug):
-    """random 90-degree rotation of spatial dimensions (H, W)."""
+    """apply a random 90-degree rotation to the spatial dimensions (H, W)."""
 
     def _apply(self, x: Tensor) -> Tensor:
-        # x is [1, H, W] or [1, Z, H, W]
-        # rotate by 90, 180, or 270 degrees
-        k = torch.randint(1, 4, ()).item()  # 1, 2, or 3 (90, 180, 270 deg)
+        k = torch.randint(1, 4, ()).item()  # 1, 2 or 3 -> 90, 180, 270 deg
         spatial_dims = (2, 3) if x.ndim == 4 else (1, 2)
         return torch.rot90(x, k=k, dims=spatial_dims)
 
@@ -120,7 +124,7 @@ class PerCropNormalize(_Aug):
 
 
 class _Pipeline:
-    # module-level so dataloader workers can pickle it.
+    # the class is at module level, so the dataloader workers can pickle it.
     def __init__(self, augs: list[_Aug]) -> None:
         self.augs = augs
 
@@ -131,7 +135,7 @@ class _Pipeline:
 
 
 def build_augmentations(cfg: Config) -> Callable[[Tensor], Tensor]:
-    """compose enabled augmentations in pipeline order."""
+    """compose the enabled augmentations in the pipeline order."""
     ordered: list[_Aug] = []
     if cfg.aug_gamma.enabled:
         ordered.append(RandomGamma(cfg.aug_gamma))

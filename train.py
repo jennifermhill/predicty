@@ -5,7 +5,7 @@ usage:
     python train.py --config configs/train.yaml --resume checkpoints/latest.pt
     python train.py --config configs/train.yaml --device cpu   # smoke test
 
-logs go to `cfg.log_dir` (tensorboard format). view with:
+logs go to `cfg.log_dir` in tensorboard format. view the logs with:
     tensorboard --logdir logs
 """
 
@@ -73,16 +73,13 @@ def build_dataset(cfg: Config):
 
 
 def find_free_port(start: int, attempts: int = 50) -> int | None:
-    """first free TCP port at or above `start` on this host.
+    """first free TCP port at or above `start`, or None if the range is full.
 
-    lets concurrent runs on the same node each get their own tensorboard
-    instead of the second one colliding on the configured port. returns None
-    if nothing in the scanned range is free.
+    each concurrent run on one node can then get its own tensorboard.
     """
     for port in range(start, start + attempts):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            # SO_REUSEADDR so a recently-closed socket in TIME_WAIT doesn't
-            # make a usable port look taken.
+            # with SO_REUSEADDR a socket in TIME_WAIT does not look taken.
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 s.bind(("", port))
@@ -93,18 +90,17 @@ def find_free_port(start: int, attempts: int = 50) -> int | None:
 
 
 def launch_tensorboard(log_dir: str, port: int) -> subprocess.Popen | None:
-    """start a tensorboard server pointed at log_dir and tear it down on exit.
+    """start a tensorboard server on log_dir and tear it down at exit.
 
-    runs as a child process so a missing binary or a busy port can never take
-    down training. returns the handle (or None if it couldn't start).
+    the server is a child process, so a missing binary or a busy port can never
+    take down training. the function returns the handle, or None if the server
+    cannot start.
     """
     tb_bin = shutil.which("tensorboard")
     if tb_bin is None:
         print("[train] tensorboard not found on PATH, skipping auto-launch")
         return None
 
-    # walk up from the configured port so a second run on the same node lands
-    # on a free port instead of failing to bind.
     free_port = find_free_port(port)
     if free_port is None:
         print(
@@ -125,8 +121,7 @@ def launch_tensorboard(log_dir: str, port: int) -> subprocess.Popen | None:
         print(f"[train] failed to launch tensorboard: {e}")
         return None
 
-    # terminate the server when training exits so it doesn't outlive the job
-    # and hold the port.
+    # the server must not outlive the job and hold the port.
     atexit.register(lambda: proc.terminate())
     host = socket.gethostname()
     print(
@@ -141,26 +136,25 @@ def main() -> None:
     cfg = Config.from_yaml(args.config)
     if args.device:
         cfg.device = args.device
-    # capture the root log dir before namespacing so tensorboard serves every
-    # run (matches the manual `tensorboard --logdir logs`), not just this one.
+    # main captures the root log dir before it namespaces the run. tensorboard
+    # then serves every run, like the manual `tensorboard --logdir logs`.
     tensorboard_root = cfg.log_dir
-    # namespace io under the run name so multiple concurrent runs keep their
-    # checkpoints and tensorboard logs separate instead of overwriting.
+    # namespace io per run, so concurrent runs do not overwrite each other.
     if args.run_name:
         cfg.checkpoint_dir = str(Path(cfg.checkpoint_dir) / args.run_name)
         cfg.log_dir = str(Path(cfg.log_dir) / args.run_name)
 
-    # serve tensorboard alongside the run unless disabled in the config.
     if cfg.tensorboard_enabled:
         launch_tensorboard(tensorboard_root, cfg.tensorboard_port)
 
     device = torch.device(cfg.device)
-    # amp is only supported on cuda. silently disable on cpu.
+    # only cuda supports amp. the code disables amp on cpu without a message.
     use_amp = cfg.use_amp and device.type == "cuda"
 
-    # bf16 carries fp32's exponent range, so it needs no gradient scaling and
-    # can't lose a step to an inf/NaN overflow the way fp16 can. fall back to
-    # fp16 where bf16 isn't supported in hardware.
+    # warning: bf16 is the wrong choice on this data. the 8 mantissa bits of
+    # bf16 collapse the teacher. see README "Results: where the models stand".
+    # bf16 carries the exponent range of fp32, so bf16 needs no gradient
+    # scaling. the code falls back to fp16 where the hardware lacks bf16.
     amp_dtype_name = str(getattr(cfg, "amp_dtype", "fp16")).lower()
     if amp_dtype_name not in ("bf16", "bfloat16", "fp16", "float16"):
         raise ValueError(
@@ -171,7 +165,7 @@ def main() -> None:
         print("[train] WARNING: bf16 unsupported on this gpu, falling back to fp16")
         want_bf16 = False
     amp_dtype = torch.bfloat16 if want_bf16 else torch.float16
-    # the scaler only exists for fp16; with bf16 every call is a no-op passthrough.
+    # the scaler is fp16-only. under bf16 every scaler call is a passthrough.
     use_scaler = use_amp and amp_dtype is torch.float16
 
     print(
@@ -179,7 +173,7 @@ def main() -> None:
         f"amp_dtype={'bf16' if want_bf16 else 'fp16'}  grad_scaler={use_scaler}"
     )
     if device.type == "cuda":
-        # confirms we actually got the gpu we asked the cluster for.
+        # the print below confirms the gpu that the cluster gave us.
         idx = device.index if device.index is not None else 0
         total_gb = torch.cuda.get_device_properties(idx).total_memory / 1024**3
         print(
@@ -230,15 +224,21 @@ def main() -> None:
     else:
         print("[train] masked autoencoder: disabled")
     if model.ibot_enabled:
+        # warning: block_size is in FEATURE-GRID cells, not voxels, unlike
+        # mae_patch_* above. at layer4 the grid is 8x8 over a 256px crop. one
+        # cell is therefore 32px, and the masked block is full-depth x
+        # (32*block) x (32*block). the print below gives both units, so nobody
+        # tunes ibot_block_size as if it were voxels.
+        _cell_px = cfg.global_crop_size // 8
         print(
             f"[train] iBOT masking: enabled "
-            f"(patch=({cfg.z_thickness}, {cfg.ibot_block_size}, {cfg.ibot_block_size}), "
+            f"(block={cfg.ibot_block_size} grid cells on {cfg.ibot_layer} "
+            f"= full-depth x {_cell_px * cfg.ibot_block_size}px square, "
             f"mask_ratio={cfg.ibot_mask_ratio}, weight={cfg.ibot_weight})"
         )
     else:
         print("[train] iBOT masking: disabled")
-    # confirms .to(device) actually moved the model. if this prints 'cpu'
-    # while device says 'cuda', training will silently run on cpu.
+    # 'cpu' here when device says 'cuda' means .to(device) silently did not take.
     print(f"[train] student params live on: {next(model.student.parameters()).device}")
     print(f"[train] teacher params live on: {next(model.teacher.parameters()).device}")
 
@@ -256,10 +256,8 @@ def main() -> None:
     scaler = GradScaler(device.type, enabled=use_scaler)
 
     # ---- io ----
-    # each invocation writes to its own timestamped subdirectory so multiple
-    # runs stay separate in tensorboard's UI instead of accumulating into the
-    # same log_dir as opaque event files. resumes get a `_resume` suffix so
-    # they're visually distinguishable from fresh runs.
+    # one timestamped subdirectory per invocation, so runs stay separate in the
+    # tensorboard UI. the `_resume` suffix marks a resume.
     run_name = time.strftime("%Y%m%d_%H%M%S")
     if args.resume:
         run_name = f"{run_name}_resume"
@@ -268,10 +266,6 @@ def main() -> None:
     print(f"[train] tensorboard logs -> {run_log_dir}")
     ckpt_dir = Path(cfg.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-    # ---- ibot ----
-    ibot_last = [None, None, None, 0]  # loss, acc@1, acc@5, step
-    # initialized before training loop to remain persistent between steps
 
     # ---- resume ----
     start_step = 0
@@ -282,7 +276,7 @@ def main() -> None:
     # ---- training loop ----
     loader_iter = iter(loader)
     t_last_log = time.time()
-    ibot_last = [None, None, None, 0]  # last iBOT [loss, top1, top5, step], carried between masked steps
+    ibot_last = [None, None, None, 0]  # [loss, top1, top5, step] from the last masked step
 
     step = start_step
     for step in range(start_step, cfg.total_steps):
@@ -291,9 +285,9 @@ def main() -> None:
         )
         model.dataset_adversary_grl_scale = linear_frac_schedule(
             step, cfg.total_steps, cfg.dataset_adversary_grl_start, cfg.dataset_adversary_grl_scale, cfg.temp_warmup_frac
-        ) # using same warmup fraction as teacher temperature for now, can separate if needed
-        # the IterableDataset is infinite, but guard against StopIteration anyway
-        # so a worker restart doesn't kill training.
+        ) # the same warmup fraction as teacher temp for now. separate it if needed
+        # the IterableDataset is infinite. a worker restart can still raise
+        # StopIteration, and StopIteration must not kill training.
         try:
             batch = next(loader_iter)
         except StopIteration:
@@ -302,9 +296,8 @@ def main() -> None:
 
         batch = batch_to_device(batch, device)
 
-        # on the first iteration only, confirm the batch actually landed on
-        # the gpu. catches the "model is cuda but batches stay on cpu" bug
-        # that silently triggers an implicit transfer per op.
+        # first iteration only. the print catches "model is cuda but batches
+        # stay on cpu". that fault silently costs an implicit transfer per op.
         if step == start_step:
             print(f"[train] first batch globals device: {batch['globals'].device}")
             if "locals" in batch:
@@ -316,17 +309,15 @@ def main() -> None:
                 ).tolist()
                 print(f"[train] first batch dataset counts: {dataset_counts}")
 
-        # set LR & weight per-step from the schedule.
         lr = lr_schedule(step, cfg.total_steps, cfg.base_lr, cfg.warmup_frac)
 
-        # weight decay uses same cosine schedule as ema momentum, but with a different start/end range.
+        # weight decay reuses the ema cosine schedule with its own start and end.
         wd = ema_momentum_schedule(step, cfg.total_steps, cfg.weight_decay_start, cfg.weight_decay_end)
         for g in optimizer.param_groups:
             g["lr"] = lr
             if g.get("wd_scheduled"): # skip the no-decay group
                 g["weight_decay"] = wd
 
-        # forward + loss under autocast (bf16/fp16 ops on cuda).
         with autocast(device.type, dtype=amp_dtype, enabled=use_amp):
             out = model(batch)
             dino = dino_loss(
@@ -354,9 +345,9 @@ def main() -> None:
                     teacher_temp=teach_temp,
                     student_temp=cfg.student_temp,
                 )
-                # capture iBOT metrics on every masked step (not only log-steps)
-                # so the logged point lands at ~the current step. cheap: argmax/
-                # topk on already-computed tokens, no backward.
+                # the code captures on every masked step, not on log-steps only,
+                # so the point lands at its real step. the capture is cheap:
+                # argmax and topk, with no backward.
                 with torch.no_grad():
                     _ibot_acc = ibot_patch_accuracy(
                         out["student_masking_globals"],
@@ -376,7 +367,7 @@ def main() -> None:
             if koleo_val is not None:
                 koleo_weight = linear_frac_schedule(
                     step, cfg.total_steps, 0.0, cfg.koleo_weight, cfg.temp_warmup_frac
-                ) # same warmup fraction as teacher temperature for now, can separate if needed
+                ) # the same warmup fraction as teacher temp for now. separate it if needed
 
             loss = dino
             if dataset_loss is not None:
@@ -388,10 +379,8 @@ def main() -> None:
             if koleo_val is not None:
                 loss = loss + koleo_weight * koleo_val
 
-        # backward, unscale grads to apply clipping in fp32, step + update.
-        # under bf16 the scaler is disabled and every call here is a passthrough
-        # (scale/unscale_/update no-op, step forwards straight to the optimizer),
-        # so the clipping still sees true-scale gradients.
+        # unscale before the clip, so the clip sees true-scale gradients. under
+        # bf16 the scaler is off, and all four calls are passthroughs.
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -401,12 +390,12 @@ def main() -> None:
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
 
-        # EMA + center + teacher_temp updates after the optimizer step.
+        # EMA and center updates, after the optimizer step.
         m = ema_momentum_schedule(
             step, cfg.total_steps, cfg.ema_momentum_start, cfg.ema_momentum_end
         )
         model.update_teacher(m)
-        # center is updated on the raw teacher logits (float32 for stability).
+        # raw teacher logits, in float32 for stability.
         model.update_center(out["teacher_globals"].float(), cfg.center_momentum)
         if out["teacher_masking_globals"] is not None:
             model.update_ibot_center(out["teacher_masking_globals"].float(), cfg.center_momentum)
@@ -414,17 +403,19 @@ def main() -> None:
         # ---- logging ----
         if step % cfg.log_interval == 0:
             with torch.no_grad():
-                # teacher entropy: high at init (uniform softmax), should
-                # decrease then stabilize. crashing to 0 -> collapsed teacher.
+                # teacher entropy. read the entropy as a fraction of
+                # ln(projector_k). ~0.71 is healthy. a climb toward 1.0 is
+                # uniform collapse. 0 is a collapsed teacher. see README
+                # "Training".
                 t_probs = (
                     (out["teacher_globals"] - model.center) / teach_temp
                 ).softmax(dim=-1)
                 entropy = -(t_probs * t_probs.clamp(min=1e-8).log()).sum(dim=-1).mean()
-                # embedding variance: stashed from the last student forward.
-                # drops near 0 -> all crops mapping to the same point.
-                # cast to fp32 because under autocast last_features is fp16
-                # (or bf16), and var of small reduced-precision values can
-                # underflow right when we most need to see collapse coming.
+                # embedding variance. a value near 0 means all crops map to one
+                # point. the code casts to fp32, because under autocast
+                # last_features is fp16/bf16. the var of small
+                # reduced-precision values underflows exactly when we must see
+                # collapse.
                 feats = model.student.last_features
                 emb_var = (
                     feats.float().var(dim=0).mean()
@@ -442,8 +433,7 @@ def main() -> None:
                 mae_mask_ratio = (
                     out["mae"]["mask_ratio"] if out["mae"] is not None else None
                 )
-                # iBOT metrics are captured every masked step (see loss block);
-                # ibot_last holds the most recent, logged below at its real step.
+                # iBOT metrics come from ibot_last, which the loss block fills.
 
             dt = time.time() - t_last_log
             t_last_log = time.time()

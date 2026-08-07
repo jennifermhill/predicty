@@ -1,8 +1,16 @@
-"""
-utils for the masking objective (currently iBOT applied to a Resnet50 backbone): 
-patch-level masked reconstruction of feature maps from a shared encoder. 
-the encoder is frozen and the decoder is trained to reconstruct
-the masked patches from the unmasked ones. the loss is evaluated only on masked patches
+"""masked-modeling pieces. most of this file is MAE, despite the filename.
+
+`MaskedPatchAutoencoder` is the bulk of the file, and it holds the MAE
+objective. the class masks patches of a global crop. the class then runs the
+*live* student encoder on the masked crop. the class decodes the latent back to
+voxels, and it scores the loss on masked patches only. nothing here is frozen
+and nothing here is iBOT.
+
+the iBOT contribution is only `make_block_mask` and `apply_grid_mask`, about 20
+lines. `models/dino.py` calls both functions to build the block mask. the iBOT
+objective itself is teacher/student distillation over patch tokens. the iBOT
+objective has no decoder, and it lives in `models/dino.py`. MAE and iBOT are
+mutually exclusive -- see README "Training" > "What gets trained".
 """
 
 from __future__ import annotations
@@ -12,8 +20,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-import random
 
 
 def _trunc_normal_(x: torch.Tensor, std: float = 0.02) -> None:
@@ -25,9 +31,9 @@ def _reconstruction_metrics(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """scale-free reconstruction quality between two flat voxel tensors.
 
-    returns (r2, pearson_corr, relative_l2). r2 and corr sit in [-1, 1] where
-    higher is better; rel_l2 is in [0, inf) where lower is better. falls back to
-    finite defaults when the target is constant (undefined variance).
+    the function returns (r2, pearson_corr, relative_l2). a higher value is
+    better for the first two. a lower value is better for rel_l2. the function
+    falls back to finite defaults when the target is constant.
     """
     if pred.numel() == 0:
         zero = pred.new_zeros(())
@@ -68,16 +74,11 @@ def apply_grid_mask(x, mask, grid: int = 8):
 def make_random_mask(
     batch_size: int, n_patches: int, mask_ratio: float, device: torch.device
 ) -> torch.Tensor:
-    """generate random binary masks for patchified volumes.
+    """random binary masks for patchified volumes.
 
-    Args:
-        batch_size: number of masks to generate.
-        n_patches: total number of patches in a volume.
-        mask_ratio: fraction of patches to mask.
-        device: device to create mask on.
-
-    Returns:
-        boolean tensor of shape (batch_size, n_patches) where True indicates masked patches.
+    the function returns a bool tensor (batch_size, n_patches). True means
+    masked. the function always masks at least one patch, and it always keeps at
+    least one patch.
     """
     if not 0.0 < mask_ratio < 1.0:
         raise ValueError(f"mask_ratio must be in (0, 1); got {mask_ratio}")
@@ -96,16 +97,10 @@ def apply_mask_to_volume(
     grid_shape: tuple[int, int, int],
     patch_shape: tuple[int, int, int],
 ) -> torch.Tensor:
-    """apply patch-level masking to a batch of 3D volumes.
+    """zero the masked patches of a batch of 3D volumes.
 
-    Args:
-        x: input tensor of shape (B, 1, Z, H, W).
-        mask: binary mask of shape (B, n_patches) where True = masked.
-        grid_shape: (n_z, n_h, n_w), number of patches in each dimension.
-        patch_shape: (pz, ph, pw), patch size in each dimension.
-
-    Returns:
-        masked volume with same shape as x (masked patches set to 0).
+    x is (B, 1, Z, H, W). mask is (B, n_patches), and True means masked. the
+    function returns a volume of the same shape.
     """
     n, c, z, h, w = x.shape
     pz, ph, pw = patch_shape
@@ -125,7 +120,6 @@ def apply_mask_to_volume(
     patches = patches.permute(0, 2, 4, 6, 1, 3, 5, 7)
     patches = patches.reshape(n, n_patches, patch_dim)
 
-    # mask
     patches = patches.masked_fill(mask.unsqueeze(-1), 0.0)
 
     # unpatchify
@@ -137,10 +131,10 @@ def apply_mask_to_volume(
 class MaskedPatchAutoencoder(nn.Module):
     """patch-level masked reconstruction decoder for 3D crop tensors.
 
-    the shared encoder produces one latent vector per masked crop. the decoder
-    conditions that vector on learned patch-position embeddings and predicts a
-    flattened voxel patch for every patch location. loss is evaluated only on
-    masked patches, matching the MAE objective while avoiding a large dense
+    the live student encoder gives one latent per masked crop. the decoder
+    conditions the latent on learned patch-position embeddings. the decoder then
+    predicts one flattened voxel patch per location. a per-patch prediction from
+    a single latent keeps the MAE objective, and it does not pay for a dense
     volumetric decoder.
     """
 
@@ -198,11 +192,10 @@ class MaskedPatchAutoencoder(nn.Module):
         _trunc_normal_(self.mask_token)
 
     def forward(self, x: torch.Tensor, encoder: nn.Module) -> dict[str, torch.Tensor]:
-        """return masked-patch reconstruction loss and diagnostics.
+        """masked-patch reconstruction loss and diagnostics.
 
-        Args:
-            x: global crops with shape (N, 1, Z, H, W).
-            encoder: shared student encoder. it receives the masked crop.
+        x is global crops (N, 1, Z, H, W). `encoder` is the live student
+        encoder, and it sees the masked crop.
         """
         if x.ndim != 5 or x.size(1) != 1:
             raise ValueError(f"expected x shape (N, 1, Z, H, W); got {tuple(x.shape)}")
@@ -224,11 +217,9 @@ class MaskedPatchAutoencoder(nn.Module):
         patch_loss = F.mse_loss(pred, target, reduction="none").mean(dim=-1)
         loss = patch_loss[mask].mean()
 
-        # reconstruction quality on masked patches only. mse alone is hard to
-        # read (its scale drifts with norm_pix_loss and input magnitude), so we
-        # also report scale-free metrics that say how good the reconstruction
-        # actually is: r2 (fraction of target variance explained), pearson
-        # correlation, and relative l2 error.
+        # mse alone is unreadable here, because its scale drifts with
+        # norm_pix_loss and with the input magnitude. the block below also
+        # reports scale-free metrics on masked patches.
         with torch.no_grad():
             pred_masked = pred[mask].flatten()
             target_masked = target[mask].flatten()

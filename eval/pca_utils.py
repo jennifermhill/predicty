@@ -1,26 +1,18 @@
-"""exact, deterministic PCA and embedding preprocessing, shared by the eval scripts.
+"""exact and deterministic PCA, and the embedding preprocess helpers the eval scripts share.
 
-eval/latent_space.py used to compute PCA with torch.pca_lowrank, which is a
-*randomized* algorithm, and that script never seeded torch's global RNG (its
-cfg.seed only reaches the dataloader workers via worker_init_fn). So two runs
-over byte-identical embeddings produced different PC1/PC2, and a static plot
-never quite matched anything computed later from the same data.
+this module uses an exact float64 SVD and a fixed sign convention. the module
+replaces an unseeded torch.pca_lowrank. the randomization of torch.pca_lowrank
+gave different PC1/PC2 on byte-identical embeddings. the error was large here,
+because the spectrum of this project is nearly flat (PC1 ~5.7% against PC2
+~5.4%), and a randomized SVD degrades exactly at a flat spectrum. therefore you
+cannot trust the PCA figures in run dirs from before 2026-07-28.
 
-Two things made that worse than it sounds:
+at 128 latent dims the exact decomposition is instant, so the change lost
+nothing.
 
-  * it asked for exactly as many basis vectors as components (q = n_components,
-    no oversampling), which is the least accurate way to use a randomized SVD;
-  * randomized SVD degrades most when the spectrum is flat, and this project's
-    is about as flat as it gets -- PC1 ~5.7% vs PC2 ~5.4% of variance, so the
-    2D plane is well determined but the axes *within* it are ill-conditioned
-    and a small perturbation rotates them a lot.
-
-This module replaces that with an exact float64 SVD plus a fixed sign
-convention. At 128 latent dims an exact decomposition is instant, so the
-randomization bought nothing in the first place.
-
-numpy-only and torch-free on purpose: eval/latent_traversal_video.py imports
-this and is meant to run on a laptop with no torch installed.
+this module uses numpy only and stays torch-free on purpose:
+eval/latent_traversal_video.py imports this module, and that script must run on
+a laptop with no torch installed.
 """
 
 from __future__ import annotations
@@ -31,11 +23,9 @@ import numpy as np
 def preprocess_embeddings(X: np.ndarray, mode: str) -> np.ndarray:
     """prepare raw encoder embeddings for projection.
 
-    l2 is the default everywhere because raw encoder feature norms vary ~2.3x
-    across crops and would otherwise dominate PCA/UMAP distances. It also makes
-    Euclidean geometry agree exactly with the cosine metric used by
-    eval/knn_behavior.py: for unit vectors ||a-b||^2 = 2 - 2*cos(a,b), so
-    neighbor orderings are identical.
+    l2 is the default everywhere. raw feature norms vary ~2.3x across crops, so
+    raw norms can dominate PCA/UMAP distances. unit vectors also make Euclidean
+    geometry agree exactly with the cosine metric of eval/knn_behavior.py.
     """
     X = np.asarray(X, dtype=np.float64)
     if mode == "raw":
@@ -50,14 +40,14 @@ def preprocess_embeddings(X: np.ndarray, mode: str) -> np.ndarray:
 
 
 def deterministic_sign(components: np.ndarray) -> np.ndarray:
-    """flip each component so its largest-magnitude loading is positive.
+    """flip each component so that its largest-magnitude loading is positive.
 
-    an SVD determines each component only up to sign, and neither numpy nor
-    torch pins it, so the same data can yield a mirrored plot on consecutive
-    runs. keying the sign to the largest-magnitude loading makes orientation a
-    property of the data rather than of the linear-algebra backend.
+    an SVD determines each component only up to a sign, and neither numpy nor
+    torch pins the sign. therefore the same data can give a mirrored plot on two
+    consecutive runs. a sign keyed to the largest-magnitude loading makes the
+    orientation a property of the data, not of the linear-algebra backend.
 
-    components: (d, k), one component per column. returns a copy.
+    components: (d, k), one component per column. this function returns a copy.
     """
     components = np.asarray(components, dtype=np.float64)
     if components.ndim != 2:
@@ -76,19 +66,18 @@ def pca_fit(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """exact PCA basis. returns (components (d, q), mean (d,), explained (q,)).
 
-    split out from pca_project so a projection can be *fit* on one set of points
-    and *applied* to another -- e.g. fitting on every annotated crop but stepping
-    through only the deduplicated ones, which keeps a walk comparable to a static
-    plot of the same annotations.
+    this function is separate from pca_project, so the caller can *fit* a
+    projection on one set of points and *apply* it to another set. for example,
+    the caller can fit on every annotated crop and then step through only the
+    deduplicated crops.
 
-    q is clamped to what the data can support. `explained` is each kept
-    component's share of the *total* variance of the centered data -- the same
-    definition the previous torch implementation printed, so diagnostics stay
-    comparable with older logs.
+    this function clamps q to what the data can support. `explained` gives the
+    share of each kept component in the *total* variance of the centered data,
+    which matches what older logs printed.
 
-    components are nested by construction: fitting q=3 and keeping the first two
-    columns gives exactly the q=2 fit. that is what lets eval/latent_space.py
-    derive its 2D and 3D PCA views from one decomposition.
+    the components are nested by construction. a q=3 fit holds the exact q=2 fit
+    in its first two columns, so eval/latent_space.py derives its 2D PCA view
+    and its 3D PCA view from one decomposition.
     """
     X = np.asarray(X, dtype=np.float64)
     if X.ndim != 2:
@@ -119,6 +108,6 @@ def pca_transform(X: np.ndarray, components: np.ndarray, mean: np.ndarray) -> np
 
 
 def pca_project(X: np.ndarray, n_components: int = 2) -> tuple[np.ndarray, np.ndarray]:
-    """exact PCA fit and applied to the same points. (coords (n, q), explained (q,))."""
+    """fit an exact PCA and apply it to the same points. (coords (n, q), explained (q,))."""
     components, mean, explained = pca_fit(X, n_components)
     return pca_transform(X, components, mean), explained

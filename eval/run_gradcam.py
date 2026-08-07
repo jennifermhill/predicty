@@ -1,13 +1,6 @@
-"""run Grad-CAM on behavior and dataset probes.
+"""the script runs Grad-CAM on the behavior probe and on the dataset probe.
 
-usage:
-    # Behavior Grad-CAM
-    python eval/run_gradcam.py --config configs/train.yaml --checkpoint checkpoints/latest.pt --mode behavior
-
-    # Dataset discrimination Grad-CAM
-    python eval/run_gradcam.py --config configs/train.yaml --checkpoint checkpoints/latest.pt --mode dataset
-
-    # Both
+usage (--mode behavior | dataset | both):
     python eval/run_gradcam.py --config configs/train.yaml --checkpoint checkpoints/latest.pt --mode both
 """
 
@@ -87,7 +80,7 @@ def load_behavior_probe(
     checkpoint_path: str,
     device: torch.device,
 ) -> tuple[nn.Linear, list[str]]:
-    """load behavior classifier from probe checkpoint."""
+    """the function loads the behavior classifier from a probe checkpoint."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
 
     required_keys = ["input_dim", "output_dim", "class_names", "head_state_dict"]
@@ -110,7 +103,7 @@ def load_dataset_probe(
     checkpoint_path: str,
     device: torch.device,
 ) -> tuple[nn.Linear, list[str]]:
-    """load dataset discriminator from probe checkpoint."""
+    """the function loads the dataset discriminator from a probe checkpoint."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
 
     required_keys = ["input_dim", "output_dim", "dataset_names", "head_state_dict"]
@@ -134,10 +127,10 @@ def extract_sample_crops(
     n_samples: int = 10,
 ) -> list[dict[str, Any]]:
     """
-    extract sample crops from an already-constructed dataset.
+    the function extracts sample crops from a dataset that the caller built.
 
     Returns:
-        list of dicts with keys: 'crop', 'metadata'
+        a list of dicts with the keys 'crop' and 'metadata'
     """
     samples = []
     for sample in ds:
@@ -145,7 +138,7 @@ def extract_sample_crops(
             break
         samples.append(
             {
-                "crop": sample["globals"][0],  # (1, Z, H, W) - use t1 global
+                "crop": sample["globals"][0],  # (1, Z, H, W), the t1 global crop
                 "metadata": sample["meta"],
             }
         )
@@ -163,7 +156,7 @@ def run_behavior_gradcam(
     output_dir: Path,
     cam_3d: bool = False,
 ) -> None:
-    """run Grad-CAM for behavior classification."""
+    """the function runs Grad-CAM for behavior classification."""
     print("\n" + "=" * 70)
     print("BEHAVIOR GRAD-CAM")
     print("=" * 70)
@@ -171,8 +164,8 @@ def run_behavior_gradcam(
     output_dir = output_dir / "behavior"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # single-forward analyzer: analytic 2D grad-cam (no backprop) + probs +
-    # depth weights from one pass, plus an optional 3D LayerCAM (one backward).
+    # one forward pass per crop gives every 2D map, the probabilities and the
+    # depth weights.
     analyzer = GradCAMAnalyzer(encoder, behavior_head, device, cam_3d=cam_3d)
 
     samples_df = pd.read_json(cfg.annotation_path, lines=True)
@@ -205,10 +198,6 @@ def run_behavior_gradcam(
         crop = batch["globals"][0]  # (C=1, Z, H, W), no batch dim
         crop = crop.unsqueeze(0).to(device)  # (1, 1, Z, H, W) = (B, C, Z, H, W)
 
-        # one forward yields 2D grad-cams for every behavior, the prediction +
-        # probabilities, depth weights, and (when cam_3d) the 3D map for the
-        # true behavior. plot flags what the model decided alongside where it
-        # looked.
         print(f"\nSample {sample_idx + 1}/{n_samples}")
         result = analyzer.analyze(
             crop,
@@ -219,18 +208,15 @@ def run_behavior_gradcam(
         probs = result["probs"]
         gradcams = result["cams_2d"]
 
-        # Upsample to input resolution
         h_in, w_in = crop.shape[-2:]
         gradcams_upsampled = {
             class_idx: upsample_gradcam(hm, (h_in, w_in))
             for class_idx, hm in gradcams.items()
         }
 
-        # Convert crop to numpy for visualization
         crop_np = crop[0, 0].cpu().numpy()  # (Z, H, W)
         crop_2d = max_project_3d(crop_np)  # (H, W)
 
-        # Visualize
         gradcams_np = {k: v.cpu().numpy() for k, v in gradcams_upsampled.items()}
         visualize_gradcam_multiclass(
             crop_2d,
@@ -247,9 +233,8 @@ def run_behavior_gradcam(
 
         print(f"  Saved: behavior_gradcam_{sample_idx:03d}.png")
 
-        # full-resolution 3D LayerCAM for the true behavior, shown per z-slice,
-        # with the pool's literal depth weighting as a companion bar strip. both
-        # came from the same analyze() call above (no extra forward passes).
+        # 3D LayerCAM per z-slice. a bar strip beside the montage shows the
+        # pool's own depth weights.
         if cam_3d:
             cam3d = result["cam_3d"].numpy()  # (Z, H, W)
             z_w = result["z_weights"].numpy()  # (Z,)
@@ -275,7 +260,7 @@ def run_dataset_gradcam(
     output_dir: Path,
     cam_3d: bool = False,
 ) -> None:
-    """run Grad-CAM for dataset discrimination."""
+    """the function runs Grad-CAM for dataset discrimination."""
     print("\n" + "=" * 70)
     print("DATASET DISCRIMINATION GRAD-CAM")
     print("=" * 70)
@@ -283,13 +268,13 @@ def run_dataset_gradcam(
     output_dir = output_dir / "dataset"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # single-forward analyzer: analytic 2D grad-cam (no backprop) + probs +
-    # depth weights from one pass, plus an optional 3D LayerCAM (one backward).
+    # one forward pass per crop gives every 2D map, the probabilities and the
+    # depth weights.
     analyzer = GradCAMAnalyzer(encoder, dataset_head, device, cam_3d=cam_3d)
 
-    # strip directory + .zarr so panel labels read cleanly. the gradcam dict
-    # keys are dataset indices used to index this list, so it must stay full
-    # length and index-aligned with dataset_names.
+    # the code removes the directory and the .zarr suffix, so that the panel
+    # labels read cleanly. the list must stay full length and index-aligned with
+    # dataset_names, because the gradcam dict keys index into the list.
     dataset_names_clean = [
         name.rsplit("/", 1)[-1].replace(".zarr", "") for name in dataset_names
     ]
@@ -301,8 +286,9 @@ def run_dataset_gradcam(
 
         own_idx = int(sample["metadata"]["dataset_idx"])
 
-        # always show the crop's own dataset, then fill the panel with others.
-        # guarantees the true source dataset appears and avoids duplicate keys.
+        # the crop's own dataset comes first, then the other datasets fill the
+        # list. that order guarantees that the true source appears, and it
+        # prevents duplicate keys.
         shown_idx = [own_idx]
         for idx in range(len(dataset_names)):
             if len(shown_idx) >= n_show:
@@ -310,8 +296,6 @@ def run_dataset_gradcam(
             if idx != own_idx:
                 shown_idx.append(idx)
 
-        # one forward yields the prediction, a 2D grad-cam for every dataset,
-        # depth weights, and (when cam_3d) the 3D map for the crop's own dataset.
         result = analyzer.analyze(
             crop,
             len(dataset_names),
@@ -323,17 +307,16 @@ def run_dataset_gradcam(
             f"\nSample {sample_idx + 1}/{len(samples)} "
             f"(from {dataset_names_clean[own_idx]}, predicted {dataset_names_clean[pred_idx]})"
         )
-        # all classes are computed; keep only the panel's shown datasets.
+        # the analyzer computes all classes. the code keeps only the datasets
+        # that the panel shows.
         gradcams = {idx: result["cams_2d"][idx] for idx in shown_idx}
 
-        # Upsample
         h_in, w_in = crop.shape[-2:]
         gradcams_upsampled = {
             class_idx: upsample_gradcam(hm, (h_in, w_in))
             for class_idx, hm in gradcams.items()
         }
 
-        # Visualize
         crop_np = crop[0, 0].cpu().numpy()  # (Z, H, W)
         crop_2d = max_project_3d(crop_np)  # (H, W)
 
@@ -352,9 +335,8 @@ def run_dataset_gradcam(
 
         print(f"  Saved: dataset_gradcam_{sample_idx:03d}.png")
 
-        # full-resolution 3D LayerCAM for the crop's own dataset, per z-slice,
-        # with the pool's literal depth weighting as a companion bar strip. both
-        # came from the same analyze() call above (no extra forward passes).
+        # 3D LayerCAM per z-slice. a bar strip beside the montage shows the
+        # pool's own depth weights.
         if cam_3d:
             cam3d = result["cam_3d"].numpy()  # (Z, H, W)
             z_w = result["z_weights"].numpy()  # (Z,)
@@ -383,7 +365,6 @@ def main() -> None:
     print(f"[gradcam] mode: {args.mode}")
     print()
 
-    # Load encoder
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     if "encoder_state_dict" not in ckpt:
         print(f"[gradcam] ERROR: checkpoint missing 'encoder_state_dict'. invalid checkpoint format.")
@@ -399,11 +380,12 @@ def main() -> None:
 
     print(f"[gradcam] encoder loaded from step {ckpt.get('step', 'unknown')}")
 
-    # Auto-detect probe checkpoints from the latent_space directory. prefer the
-    # probe from THIS run's own dir (its input_dim matches this encoder); fall back
-    # to the most recently MODIFIED probe. NB: a plain name sort is wrong here --
-    # letter-prefixed run names (e.g. "final_...") sort above digit-prefixed ones,
-    # so `sorted(..., reverse=True)` would grab a stale probe of the wrong latent_dim.
+    # warning: the code must never sort the probe candidates by name.
+    # letter-prefixed run names sort above digit-prefixed ones, so a sort by
+    # name can select a stale probe with the wrong latent_dim. the code sorts by
+    # mtime instead. the code prefers this run's own probe, because its
+    # input_dim matches this encoder. otherwise the code takes the probe with
+    # the most recent mtime.
     run_name = Path(args.checkpoint).parent.name
     latent_dir = Path("latent_space")
 
@@ -412,7 +394,7 @@ def main() -> None:
             return None
         matches = sorted(latent_dir.glob(f"{run_name}*/{kind}.pt"),
                          key=lambda p: p.stat().st_mtime, reverse=True)
-        if not matches:  # no probe for this run yet; fall back to newest anywhere
+        if not matches:  # no probe for this run yet, so take the newest one anywhere
             matches = sorted(latent_dir.glob(f"*/{kind}.pt"),
                              key=lambda p: p.stat().st_mtime, reverse=True)
         return matches[0] if matches else None
@@ -422,7 +404,6 @@ def main() -> None:
     if args.dataset_probe is None:
         args.dataset_probe = _autodetect_probe("dataset_probe")
 
-    # Load probes
     behavior_head = None
     dataset_head = None
     behavior_names = None
@@ -450,8 +431,8 @@ def main() -> None:
             )
             print(f"[gradcam] dataset classes: {len(dataset_names)} datasets")
 
-    # Extract sample crops. set the seed before building the dataset so
-    # sampling is reproducible.
+    # the code sets the seed before it builds the dataset, so that the sample
+    # selection is reproducible.
     cfg.seed = args.seed
     ds = MultiZarrDataset(cfg)
     print(f"[gradcam] extracting {args.n_samples} sample crops...")
@@ -462,9 +443,9 @@ def main() -> None:
         print("[gradcam] WARNING: no samples extracted. check dataset configuration or zarr paths.")
         return
 
-    # Output directory. defaults to a "gradcam" subfolder inside THIS run's own
-    # latent_space folder (next to the probes), so outputs stay grouped per run
-    # and the redundant-run check can find them. an explicit --output-dir wins.
+    # the default output is a "gradcam" subfolder in this run's own latent_space
+    # folder, next to the probes. the redundant-run check can then find the
+    # subfolder.
     if args.output_dir:
         output_dir = Path(args.output_dir)
     else:
@@ -476,7 +457,6 @@ def main() -> None:
         output_dir = base / "gradcam"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Run Grad-CAM
     if args.mode in ["behavior", "both"] and behavior_head is not None:
         run_behavior_gradcam(
             cfg,

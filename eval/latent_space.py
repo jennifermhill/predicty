@@ -1,33 +1,31 @@
 """latent-space visualization for a frozen WS-DINO encoder.
 
-this samples normal training crops, embeds them with a checkpointed encoder,
-then projects the high-dimensional embeddings to 2D for inspection.
+this script samples normal training crops and embeds them with a checkpointed
+encoder. the script then projects the high-dimensional embeddings to 2D for
+inspection.
 
-Usage:
+usage:
     python eval/latent_space.py --config configs/train.yaml --checkpoint checkpoints/latest.pt
     python eval/latent_space.py --config configs/train.yaml --checkpoint checkpoints/latest.pt --n-crops 20000 --method umap
 
-Outputs:
+outputs:
     <out-dir>/embeddings.npz         raw embeddings + 2D/3D coords per method + labels
     <out-dir>/<method>/metadata.csv  crop metadata + that method's coords per point
     <out-dir>/<method>/latent_by_*.png  scatter plots colored by metadata fields
 
-each metadata.csv carries both a 2D and a 3D projection per point:
-coord_x/coord_y from the 2D fit (what eval/interactive_latent_viewer.py reads)
-and coord_x3/coord_y3/coord_z3 from a 3D fit (what
-eval/interactive_latent_viewer_3d.py reads). PCA gets both from one
-decomposition because its components are nested -- the 2D coords are literally
-the first two columns of the 3D fit. UMAP/t-SNE are *not* nested, so a
-n_components=3 fit is a genuinely separate (and separately-priced) run whose x/y
-do not match the 2D fit; pass --no-3d to skip it.
+each metadata.csv carries a 2D projection (coord_x/coord_y, which
+eval/interactive_latent_viewer.py reads) and a 3D projection
+(coord_x3/coord_y3/coord_z3, which eval/interactive_latent_viewer_3d.py reads).
+PCA gives both views from one decomposition, because its components are nested.
+the UMAP and t-SNE components are not nested, so their 3D fit is a separate fit,
+and its x/y do not agree with the 2D fit. --no-3d skips the 3D fit.
 
-PCA always runs so every report has a deterministic, variance-faithful view.
-"deterministic" is now literal: PCA comes from eval/pca_utils.py's exact SVD with
-a fixed sign convention, so re-running this script on the same embeddings
-reproduces the same coordinates and the same plot orientation. Before, it used a
-randomized torch.pca_lowrank with no seed and did neither.
-when umap-learn (or scikit-learn for t-SNE) is installed, that manifold method
-runs too, giving both a umap/ and a pca/ subdirectory side by side.
+PCA always runs, so every report holds a deterministic and variance-faithful
+view. the exact SVD of eval/pca_utils.py has a fixed sign convention, and it
+reproduces the same coordinates and the same plot orientation on the same
+embeddings. when umap-learn is installed, or scikit-learn for t-SNE, that
+manifold method also runs. a run then holds a umap/ subdirectory and a pca/
+subdirectory side by side.
 """
 
 from __future__ import annotations
@@ -39,7 +37,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-# allow running as `python eval/latent_space.py` from project root.
+# the path insert lets you run `python eval/latent_space.py` from the project root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import matplotlib
@@ -60,12 +58,9 @@ from data.dataset import MultiZarrDataset, ZarrCellDataset, worker_init_fn
 from models.encoder import HybridEncoder
 from eval.wasserstein import print_batch_effect_wasserstein
 
-# PCA and embedding preprocessing live in eval/pca_utils.py so that this script,
-# eval/latent_traversal_video.py and eval/refresh_pca_and_video.py provably share
-# one implementation. they used to disagree: this script's PCA was a randomized
-# torch.pca_lowrank against an unseeded global RNG, so its static plots did not
-# reproduce run to run, let alone match anything recomputed later. see that
-# module's docstring.
+# the PCA code and the embedding preprocess code live in eval/pca_utils.py, so
+# this script and eval/latent_traversal_video.py share one implementation. the
+# two disagreed once. see the docstring of that module.
 from eval.pca_utils import pca_project, preprocess_embeddings
 
 
@@ -121,10 +116,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def disable_augmentations(cfg: Config) -> None:
-    """turn off stochastic augmentations for deterministic visual diagnostics."""
+    """turn off the stochastic augmentations to keep the visual diagnostics deterministic."""
     for name in ("aug_intensity", "aug_gamma", "aug_noise", "aug_blur"):
         getattr(cfg, name).enabled = False
-    # Keep per-crop normalization on because it is the encoder input convention.
+    # the per-crop normalization stays on, because it is the input convention of
+    # the encoder.
 
 
 def build_dataset(cfg: Config):
@@ -374,10 +370,11 @@ def load_cached_embeddings(path: Path, cfg: Config) -> tuple[np.ndarray, list[di
     return X, rows
 
 def _effective_dims(X: np.ndarray) -> tuple[float, float]:
-    """effective dimensionality of an embedding cloud from its full variance
-    spectrum: participation ratio (sum l)^2 / sum l^2, and entropy rank exp(H).
-    both are 'soft counts' of how many directions the variance actually spans
-    (e.g. ~2 of 2048 = collapsed; ~16 of 128 = healthy spread).
+    """the effective dimensionality of an embedding cloud, from its full variance
+    spectrum: the participation ratio (sum l)^2 / sum l^2, and the entropy rank
+    exp(H). both values are soft counts of how many directions the variance
+    spans. for example, ~2 of 2048 means collapse, and ~16 of 128 means a
+    healthy spread.
     """
     Xc = (X - X.mean(axis=0, keepdims=True)).astype(np.float64)
     sv = np.linalg.svd(Xc, compute_uv=False)     # singular values of centered data
@@ -445,8 +442,8 @@ def reduce_for_manifold(X: np.ndarray, pca_dim: int) -> np.ndarray:
 
 
 def best_available_manifold() -> str:
-    """pick the manifold method to pair with PCA: umap if available, else
-    t-SNE, else nothing extra (pca only)."""
+    """pick the manifold method that pairs with PCA: umap when available, then
+    t-SNE, and otherwise nothing extra (pca only)."""
     try:
         import umap  # type: ignore  # noqa: F401
 
@@ -461,21 +458,24 @@ def best_available_manifold() -> str:
 
 
 def resolve_methods(method: str) -> list[str]:
-    """which 2D projections to produce. naming a method explicitly produces
-    only that one; the default `auto` pairs the best available manifold method
-    with PCA so a run gets both a manifold view and a deterministic,
-    variance-faithful reference side by side."""
+    """choose the 2D projections to produce.
+
+    a named method produces only that one method. `auto` pairs the best
+    available manifold method with PCA, so a run gets a manifold view and a
+    deterministic reference side by side.
+    """
     if method != "auto":
         return [method]
     manifold = best_available_manifold()
-    # dedupe when no manifold lib is installed and auto falls back to pca.
+    # remove the duplicate when no manifold lib is installed and auto falls back
+    # to pca.
     return ["pca"] if manifold == "pca" else [manifold, "pca"]
 
 
 def project_single(
     args: argparse.Namespace, X: np.ndarray, method: str, n_components: int = 2
 ) -> np.ndarray:
-    """project preprocessed embeddings X to n_components dims with one method."""
+    """project the preprocessed embeddings X to n_components dims with one method."""
     if method == "umap":
         try:
             import umap  # type: ignore
@@ -498,9 +498,9 @@ def project_single(
             raise RuntimeError("t-SNE requested but scikit-learn is not installed") from e
         X_red = reduce_for_manifold(X, args.pca_dim)
         perplexity = min(args.tsne_perplexity, max(5.0, (X.shape[0] - 1) / 3))
-        # barnes_hut (the default) only supports n_components < 4, which covers
-        # both 2D and 3D; be explicit so a future bump fails loudly instead of
-        # silently switching to the O(n^2) exact solver.
+        # barnes_hut, the default, supports n_components < 4 only. raise an
+        # explicit error, so a future bump fails loudly and does not switch to
+        # the O(n^2) exact solver without a message.
         if n_components >= 4:
             raise ValueError("t-SNE here supports at most 3 components")
         reducer = TSNE(
@@ -526,13 +526,12 @@ def project_single(
 def project_2d_and_3d(
     args: argparse.Namespace, X: np.ndarray, method: str
 ) -> tuple[np.ndarray, np.ndarray | None]:
-    """2D coords and (optionally) 3D coords for one projection method.
+    """2D coords and, optionally, 3D coords for one projection method.
 
-    PCA components are nested, so one q=3 decomposition yields both views and
-    the 2D coords are exactly its first two columns -- no second fit, no risk of
-    the two views disagreeing. UMAP and t-SNE optimize a fixed-dimension
-    objective, so their 3D embedding is unrelated to their 2D one (x/y included)
-    and genuinely requires a second fit.
+    the PCA components are nested, so one q=3 decomposition gives both views.
+    UMAP and t-SNE optimize an objective at a fixed dimension. therefore their
+    3D embedding has no relation to their 2D embedding, and it needs a second
+    fit.
     """
     if not args.make_3d:
         return project_single(args, X, method, 2), None
@@ -553,13 +552,11 @@ def write_metadata_csv(
     coords: np.ndarray,
     coords3: np.ndarray | None = None,
 ) -> None:
-    """one row per point with the 2D coords first, then the optional 3D coords.
+    """write one row per point, with the 2D coords first and the optional 3D coords after.
 
-    coord_x/coord_y keep their exact original meaning so
-    eval/interactive_latent_viewer.py is unaffected; the 3D fit lives in
-    separate coord_x3/coord_y3/coord_z3 columns rather than adding a bare
-    coord_z, because for UMAP/t-SNE the 3D fit's x/y differ from the 2D fit's
-    and mixing them would silently plot a hybrid that exists in neither.
+    the 3D fit gets its own coord_x3/coord_y3/coord_z3 columns, and not a bare
+    coord_z. for UMAP and t-SNE the x/y of the 3D fit differ from the x/y of the
+    2D fit. a mix of the two would plot a hybrid that exists in neither fit.
     """
     coord_fields = ["coord_x", "coord_y"]
     if coords3 is not None:
@@ -591,8 +588,8 @@ def save_npz(
     t = np.asarray([r["t"] for r in rows], dtype=np.int64)
     z = np.asarray([r["z"] for r in rows], dtype=np.int64)
     view_idx = np.asarray([r["view_idx"] for r in rows], dtype=np.int64)
-    # "" for points with no annotation (e.g. randomly-sampled crops in
-    # extract_embeddings where row["label"] is None).
+    # a point with no annotation gets "". for example, a random crop from
+    # extract_embeddings has row["label"] None.
     label = np.asarray(["" if r.get("label") is None else str(r["label"]) for r in rows])
     arrays: dict[str, np.ndarray] = {
         "embeddings": X.astype(np.float32),
@@ -602,10 +599,8 @@ def save_npz(
         "view_idx": view_idx,
         "label": label,
     }
-    # one coords_<method> array per projection so downstream tools can load
-    # any view from a single file. coords_<method>_3d holds the 3D fit, which
-    # the 3D viewer checks metadata.csv against the same way the 2D viewer
-    # checks coords_<method>.
+    # one coords_<method> array per projection, and one coords_<method>_3d array
+    # for the 3D fit, so a downstream tool can load any view from a single file.
     for method, coords in coords_by_method.items():
         arrays[f"coords_{method}"] = coords.astype(np.float32)
     for method, coords in (coords3_by_method or {}).items():
@@ -680,9 +675,9 @@ def plot_continuous(
     fig.savefig(out_path)
     plt.close(fig)
 
-# annotations plots have few points (~500) and few classes, so they get
-# bigger dots and a high-contrast qualitative palette (ColorBrewer Set1),
-# unlike the dense ~10k-point metadata scatters which stay small on tab20.
+# an annotation plot has few points and few classes. therefore plot_annotations
+# below uses bigger dots and a high-contrast palette (ColorBrewer Set1). the
+# dense metadata scatters stay small on tab20.
 
 
 
@@ -733,7 +728,8 @@ def plot_annotations(
         print("[annotations] umap-learn not installed; skipping annotations UMAP plot")
         return
     X_red = reduce_for_manifold(X_ann, args.pca_dim)
-    # UMAP needs n_neighbors < n_samples; clamp for the small labeled subset.
+    # UMAP needs n_neighbors < n_samples. clamp n_neighbors for the small
+    # labeled subset.
     n_neighbors = int(min(args.umap_neighbors, max(2, len(ann_idx) - 1)))
     reducer = umap.UMAP(
         n_components=2,
@@ -872,8 +868,9 @@ def main() -> None:
     print(f"[latent] embedding preprocess: {args.embedding_preprocess}")
     print_embedding_diagnostics(X, X_projected)
 
-    # batch-effect check in the full latent space: how far apart the per-dataset
-    # embedding clouds sit. complements the training-time dataset adversary.
+    # a batch-effect check in the full latent space: how far apart the
+    # per-dataset embedding clouds sit. the check complements the dataset
+    # adversary of the training stage.
     print_batch_effect_wasserstein(X_projected, rows, out_dir=out_dir, seed=args.seed)
 
     methods = resolve_methods(args.method)

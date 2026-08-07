@@ -1,21 +1,12 @@
-"""run expected gradients on behavior and dataset probes.
+"""the script runs expected gradients on the behavior probe and the dataset probe.
 
-the input-space companion to run_gradcam.py. expected gradients attributes each
-probe's class logit back to the raw crop voxels, so the maps are at input
-resolution and keep the z axis grad-cam discards. it is the right variant here
-because groupnorm makes the encoder scale invariant, which breaks fixed-baseline
-integrated gradients (see eval/expected_gradients.py). baselines are sampled
-from real crops so every path stays in the normalized data regime.
+the script is the input-space companion to run_gradcam.py. the maps are at input
+resolution, and they keep the z axis that grad-cam discards. see
+eval/expected_gradients.py for the reason to use EG rather than fixed-baseline
+integrated gradients on this encoder.
 
-usage:
-    # behavior EG
-    python eval/run_eg.py --config configs/train.yaml --checkpoint checkpoints/latest.pt --mode behavior
-
-    # dataset discrimination EG
-    python eval/run_eg.py --config configs/train.yaml --checkpoint checkpoints/latest.pt --mode dataset
-
-    # both, with per-z-slice panels for the predicted class
-    python eval/run_eg.py --config configs/train.yaml --checkpoint checkpoints/latest.pt --mode both --z-slices
+usage (--mode behavior | dataset | both; --z-slices adds per-z panels):
+    python eval/run_eg.py --config configs/train.yaml --checkpoint checkpoints/latest.pt --mode both
 """
 
 from __future__ import annotations
@@ -41,8 +32,8 @@ from eval.expected_gradients import (
 )
 from eval.visualize_gradcam import max_project_3d
 
-# reuse the probe loaders and dataset sampling from the grad-cam runner so the
-# two visualizers stay in lockstep on how models and crops are loaded.
+# the grad-cam runner shares these functions, so that both scripts explain crops
+# that they load in the same way.
 from eval.run_gradcam import (
     load_behavior_probe,
     load_dataset_probe,
@@ -108,7 +99,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def _predict(encoder, head, crop, n_classes):
-    """predicted class + probability dict for a crop."""
+    """the predicted class and the probability dict for a crop."""
     with torch.no_grad():
         prob_vec = torch.softmax(head(encoder(crop)), dim=-1)[0]
         pred_class = int(prob_vec.argmax().item())
@@ -119,7 +110,7 @@ def _predict(encoder, head, crop, n_classes):
 def build_baseline_pool(
     ds: MultiZarrDataset, pool_size: int, device: torch.device
 ) -> torch.Tensor:
-    """stack real crops into a baseline distribution, shape (M, 1, Z, H, W)."""
+    """the function stacks real crops into a baseline distribution, shape (M, 1, Z, H, W)."""
     pool_samples = extract_sample_crops(ds, pool_size)
     if not pool_samples:
         raise ValueError("could not sample any crops for the baseline pool")
@@ -146,8 +137,8 @@ def run_behavior_eg(
     output_dir = output_dir / "behavior"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # sample annotated crops per behavior, mirroring run_gradcam so the two
-    # methods explain comparable inputs.
+    # the per-behavior sample selection is the same as in run_gradcam, so that
+    # the two methods explain comparable inputs.
     samples_df = pd.read_json(cfg.annotation_path, lines=True)
     samples_df = samples_df[samples_df["label"].isin(behavior_names)]
     if cfg.zarr_paths is None:
@@ -258,7 +249,8 @@ def run_dataset_eg(
         crop = sample["crop"].unsqueeze(0).to(device)  # (1, 1, Z, H, W)
         own_idx = int(sample["metadata"]["dataset_idx"])
 
-        # always include the crop's own dataset, then fill with others.
+        # the list always starts with the crop's own dataset. the other datasets
+        # then fill the list.
         shown_idx = [own_idx]
         for idx in range(len(dataset_names)):
             if len(shown_idx) >= n_show:
@@ -349,11 +341,9 @@ def main() -> None:
     encoder.eval()
     print(f"[eg] encoder loaded from step {ckpt.get('step', 'unknown')}")
 
-    # auto-detect probe checkpoints, matching run_gradcam's behavior. prefer THIS
-    # run's own dir (its input_dim matches this encoder); fall back to the most
-    # recently MODIFIED probe. a plain name sort is wrong: letter-prefixed run names
-    # (e.g. "final_...") sort above digit-prefixed ones, grabbing a stale probe of
-    # the wrong latent_dim.
+    # warning: the sort must use mtime and never the name. the probe
+    # auto-detection is the same as in run_gradcam.main. see the comment there
+    # for the reason.
     run_name = Path(args.checkpoint).parent.name
     latent_dir = Path("latent_space")
 
@@ -362,7 +352,7 @@ def main() -> None:
             return None
         hits = sorted(latent_dir.glob(f"{run_name}*/{kind}.pt"),
                       key=lambda p: p.stat().st_mtime, reverse=True)
-        if not hits:  # no probe for this run yet; fall back to newest anywhere
+        if not hits:  # no probe for this run yet, so take the newest one anywhere
             hits = sorted(latent_dir.glob(f"*/{kind}.pt"),
                           key=lambda p: p.stat().st_mtime, reverse=True)
         return hits[0] if hits else None
@@ -409,8 +399,7 @@ def main() -> None:
         print("[eg] WARNING: no crops extracted. check dataset configuration.")
         return
 
-    # write inside THIS run's own latent_space folder (next to the probes),
-    # e.g. latent_space/<run>_<ts>/eg -- so outputs stay grouped per run.
+    # the outputs go into this run's own latent_space folder, next to the probes.
     run_dirs = sorted(
         (p for p in latent_dir.glob(f"{run_name}*") if p.is_dir()),
         key=lambda p: p.stat().st_mtime, reverse=True,

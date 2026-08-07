@@ -5,13 +5,11 @@ from __future__ import annotations
 import cv2
 import matplotlib
 
-# force the non-interactive backend before pyplot loads. on headless compute
-# nodes the default tk backend tears its objects down on the wrong thread at
-# exit, which aborts with "main thread is not in main loop". we only save pngs.
+# the matplotlib.use call must precede the pyplot import, because tk aborts at
+# exit on headless nodes.
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
 from pathlib import Path
 from typing import Optional
 
@@ -20,16 +18,8 @@ def apply_colormap(
     heatmap: np.ndarray,
     colormap: int = cv2.COLORMAP_JET,
 ) -> np.ndarray:
-    """
-    apply a colormap to a grayscale heatmap.
-
-    Args:
-        heatmap: Grayscale image [0, 1] or [0, 255]
-        colormap: OpenCV colormap constant
-
-    Returns:
-        RGB image with colormap applied
-    """
+    """the function applies `colormap` to a grayscale heatmap in [0, 1] or
+    [0, 255] and returns RGB."""
     if heatmap.max() <= 1.0:
         heatmap = (heatmap * 255).astype(np.uint8)
     else:
@@ -44,43 +34,29 @@ def overlay_gradcam(
     gradcam: np.ndarray,
     alpha: float = 0.5,
 ) -> np.ndarray:
-    """
-    overlay Grad-CAM heatmap on input image.
+    """the function blends a [0, 1] Grad-CAM over a [0, 1] grayscale or RGB image.
 
-    Args:
-        image: Input image, grayscale [0, 1] or RGB [0, 1]
-        gradcam: Grad-CAM heatmap [0, 1]
-        alpha: Blending weight (0 = image only, 1 = heatmap only)
-
-    Returns:
-        blended RGB image [0, 1]
+    alpha is the weight of the heatmap: 0 gives the image only, 1 gives the
+    heatmap only.
     """
-    # Ensure 3-channel
     if image.ndim == 2:
         image_rgb = np.stack([image] * 3, axis=-1)
     else:
         image_rgb = image
 
-    # Normalize to [0, 255]
     img_255 = (image_rgb * 255).astype(np.uint8)
     hm_255 = (gradcam * 255).astype(np.uint8)
-
-    # Apply colormap to heatmap
     heatmap_colored = apply_colormap(hm_255)
-
-    # Blend
     blended = cv2.addWeighted(img_255, 1 - alpha, heatmap_colored, alpha, 0)
 
     return blended.astype(np.float32) / 255.0
 
 
 def focus_stats(gradcam: np.ndarray, top_frac: float = 0.2) -> dict[str, float]:
-    """summarize where a Grad-CAM heatmap concentrates its attention.
+    """peak location, hot-area fraction and the mass in that area, for a Grad-CAM map.
 
-    Returns the peak location, the area fraction above the top-`top_frac`
-    intensity threshold, and how concentrated the map is (mass inside that
-    region). these numbers make it possible to compare maps quantitatively
-    instead of eyeballing colors.
+    these numbers let you compare maps quantitatively. a comparison of the
+    colors by eye is not necessary.
     """
     hm = gradcam.astype(np.float64)
     total = hm.sum()
@@ -101,7 +77,7 @@ def focus_stats(gradcam: np.ndarray, top_frac: float = 0.2) -> dict[str, float]:
 
 
 def _highlight_axis(ax, color: str = "#1565c0", width: float = 3.0) -> None:
-    """draw a colored border around a subplot to flag the predicted class."""
+    """the function draws a colored border around a subplot, to mark the predicted class."""
     ax.axis("on")
     ax.set_xticks([])
     ax.set_yticks([])
@@ -111,7 +87,8 @@ def _highlight_axis(ax, color: str = "#1565c0", width: float = 3.0) -> None:
 
 
 def _draw_focus_contour(ax, gradcam: np.ndarray, levels=(0.5, 0.75)) -> None:
-    """outline high-activation regions so focus is readable against the cell."""
+    """the function outlines the high-activation regions, so that you can read
+    the focus against the cell."""
     if gradcam.max() - gradcam.min() < 1e-8:
         return
     ax.contour(
@@ -121,78 +98,6 @@ def _draw_focus_contour(ax, gradcam: np.ndarray, levels=(0.5, 0.75)) -> None:
         linewidths=1.2,
         alpha=0.9,
     )
-
-
-def visualize_gradcam_single(
-    image: np.ndarray,
-    gradcam: np.ndarray,
-    title: str = "Grad-CAM",
-    save_path: Optional[str] = None,
-    figsize: tuple[int, int] = (16, 4),
-) -> None:
-    """
-    visualize original, heatmap, overlay, and a focus-contour panel.
-
-    panels: original grayscale; Grad-CAM with an intensity colorbar; blended
-    overlay; and the original with the top activation region outlined so the
-    focus can be read directly against the cell structure. A caption reports
-    peak location, hot-area coverage, and how concentrated the attention is.
-
-    Args:
-        image: Input image, grayscale or RGB [0, 1]
-        gradcam: Grad-CAM heatmap [0, 1]
-        title: Plot title
-        save_path: Path to save figure
-        figsize: Figure size (width, height)
-    """
-    # Ensure 2D image for display
-    if image.ndim == 3:
-        image_2d = image.max(axis=0)
-    else:
-        image_2d = image
-
-    # Generate overlay
-    overlay = overlay_gradcam(image_2d, gradcam, alpha=0.5)
-    stats = focus_stats(gradcam)
-
-    # Plot
-    fig, axes = plt.subplots(1, 4, figsize=figsize)
-    fig.suptitle(title, fontsize=14, fontweight="bold")
-
-    axes[0].imshow(image_2d, cmap="gray")
-    axes[0].set_title("Original")
-    axes[0].axis("off")
-
-    hm_im = axes[1].imshow(gradcam, cmap="jet", vmin=0.0, vmax=1.0)
-    axes[1].set_title("Grad-CAM")
-    axes[1].axis("off")
-    fig.colorbar(hm_im, ax=axes[1], fraction=0.046, pad=0.04, label="activation")
-
-    axes[2].imshow(overlay)
-    axes[2].set_title("Overlay")
-    axes[2].axis("off")
-
-    axes[3].imshow(image_2d, cmap="gray")
-    _draw_focus_contour(axes[3], gradcam)
-    axes[3].scatter(
-        [stats["peak_x"]], [stats["peak_y"]],
-        c="#ff1744", marker="x", s=80, linewidths=2.0,
-    )
-    axes[3].set_title("Focus region")
-    axes[3].axis("off")
-
-    caption = (
-        f"peak=({stats['peak_x']:.0f}, {stats['peak_y']:.0f})   "
-        f"hot-area coverage={stats['coverage'] * 100:.1f}%   "
-        f"concentration={stats['concentration'] * 100:.1f}%"
-    )
-    fig.text(0.5, 0.01, caption, ha="center", fontsize=10, color="#444444")
-
-    if save_path:
-        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-
-    plt.close()
 
 
 def visualize_gradcam_multiclass(
@@ -205,35 +110,25 @@ def visualize_gradcam_multiclass(
     pred_class: Optional[int] = None,
     probs: Optional[dict[int, float]] = None,
 ) -> None:
-    """
-    visualize Grad-CAM for multiple classes in a two-row grid.
+    """two-row per-class grid: the overlay on top, the raw heatmap below.
 
-    the leading column shows the original crop with no overlay for reference.
-    top row overlays each class heatmap on the crop with the top activation
-    region outlined; bottom row shows the raw heatmap on a shared, fixed [0, 1]
-    color scale (one colorbar) so intensities are comparable across classes.
-    per-class titles include hot-area coverage, and the predicted class column
-    is highlighted when `pred_class`/`probs` are provided.
+    the leading column is the original crop. the bottom row shares a fixed
+    [0, 1] scale and one colorbar, so that the intensities are comparable across
+    the classes. the function highlights the column of the predicted class when
+    the caller gives `pred_class`.
 
     Args:
-        image: Input image [0, 1]
-        gradcams: Dict mapping class_idx → Grad-CAM heatmap
-        class_names: List of class names
-        title: Plot title
-        save_path: Path to save figure
-        figsize: Figure size, defaults to (4*(n_classes+1), 8) for the extra
-            original-crop column
-        pred_class: Optional predicted class index to highlight
-        probs: Optional dict mapping class_idx → probability, shown in titles
+        image: input image [0, 1]
+        gradcams: {class_idx: heatmap}
+        pred_class: index of the predicted class. the function highlights that
+            column.
+        probs: {class_idx: probability}. the titles show these values.
     """
     n_classes = len(gradcams)
-    # leading column holds the original crop for reference, so the grid has
-    # one more column than there are classes.
-    n_cols = n_classes + 1
+    n_cols = n_classes + 1  # + 1 for the original-crop column
     if figsize is None:
         figsize = (4 * n_cols, 8)
 
-    # Ensure 2D image
     if image.ndim == 3:
         image_2d = image.max(axis=0)
     else:
@@ -242,8 +137,8 @@ def visualize_gradcam_multiclass(
     fig, axes = plt.subplots(2, n_cols, figsize=figsize, squeeze=False)
     fig.suptitle(title, fontsize=14, fontweight="bold")
 
-    # column 0: original crop, no overlay. bottom cell left blank so the row
-    # stays aligned with the heatmaps to its right.
+    # column 0: the original crop, with no overlay. the bottom cell stays blank,
+    # so that the row aligns with the heatmaps to its right.
     axes[0, 0].imshow(image_2d, cmap="gray")
     axes[0, 0].set_title("Original", fontsize=11, fontweight="bold")
     axes[0, 0].axis("off")
@@ -260,7 +155,7 @@ def visualize_gradcam_multiclass(
         if pred_class is not None and class_idx == pred_class:
             header += "  (pred)"
 
-        # top row: overlay + focus contour
+        # top row: the overlay and the focus contour
         overlay = overlay_gradcam(image_2d, gradcam, alpha=0.5)
         axes[0, col].imshow(overlay)
         _draw_focus_contour(axes[0, col], gradcam)
@@ -270,7 +165,7 @@ def visualize_gradcam_multiclass(
         if pred_class is not None and class_idx == pred_class:
             _highlight_axis(axes[0, col])
 
-        # bottom row: raw heatmap on a shared, fixed scale
+        # bottom row: the raw heatmap on a shared, fixed scale
         hm_im = axes[1, col].imshow(gradcam, cmap="jet", vmin=0.0, vmax=1.0)
         axes[1, col].set_title(
             f"coverage {stats['coverage'] * 100:.0f}%", fontsize=9
@@ -278,8 +173,8 @@ def visualize_gradcam_multiclass(
         axes[1, col].axis("off")
 
     if hm_im is not None:
-        # attach the colorbar to the heatmap columns only, skipping the blank
-        # cell under the original crop.
+        # the code attaches the colorbar to the heatmap columns only. the
+        # colorbar skips the blank cell below the original crop.
         fig.colorbar(
             hm_im, ax=axes[1, 1:].tolist(),
             fraction=0.046, pad=0.02, label="activation",
@@ -292,74 +187,11 @@ def visualize_gradcam_multiclass(
     plt.close()
 
 
-def visualize_gradcam_grid(
-    images: np.ndarray,
-    gradcams: np.ndarray,
-    titles: Optional[list[str]] = None,
-    save_path: Optional[str] = None,
-    figsize: Optional[tuple[int, int]] = None,
-) -> None:
-    """
-    visualize multiple samples with their Grad-CAM overlays in a grid.
-
-    Args:
-        images: Array of images, shape (n_samples, H, W) or (n_samples, H, W, 3)
-        gradcams: Array of heatmaps, shape (n_samples, H, W)
-        titles: Optional list of titles for each sample
-        save_path: Path to save figure
-        figsize: Figure size
-    """
-    n_samples = images.shape[0]
-
-    if figsize is None:
-        figsize = (4 * n_samples, 8)
-
-    fig, axes = plt.subplots(2, n_samples, figsize=figsize)
-    if n_samples == 1:
-        axes = axes.reshape(2, 1)
-
-    for i in range(n_samples):
-        image = images[i]
-        gradcam = gradcams[i]
-
-        # Ensure 2D image
-        if image.ndim == 3:
-            image_2d = image.max(axis=0)
-        else:
-            image_2d = image
-
-        # Top row: original + overlay
-        overlay = overlay_gradcam(image_2d, gradcam, alpha=0.5)
-        axes[0, i].imshow(overlay)
-        axes[0, i].axis("off")
-        if titles:
-            axes[0, i].set_title(titles[i], fontsize=10)
-
-        # Bottom row: heatmap only
-        axes[1, i].imshow(gradcam, cmap="jet")
-        axes[1, i].axis("off")
-
-    if save_path:
-        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-
-    plt.close()
-
-
 def max_project_3d(
     volume: np.ndarray,
     axis: int = 0,
 ) -> np.ndarray:
-    """
-    max project a 3D volume to 2D.
-
-    Args:
-        volume: 3D array (Z, H, W)
-        axis: Axis to project along
-
-    Returns:
-        2D projection (H, W)
-    """
+    """the function max-projects a (Z, H, W) volume along `axis` to (H, W)."""
     return np.max(volume, axis=axis)
 
 
@@ -372,28 +204,24 @@ def visualize_layercam_3d(
     overlay_alpha: float = 0.5,
     z_weights: Optional[np.ndarray] = None,
 ) -> None:
-    """per-z-slice display of a 3D attribution map, so depth is not hidden.
+    """per-z-slice display of a 3D attribution map, so that depth stays visible.
 
-    top row shows each raw depth slice; middle row overlays that slice's LayerCAM
-    on a shared [0, 1] color scale (one colorbar) so slices are comparable. the
-    far-right column summarizes the volume with a max-projection of the crop and
-    of the attribution, and each overlay title reports that slice's mean
-    attribution so you can read which depth slices the map favors.
+    the raw slices are on top. their LayerCAM overlays are below, on one shared
+    [0, 1] scale. a max-projection summary column is at the right.
 
-    if `z_weights` is given, a bottom bar strip shows ZAttentionPool's literal
-    per-slice depth weighting. this is a different signal from the map above:
-    the map's spatial-per-z variation reflects feature relevance, whereas the
-    bars are the depth weights the model actually applied (spatially uniform).
-    uses matplotlib only (no OpenCV dependency).
+    the optional `z_weights` bar strip is a *different* signal from the map. the
+    per-z variation of the map is feature relevance. the bars are the depth
+    weights that ZAttentionPool applied, and those weights are spatially
+    uniform.
 
     Args:
-        crop: raw crop volume, shape (Z, H, W).
-        cam3d: attribution map in [0, 1], shape (Z, H, W).
-        title: plot title.
-        save_path: where to save the figure.
-        max_slices: cap on displayed slices; evenly subsampled if Z exceeds it.
+        crop: raw crop volume (Z, H, W).
+        cam3d: attribution map in [0, 1], (Z, H, W).
+        max_slices: maximum number of slices on display. if Z is larger, the
+            function subsamples the slices evenly.
         overlay_alpha: blend weight of the heatmap over the grayscale slice.
-        z_weights: optional (Z,) ZAttentionPool weights, drawn as a bar strip.
+        z_weights: optional (Z,) ZAttentionPool weights. the function draws them
+            as a bar strip.
     """
     if crop.ndim != 3 or cam3d.ndim != 3:
         raise ValueError(f"expected (Z, H, W) crop and cam; got {crop.shape}, {cam3d.shape}")
@@ -403,7 +231,8 @@ def visualize_layercam_3d(
         raise ValueError(f"z_weights has {len(z_weights)} entries, expected {crop.shape[0]}")
 
     z_total = crop.shape[0]
-    # subsample depth slices if there are too many to show side by side.
+    # the function subsamples the depth slices if there are too many for a
+    # side-by-side display.
     if z_total > max_slices:
         shown = np.linspace(0, z_total - 1, max_slices).round().astype(int)
     else:
@@ -413,7 +242,7 @@ def visualize_layercam_3d(
     slice_importance = cam3d.reshape(z_total, -1).mean(axis=1)
 
     n_cols = len(shown) + 1  # + 1 summary column
-    # two image rows, plus a short bar row when pool weights are supplied.
+    # two image rows, plus a short bar row when the caller supplies the pool weights.
     height_ratios = [1.0, 1.0, 0.5] if z_weights is not None else [1.0, 1.0]
     n_rows = len(height_ratios)
     fig = plt.figure(figsize=(2.2 * n_cols, 2.5 * n_rows))
@@ -435,7 +264,7 @@ def visualize_layercam_3d(
         ax_ov.axis("off")
         overlay_axes.append(ax_ov)
 
-    # summary column: max-projection of the crop and of the attribution.
+    # summary column: the max-projection of the crop and of the attribution.
     ax_sum_raw = fig.add_subplot(gs[0, -1])
     ax_sum_raw.imshow(crop.max(axis=0), cmap="gray")
     ax_sum_raw.set_title("crop max-proj", fontsize=9)
@@ -453,12 +282,13 @@ def visualize_layercam_3d(
             fraction=0.02, pad=0.01, label="attribution",
         )
 
-    # bottom strip: ZAttentionPool's literal per-slice depth weighting.
+    # bottom strip: ZAttentionPool's literal per-slice depth weights.
     if z_weights is not None:
         ax_bar = fig.add_subplot(gs[2, :])
         zs = np.arange(z_total)
         bars = ax_bar.bar(zs, np.asarray(z_weights), color="#9e9e9e")
-        # highlight the slices shown in the montage so the two views line up.
+        # the code highlights the slices that the montage shows, so that the two
+        # views line up.
         for z in shown:
             bars[int(z)].set_color("#1565c0")
         ax_bar.set_xticks(zs)
@@ -476,25 +306,3 @@ def visualize_layercam_3d(
     plt.close()
 
 
-def save_gradcam_heatmap(
-    gradcam: torch.Tensor | np.ndarray,
-    save_path: str,
-    colormap: int = cv2.COLORMAP_JET,
-) -> None:
-    """
-    save Grad-CAM heatmap as an image file.
-
-    Args:
-        gradcam: Heatmap tensor or array [0, 1]
-        save_path: Path to save image
-        colormap: OpenCV colormap
-    """
-    if isinstance(gradcam, torch.Tensor):
-        gradcam = gradcam.cpu().numpy()
-
-    # Apply colormap and save
-    heatmap_colored = apply_colormap(gradcam, colormap)
-    heatmap_bgr = cv2.cvtColor(heatmap_colored, cv2.COLOR_RGB2BGR)
-
-    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(save_path, heatmap_bgr)

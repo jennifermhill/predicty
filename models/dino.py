@@ -7,13 +7,13 @@ projector ("DINO head"):
 wrapper:
   student = encoder + projector (trainable)
   teacher = EMA copy of student (no grad)
-  center  = running mean of teacher logits; subtracted before softmax to
-            prevent any one prototype from dominating (DINO's main anti-collapse
-            mechanism).
+  center  = running mean of teacher logits. the wrapper subtracts the center
+            before the softmax, so no single prototype can dominate. the center
+            is the main anti-collapse mechanism of DINO.
 
-loss: cross-entropy between (centered, sharpened) teacher and (sharpened)
-student over all (teacher_global, student_view) pairs except same-view
-global-global. with 2 globals + n_local locals there are
+loss: cross-entropy between the centered and sharpened teacher and the sharpened
+student. the loss covers all (teacher_global, student_view) pairs except the
+same-view global-global pairs. with 2 globals and n_local locals there are
 2 * (n_global - 1) + 2 * n_local = 2 + 2 * n_local pair terms per sample.
 """
 
@@ -47,10 +47,11 @@ def gradient_reverse(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
 class DINOHead(nn.Module):
     """3-layer MLP -> L2 normalize -> weight-normed prototype layer.
 
-    the prototype layer's magnitude (`parametrizations.weight.original0`) is
-    frozen at 1 — the "norm_last_layer" trick from DINO. removes a degree of
-    freedom that otherwise lets the model cheat on softmax confidence by
-    rescaling.
+    the head freezes the magnitude of the prototype layer
+    (`parametrizations.weight.original0`) at 1. the freeze is the
+    "norm_last_layer" trick of DINO. the freeze removes a degree of freedom.
+    without the freeze the model can cheat on softmax confidence by a rescale of
+    the magnitude.
     """
 
     def __init__(
@@ -69,12 +70,10 @@ class DINOHead(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, bottleneck_dim),
         )
-        # use the parametrizations API (not legacy `nn.utils.weight_norm`):
-        # the legacy version registers `weight` as a non-leaf tensor, which
-        # breaks `copy.deepcopy` and therefore the teacher-from-student init
-        # below. with parametrizations the magnitude lives at
-        # `last_layer.parametrizations.weight.original0` and is a real leaf,
-        # so deepcopy works and the freeze trick is still available.
+        # warning: the legacy `nn.utils.weight_norm` registers `weight` as a
+        # non-leaf tensor. a non-leaf tensor breaks deepcopy, and a broken
+        # deepcopy breaks the teacher-from-student init. use the
+        # parametrizations API instead.
         self.last_layer = nn.utils.parametrizations.weight_norm(
             nn.Linear(bottleneck_dim, out_dim, bias=False)
         )
@@ -89,7 +88,8 @@ class DINOHead(nn.Module):
 
 
 class DatasetClassifier(nn.Module):
-    """small adversarial head for predicting dataset identity from encoder features."""
+    """small adversarial head. the head predicts dataset identity from encoder
+    features."""
 
     def __init__(
         self,
@@ -111,8 +111,9 @@ class DatasetClassifier(nn.Module):
 
 
 class StudentNet(nn.Module):
-    """encoder + projector. stashes the last encoder features (no grad) so the
-    training loop can compute embedding variance without a redundant forward."""
+    """encoder + projector. the net stashes the last encoder features with no
+    grad, so the training loop can compute embedding variance without a
+    redundant forward."""
 
     def __init__(
         self, encoder: nn.Module, projector: nn.Module, masking_head: Optional[nn.Module] = None
@@ -136,11 +137,12 @@ class StudentNet(nn.Module):
 
 
 class DINOWrapper(nn.Module):
-    """owns the trainable student, the EMA teacher, and the centering buffer."""
+    """the wrapper owns the trainable student, the EMA teacher, and the
+    centering buffer."""
 
     def __init__(self, cfg, n_datasets: Optional[int] = None) -> None:
         super().__init__()
-        # local import keeps the encoder module decoupled from the wrapper.
+        # the local import keeps the encoder module decoupled from the wrapper.
         from models.encoder import HybridEncoder
         from models.ibot import MaskedPatchAutoencoder
 
@@ -161,18 +163,16 @@ class DINOWrapper(nn.Module):
         student_mask_head = None
         self.ibot_enabled = getattr(cfg, "ibot_enabled", False)
         if self.ibot_enabled:
-            from models.ibot import make_block_mask, apply_grid_mask
-
             self.ibot_mask_ratio = list(getattr(cfg, "ibot_mask_ratio", [0.1, 0.5]))
             self.ibot_layer = getattr(cfg, "ibot_layer", "layer4")
             self.ibot_block_size = int(getattr(cfg, "ibot_block_size", 2))
             
-            # dummy pass to derive channel count + grid size
+            # a dummy pass derives the channel count and the grid size
             with torch.no_grad():
                 dummy = torch.zeros(1, 1, cfg.z_thickness, cfg.global_crop_size, cfg.global_crop_size)
                 tok = student_enc.forward_tokens(dummy, layer=self.ibot_layer)
             self.ibot_channels = tok.shape[1]
-            self.ibot_grid = tok.shape[-1]  # assumes square grid
+            self.ibot_grid = tok.shape[-1]  # the code assumes a square grid
             self.register_buffer("ibot_center", torch.zeros(cfg.projector_k))
             self.ibot_p = float(getattr(cfg, "ibot_p", 0.5))
             
@@ -197,7 +197,6 @@ class DINOWrapper(nn.Module):
             if cfg.dataset_adversary_enabled and self.n_datasets > 1
             else None
         )
-        #initializes grl scale to starting value
         self.dataset_adversary_grl_scale = cfg.dataset_adversary_grl_start
         self.mae_decoder = (
             MaskedPatchAutoencoder(
@@ -217,14 +216,15 @@ class DINOWrapper(nn.Module):
             else None
         )
 
-        # teacher: frozen deep-copy of the student. EMA-updated each step.
+        # teacher: a frozen deep-copy of the student. the training loop updates
+        # the teacher by EMA at each step.
         self.teacher = copy.deepcopy(self.student)
         self.teacher.eval()
         for p in self.teacher.parameters():
             p.requires_grad = False
 
-        # centering buffer: EMA of pre-softmax teacher logits. registered as a
-        # buffer so it moves with `.to(device)` and is saved in checkpoints.
+        # EMA of pre-softmax teacher logits. the center is a buffer, so it moves
+        # with `.to(device)` and torch saves it in checkpoints.
         self.register_buffer("center", torch.zeros(cfg.projector_k))
         
         self.koleo_enabled = getattr(cfg, "koleo_enabled", False)
@@ -232,11 +232,10 @@ class DINOWrapper(nn.Module):
         
 
     def train(self, mode: bool = True):
-        # teacher is EMA-only. keep it in eval regardless of the wrapper's mode
-        # so any mode-dependent layer uses inference behavior. groupnorm is mode
-        # invariant and the teacher has no dropout, so this is currently
-        # defensive: it guards against a stray `model.train()` (loop top, DDP,
-        # post-validation) corrupting the targets if such a layer is ever added.
+        # the teacher is EMA-only, so train() pins the teacher to eval in every
+        # mode of the wrapper. the pin is defensive today, because groupnorm is
+        # mode-invariant and there is no dropout. if someone adds such a layer,
+        # the pin protects the targets from a stray `model.train()`.
         super().train(mode)
         self.teacher.eval()
         return self
@@ -248,7 +247,8 @@ class DINOWrapper(nn.Module):
         B = globals_.shape[0]
         n_g = globals_.shape[1]
 
-        # student processes globals + locals; teacher only globals.
+        # the student processes globals and locals. the teacher processes
+        # globals only.
         g_flat = globals_.flatten(0, 1)
         g_features = self.student.encode(g_flat)
         s_g = self.student.project(g_features)
@@ -283,7 +283,8 @@ class DINOWrapper(nn.Module):
         if self.mae_decoder is not None:
             mae_out = self.mae_decoder(g_flat, self.student.encoder)
 
-        # iBOT student: masked globals through masking head
+        # iBOT student: the wrapper sends masked globals through the masking
+        # head
         do_ibot = self.ibot_enabled and torch.rand(()) < self.ibot_p
         s_g_ibot = None
         ibot_mask = None
@@ -302,26 +303,23 @@ class DINOWrapper(nn.Module):
             )
             s_g_ibot = project_grid(self.student.masking_head, self.student.encoder.forward_tokens(g_masked, layer=self.ibot_layer))
 
-        # stash the real (globals+locals) embeddings for the collapse monitor.
-        # must come after the ibot masked encode above: student.encode sets
-        # last_features as a side effect, so the masked crop would otherwise be
-        # what the variance monitor reads. setting it here keeps that signal on
-        # unmasked embeddings. (mae calls the encoder directly, not encode, so
-        # it never touches last_features.)
+        # warning: the stash below must come after the ibot masked encode.
+        # student.encode sets last_features as a side effect, so an earlier
+        # stash makes the collapse monitor read the masked crop. the stash keeps
+        # the unmasked embeddings for the collapse monitor.
         self.student.last_features = student_features.detach()
 
         with torch.no_grad():
             t_g_ibot = None
             if do_ibot:
-                # one encoder pass for both teacher targets. previously
-                # teacher.encode(g_flat) and forward_tokens(g_flat) each ran the
-                # full stem + layer1-4 on the *same* unmasked input, so the whole
-                # teacher forward over every global crop was computed twice.
+                # one encoder pass gives both teacher targets. separate encode
+                # and forward_tokens calls ran the whole teacher forward twice.
                 t_g_feat, t_tokens = self.teacher.encoder.forward_with_tokens(
                     g_flat, layer=self.ibot_layer
                 )
-                # encode() sets this as a side effect; keep parity for anything
-                # that reads the teacher's stashed features.
+                # encode() sets last_features as a side effect. the line below
+                # keeps parity for any code that reads the stashed features of
+                # the teacher.
                 self.teacher.last_features = t_g_feat.detach()
                 t_g_ibot = project_grid(self.teacher.masking_head, t_tokens)
             else:
@@ -330,7 +328,8 @@ class DINOWrapper(nn.Module):
         
         koleo = None
         if self.koleo_enabled:
-            # apply per view across distinct samples, not within the t1/t2 pair
+            # the loss applies per view across distinct samples, not inside the
+            # t1/t2 pair
             koleo = 0.5 * (koleo_loss(g_features[0::2]) + koleo_loss(g_features[1::2]))
 
         return {
@@ -354,13 +353,16 @@ class DINOWrapper(nn.Module):
         """teacher = m * teacher + (1 - m) * student, parameter-wise."""
         for p_s, p_t in zip(self.student.parameters(), self.teacher.parameters()):
             p_t.data.mul_(momentum).add_(p_s.data, alpha=1.0 - momentum)
-        # modules can hold non-parameter float buffers that the parameter EMA
-        # above misses. groupnorm keeps none, so this is a no-op today, but stays
-        # correct if a buffered module (e.g. a reintroduced batchnorm with
-        # running_mean/running_var) is added: EMA float buffers with the same
-        # momentum so the teacher's normalization drifts as slowly as its
-        # weights rather than jumping to the student's current stats. integer
-        # buffers (e.g. num_batches_tracked) can't be EMA'd, so copy directly.
+        # modules can hold non-parameter float buffers, and the parameter EMA
+        # above misses them. groupnorm keeps no buffers, so the loop below is a
+        # no-op today. the loop stays correct if someone adds a buffered module,
+        # for example a batchnorm with running_mean/running_var.
+        #
+        # the loop applies an EMA to float buffers with the same momentum. the
+        # normalization of the teacher then drifts as slowly as its weights, and
+        # the normalization does not jump to the current stats of the student.
+        # the loop cannot apply an EMA to integer buffers, for example
+        # num_batches_tracked, so the loop copies them directly.
         for b_s, b_t in zip(self.student.buffers(), self.teacher.buffers()):
             if b_t.dtype.is_floating_point:
                 b_t.data.mul_(momentum).add_(b_s.data, alpha=1.0 - momentum)
@@ -371,7 +373,8 @@ class DINOWrapper(nn.Module):
     def update_center(
         self, teacher_logits: torch.Tensor, momentum: float = 0.9
     ) -> None:
-        """EMA the centering buffer toward this batch's teacher mean."""
+        """move the centering buffer toward the teacher mean of this batch by an
+        EMA."""
         self.center.mul_(momentum).add_(
             teacher_logits.mean(dim=0), alpha=1.0 - momentum
         )
@@ -380,7 +383,8 @@ class DINOWrapper(nn.Module):
     def update_ibot_center(
         self, teacher_masking_logits: torch.Tensor, momentum: float = 0.9
     ) -> None:
-        """EMA the iBOT centering buffer toward this batch's teacher mean."""
+        """move the iBOT centering buffer toward the teacher mean of this batch
+        by an EMA."""
         if self.ibot_enabled:
             self.ibot_center.mul_(momentum).add_(
                 teacher_masking_logits.mean(dim=(0,1)), alpha=1.0 - momentum
@@ -399,11 +403,11 @@ def dino_loss(
     student_temp: float = 0.1,
 ) -> torch.Tensor:
     """cross-entropy between centered+sharp teacher and sharp student logits."""
-    # teacher: center, sharpen, softmax — detach (no grad through teacher).
+    # the loss applies the center, the sharpen temperature, a softmax and a
+    # detach to the teacher logits. no gradient flows through the teacher.
     t = ((teacher_globals - center) / teacher_temp).softmax(dim=-1).detach()
     t = t.view(B, n_g, -1)
 
-    # student: sharpen, log-softmax
     sg = (student_globals / student_temp).log_softmax(dim=-1).view(B, n_g, -1)
     sl = (
         (student_locals / student_temp).log_softmax(dim=-1).view(B, n_l, -1)
@@ -414,7 +418,8 @@ def dino_loss(
     total = student_globals.new_zeros(())
     n_terms = 0
 
-    # global-global: skip same-view pairs (the identity match is trivial).
+    # global-global: the loop skips same-view pairs, because the identity match
+    # is trivial.
     for ti in range(n_g):
         for sj in range(n_g):
             if ti == sj:
@@ -422,7 +427,7 @@ def dino_loss(
             total = total + -(t[:, ti] * sg[:, sj]).sum(dim=-1).mean()
             n_terms += 1
 
-    # local-global: every (teacher global, student local) pair.
+    # local-global: every pair.
     if sl is not None:
         for ti in range(n_g):
             for sj in range(n_l):
@@ -432,7 +437,7 @@ def dino_loss(
     return total / max(n_terms, 1)
 
 def project_grid(head, fmap):
-    """(N, C, gh, gw) -> (N, gh*gw, K): run the head on every cell."""
+    """(N, C, gh, gw) -> (N, gh*gw, K). the function runs the head on every cell."""
     n, c, gh, gw = fmap.shape
     tok = fmap.permute(0, 2, 3, 1).reshape(n, gh * gw, c)
     return head(tok).reshape(n, gh * gw, -1)
@@ -440,7 +445,7 @@ def project_grid(head, fmap):
 def ibot_patch_loss(
     student_tok, teacher_tok, mask, ibot_center, teacher_temp: float = 0.04, student_temp: float = 0.1
 ):
-    """CE on HIDDEN tiles only"""
+    """cross-entropy on masked tiles only."""
     t = ((teacher_tok - ibot_center) / teacher_temp).softmax(dim=-1).detach()
     s = (student_tok / student_temp).log_softmax(dim=-1)
     ce = -(t * s).sum(dim=-1)
@@ -449,9 +454,9 @@ def ibot_patch_loss(
 def koleo_loss(features: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     with torch.autocast(features.device.type, enabled=False):
         x = torch.nn.functional.normalize(features.float(), dim=-1, p=2, eps=eps)
-        sim = x @ x.t()                 # cosine sims (unit sphere)
-        sim.fill_diagonal_(-2.0)        # exclude self (cos ∈ [-1,1])
-        nn_idx = sim.argmax(dim=1)      # nearest neighbor = max cosine
+        sim = x @ x.t()                 # cosine sims on the unit sphere
+        sim.fill_diagonal_(-2.0)        # -2.0 excludes self, because cos is in [-1,1]
+        nn_idx = sim.argmax(dim=1)      # the nearest neighbor has the max cosine
         nn_dist = (x - x[nn_idx]).norm(dim=-1)
         return -(nn_dist + eps).log().mean()
 
@@ -469,8 +474,8 @@ def ibot_patch_accuracy(
 
 
 if __name__ == "__main__":
-    # smoke test with random tensors. no zarr required.
-    # run from project root: python -m models.dino
+    # smoke test on random tensors, no zarr. run from the project root:
+    # python -m models.dino
     from configs.config import Config
 
     cfg = Config()
@@ -486,7 +491,7 @@ if __name__ == "__main__":
 
     B = 2
     batch = {
-        # smaller spatial dims than real config for a quick CPU smoke test.
+        # smaller spatial dims than the real config, so the test runs on cpu.
         "globals": torch.randn(B, 2, 1, 10, 96, 96),
         "locals": torch.randn(B, 6, 1, 5, 48, 48),
         "weak_label": torch.tensor([[0, 5], [2, 5]], dtype=torch.long),
