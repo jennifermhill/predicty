@@ -67,9 +67,10 @@ class InteractiveLatentViewerTest(unittest.TestCase):
         self.assertIsNone(nearest_annotated_index(np.asarray([0, 1]), rows))
 
     def test_select_click_indices_reserves_a_slot_for_nearest_annotated_crop(self) -> None:
-        # A dense cluster of unlabeled points sits right on the click target;
-        # the one labeled point is far away. Pure nearest-4 would never
-        # surface it, so it should be swapped into the last slot instead.
+        # a dense cluster of unlabeled points sits on the click target, and the
+        # one labeled point is far away. a pure nearest-4 would therefore never
+        # surface the labeled point. the function must swap that point into the
+        # last slot instead.
         rows = [
             {
                 "dataset_idx": "0", "view": "t1", "t": "10", "frame_gap": "3",
@@ -123,9 +124,9 @@ class InteractiveLatentViewerTest(unittest.TestCase):
         )
 
     def test_select_click_indices_never_returns_a_hidden_point(self) -> None:
-        # Same near-cluster / far-annotated-point setup as the "reserves a
-        # slot" test above, but the annotated point is hidden by a checkbox;
-        # it must not be selected even though it would otherwise be promoted.
+        # the setup is the same as in the "reserves a slot" test above, but the
+        # annotated point is hidden. the function must not promote that point
+        # into the selection.
         rows = [
             {
                 "dataset_idx": "0", "view": "t1", "t": "10", "frame_gap": "3",
@@ -188,7 +189,7 @@ class InteractiveLatentViewerTest(unittest.TestCase):
             nearest=4, max_crops=12, point_size=5.0,
         )
         try:
-            # both checkboxes on by default: both points visible
+            # both checkboxes are on by default, so both points are visible
             self.assertEqual(viewer.visible_mask.tolist(), [True, True])
 
             viewer._on_visibility_toggle("Unannotated")

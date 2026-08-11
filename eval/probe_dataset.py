@@ -1,34 +1,42 @@
 """linear probe for dataset identity on a frozen WS-DINO encoder.
 
-we freeze the encoder, extract embeddings of t1 global crops over many samples,
-and train a single nn.Linear to predict which zarr (dataset_idx) each crop came
-from. By default, extraction samples only the configured held-out spatial
-regions, which DINO training should exclude, then splits those regions
-spatially into probe train/val. The intent is for this classifier to FAIL: low
-val accuracy means the encoder has learned representations that don't encode
-dataset identity, which is what we want: biology rather than
-microscope/illumination signatures.
+the probe freezes the encoder, extracts embeddings of t1 global crops over many
+samples, and trains a single nn.Linear. the nn.Linear predicts which zarr
+(dataset_idx) each crop came from. by default the extraction samples only the
+configured held-out spatial regions, which DINO training must exclude. the
+extraction then splits those regions spatially into probe train and probe val.
+the intent is that this classifier FAILS. a low val accuracy means the encoder
+learned representations that do not encode dataset identity, which is the wanted
+outcome: biology, not microscope or illumination signatures.
 
 usage:
     python eval/probe_dataset.py --config configs/train.yaml --checkpoint checkpoints/latest.pt
     python eval/probe_dataset.py --config configs/train.yaml --checkpoint checkpoints/step_001500.pt --n-samples 4000
     python eval/probe_dataset.py --config configs/train.yaml --checkpoint checkpoints/latest.pt --split random
 
-interpretation (3 datasets -> chance = 33.3%):
-    val_acc near 33%  : encoder is dataset-invariant. good.
-    val_acc ~40-60%   : moderate dataset leakage; encoder partially memorized identity.
-    val_acc > 80%     : encoder has clearly memorized dataset identity. bad.
+interpretation, relative to chance (= 1 / n_classes, printed at startup):
+    val_acc near chance : encoder is dataset-invariant. good.
+    val_acc ~2x chance  : moderate dataset leakage; encoder partially memorized identity.
+    val_acc > 80%       : encoder clearly memorized dataset identity. bad.
+
+n_classes here counts imaging sessions, not zarrs -- see README "Data".
 """
 
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
-# allow running as `python eval/probe_dataset.py` from project root.
+import numpy as np
+
+# a Field_* path component is a well of one plate, not a separate session.
+_FIELD_DIR = re.compile(r"^Field_[A-Z]\d+$", re.I)
+
+# the path insert lets you run `python eval/probe_dataset.py` from the project root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
@@ -59,6 +67,31 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--probe-weight-decay", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=42, help="seed for sampling + train/val split")
     p.add_argument(
+        "--max-contamination", type=float, default=None,
+        help=(
+            "drop probe crops whose pixels overlap the training regions' "
+            "footprint by more than this fraction (0-1). the spatial holdout "
+            "partitions crop TOP-LEFT positions, not image area, and every crop "
+            "extends global_crop_size-1 px past its top-left -- so a 'held-out' "
+            "crop can still be built largely from pixels training saw. the "
+            "overlap fraction is always reported; pass this to also filter on "
+            "it. note the achievable floor is not 0: with a 3x3 grid, 3 held-out "
+            "regions and a 256px crop the uncontaminated area is three 241px "
+            "corners, which cannot contain a 256px crop at all (floor ~11%). "
+            "compare an unfiltered run against a filtered one to see how much "
+            "of the reported leakage is crop memorisation."
+        ),
+    )
+    p.add_argument(
+        "--no-merge-sessions", action="store_true",
+        help=(
+            "keep every zarr as its own class. by default zarrs from one "
+            "imaging session (a plate's Field_B2 / Field_B3) are merged, since "
+            "they share plate, day and optics and differ only by well and "
+            "therefore strain -- separating them measures biology, not batch"
+        ),
+    )
+    p.add_argument(
         "--split",
         choices=("spatial-holdout", "random"),
         default="spatial-holdout",
@@ -77,8 +110,11 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 def setup_logging(checkpoint_path: str) -> Path:
-    """derive a log directory from the checkpoint's parent folder name and
-    tee all stdout to both the terminal and a log file inside it."""
+    """derive a log directory from the name of the parent folder of the checkpoint.
+
+    this function tees all stdout to the terminal and to a log file in that
+    directory.
+    """
     run_name = Path(checkpoint_path).parent.name
     candidates = [p for p in Path("latent_space").glob(f"{run_name}_*") if p.is_dir()]
 
@@ -104,13 +140,12 @@ def setup_logging(checkpoint_path: str) -> Path:
     return log_path
 
 def disable_augmentations(cfg: Config) -> None:
-    """turn off stochastic augs so embeddings are deterministic given the
-    sampled (t, z, y, x). per-crop norm stays on since that's how the encoder
-    was trained to receive its input.
+    """turn off the stochastic augs, so the embeddings stay deterministic for a
+    given sampled (t, z, y, x). the per-crop norm stays on, because the encoder
+    received its input in that form during training.
     """
     for name in ("aug_intensity", "aug_gamma", "aug_noise", "aug_blur"):
         getattr(cfg, name).enabled = False
-    # aug_percrop_norm stays enabled; it's the input convention the encoder learned.
 
 
 @torch.no_grad()
@@ -121,7 +156,7 @@ def extract_embeddings(
     n_samples: int,
     seed: int,
 ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
-    """run encoder on the t1 global of many samples; return embeddings, labels, metadata."""
+    """run the encoder on the t1 global of many samples. return embeddings, labels and metadata."""
     cfg.seed = seed
     disable_augmentations(cfg)
 
@@ -135,8 +170,9 @@ def extract_embeddings(
         num_workers=cfg.num_workers,
         worker_init_fn=worker_init_fn,
         pin_memory=device.type == "cuda",
-        # spawn (not fork) so workers start fresh. forking after the parent has
-        # initialized cuda + the zarr/blosc threadpool deadlocks on first read.
+        # use spawn and not fork, so each worker starts fresh. a fork after the
+        # parent initialized cuda and the zarr/blosc threadpool deadlocks on the
+        # first read.
         multiprocessing_context="spawn" if cfg.num_workers > 0 else None,
     )
 
@@ -198,6 +234,99 @@ def random_split(
     return X[:n_train], y[:n_train], X[n_train:], y[n_train:]
 
 
+def training_footprint_overlap(
+    rows: list[dict[str, Any]],
+    cfg: Config,
+    holdout_regions: list[int],
+) -> torch.Tensor:
+    """the per-crop fraction of pixels that a training-region crop can also cover.
+
+    the holdout partitions the top-left positions of the crops, and not the
+    image area. therefore a "held-out" crop can still consist mostly of training
+    pixels. see README "How to read the metrics" section 2. this function
+    measures the fraction for each crop, so you can read the probe number
+    against the fraction, and not assume that the crops are clean.
+
+    returns a float tensor in [0, 1], aligned with `rows`.
+    """
+    grid_y, grid_x = cfg.spatial_region_grid_y, cfg.spatial_region_grid_x
+    crop = cfg.global_crop_size
+
+    # warning: the frame sizes vary by up to 4x in area (README "Data"). you
+    # must rebuild the region grid and the footprint for every distinct frame
+    # size. the cache key is (h, w).
+    sats: dict[tuple[int, int], np.ndarray] = {}
+
+    def sat_for(frame_y: int, frame_x: int) -> np.ndarray:
+        key = (frame_y, frame_x)
+        if key not in sats:
+            train = np.zeros((frame_y, frame_x), dtype=bool)
+            for idx in range(grid_y * grid_x):
+                if idx in holdout_regions:
+                    continue
+                y0, y1, x0, x1 = region_bounds_for_top_left(
+                    frame_y, frame_x, crop, grid_y, grid_x, idx
+                )
+                # the bands are top-left ranges. a crop at y1-1 reaches to y1-1+crop.
+                train[y0 : y1 - 1 + crop, x0 : x1 - 1 + crop] = True
+            # a summed-area table, so the overlap of each crop costs 4 lookups.
+            sats[key] = np.pad(train.cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+        return sats[key]
+
+    out = torch.empty(len(rows), dtype=torch.float32)
+    oob = 0
+    for i, row in enumerate(rows):
+        frame_y, frame_x = int(row["frame_y"]), int(row["frame_x"])
+        sat = sat_for(frame_y, frame_x)
+        y, x = int(row["global_y"]), int(row["global_x"])
+        # clamp (y, x), do not trust them: the overrepresent_classes injection
+        # branch in _sample_pair takes (y, x) from index.jsonl without a check,
+        # and dask truncates an out-of-range read silently and raises no error.
+        y = min(max(y, 0), max(0, frame_y - 1))
+        x = min(max(x, 0), max(0, frame_x - 1))
+        if y != int(row["global_y"]) or x != int(row["global_x"]):
+            oob += 1
+        y2, x2 = min(y + crop, frame_y), min(x + crop, frame_x)
+        covered = sat[y2, x2] - sat[y, x2] - sat[y2, x] + sat[y, x]
+        out[i] = covered / max(1, (y2 - y) * (x2 - x))
+    if oob:
+        print(f"[probe] WARNING {oob}/{len(rows)} crops had a top-left outside "
+              "their own zarr's frame and were clamped for this calculation -- "
+              "those crops were read truncated by dask, not as full crops")
+    return out
+
+
+def report_contamination(
+    overlap: torch.Tensor, rows: list[dict[str, Any]] | None = None
+) -> None:
+    q = torch.tensor([0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0])
+    vals = torch.quantile(overlap, q)
+    print("[probe] training-footprint overlap per probe crop "
+          "(fraction of each crop's pixels that training could also see):")
+    print("        " + "  ".join(f"p{int(p*100):<3d}={v*100:5.1f}%"
+                                 for p, v in zip(q.tolist(), vals.tolist())))
+    print(f"        mean={overlap.mean()*100:.1f}%   "
+          f">99% contaminated: {(overlap > 0.99).float().mean()*100:.1f}% of crops")
+    print("        higher overlap inflates this probe (memorised crops are more "
+          "identifiable), so it biases the reported leakage UP, not down.")
+    # contamination depends strongly on the frame size, because the grid is in
+    # absolute pixels and the frames vary by up to 4x in area (README "Data").
+    # a pool across the experiments hides the effect, so report it per frame
+    # size.
+    if rows:
+        by_frame: dict[tuple[int, int], list[float]] = {}
+        for r, v in zip(rows, overlap.tolist()):
+            by_frame.setdefault(
+                (int(r["frame_y"]), int(r["frame_x"])), []
+            ).append(v)
+        print("        by frame size (crop "
+              "is a bigger share of a small frame, so contamination is worse):")
+        for (h, w), vs in sorted(by_frame.items()):
+            a = torch.tensor(vs)
+            print(f"          {h:5d}x{w:<5d} n={len(vs):5d}  "
+                  f"mean={a.mean()*100:5.1f}%  min={a.min()*100:5.1f}%")
+
+
 def spatial_holdout_split(
     X: torch.Tensor,
     y: torch.Tensor,
@@ -250,10 +379,33 @@ def spatial_holdout_split(
     return X_train, y_train, X_val, y_val
 
 
-def print_confusion_matrix(cm: torch.Tensor, zarr_paths: list[str]) -> None:
+def session_key(zarr_path: str) -> str:
+    """collapse the zarrs of a single imaging session into one class.
+
+    the Field_* wells of a plate share the plate, the day and the optics, and
+    they differ only by strain. therefore a separate score for each well
+    measures biology and not batch. see README "Data". this function does NOT
+    merge the day subdirectories, for example mixin65 day1 against day2, because
+    those are truly different sessions.
+    """
+    parts = PurePosixPath(zarr_path.replace("\\", "/")).parts
+    try:
+        i = next(j for j, p in enumerate(parts)
+                 if p.startswith("cryolite_mixin_test"))
+    except StopIteration:
+        return zarr_path
+    return "/".join(p for p in parts[i:-1] if not _FIELD_DIR.match(p))
+
+
+def print_confusion_matrix(cm: torch.Tensor, class_names: list[str]) -> None:
     """print a labeled confusion matrix and per-class accuracy."""
     n = cm.size(0)
-    short_names = [Path(p).name[:30] for p in zarr_paths]
+    # class_names holds zarr paths in the unmerged case and session keys in the
+    # merged case. the constant "cryolite_" prefix goes away, so the experiment
+    # and the date stay inside the 30-char truncation.
+    short_names = [
+        (Path(p).name or p).removeprefix("cryolite_")[:30] for p in class_names
+    ]
 
     print()
     print("  confusion matrix (rows = true dataset, cols = predicted):")
@@ -301,6 +453,25 @@ def main() -> None:
 
     cfg = Config.from_yaml(args.config)
 
+    # set the cap on the config, so the SAMPLER enforces the cap before any
+    # read. the test is purely geometric, so a rejected candidate costs nothing.
+    # a rejection upstream of balance_datasets also keeps the per-experiment
+    # counts even. see README "How to read the metrics" section 2.
+    if args.max_contamination is not None:
+        cfg.max_train_footprint_overlap = args.max_contamination
+        print(f"[probe] max_train_footprint_overlap = {args.max_contamination} "
+              "(enforced during sampling, not after)")
+
+    # this probe forces overrepresent_classes off and gives no flag for it. the
+    # injection branch of overrepresent_classes bypasses the spatial region
+    # filter, so rep_alpha > 0 would feed this leakage probe the most memorised
+    # crops available. see README "How to read the metrics" section 1. the
+    # numbers from before 2026-08-04 come from runs with the option on.
+    if cfg.overrepresent_classes:
+        print("[probe] overrepresent_classes: forced OFF "
+              "(its injection branch bypasses the spatial region filter)")
+        cfg.overrepresent_classes = False
+
     device = torch.device(args.device or cfg.device)
     print(f"[probe] device      : {device}")
     if device.type == "cuda":
@@ -327,7 +498,30 @@ def main() -> None:
         p.requires_grad = False
     encoder.eval()
 
-    n_datasets = len(cfg.zarr_paths) if cfg.zarr_paths else 1
+    # the class space. by default the zarrs of one imaging session collapse to
+    # one class. the code below applies the remap to y directly after the
+    # extraction.
+    class_names = list(cfg.zarr_paths) if cfg.zarr_paths else ["dataset"]
+    session_remap: torch.Tensor | None = None
+    if not args.no_merge_sessions and cfg.zarr_paths:
+        keys = [session_key(p) for p in cfg.zarr_paths]
+        order = sorted(dict.fromkeys(keys), key=keys.index)  # stable, first-seen
+        if len(order) < len(keys):
+            session_remap = torch.tensor(
+                [order.index(k) for k in keys], dtype=torch.long
+            )
+            print(f"[probe] merged {len(keys)} zarrs -> {len(order)} imaging "
+                  "sessions (same plate/day/optics, differing only by well):")
+            for k in order:
+                members = [Path(p).name[:44]
+                           for p, kk in zip(cfg.zarr_paths, keys) if kk == k]
+                if len(members) > 1:
+                    print(f"    {k.split('/')[0]}")
+                    for m in members:
+                        print(f"        + {m}")
+            class_names = order
+
+    n_datasets = len(class_names)
     chance_pct = 100.0 / n_datasets
     print(f"[probe] n_datasets  : {n_datasets}  (chance baseline = {chance_pct:.1f}%)")
     print()
@@ -353,8 +547,42 @@ def main() -> None:
     t0 = time.time()
     X, y, rows = extract_embeddings(cfg, encoder, device, args.n_samples, args.seed)
     print(f"[probe] extracted in {time.time()-t0:.1f}s.  X.shape={tuple(X.shape)}  y.shape={tuple(y.shape)}")
+    if session_remap is not None:
+        # y indexes cfg.zarr_paths. fold y down to the session class space.
+        y = session_remap[y]
     print(f"[probe] dataset_idx counts: {torch.bincount(y, minlength=n_datasets).tolist()}")
     print()
+
+    # --- how much of this "held-out" data did the encoder see? ---
+    if args.split == "spatial-holdout" and rows:
+        # in holdout mode the sampler visits only the held-out regions, so the
+        # regions present in `rows` are the resolved holdout set. read the set
+        # from the data, and do not extract it from the dataset object.
+        counts: dict[int, int] = {}
+        for r in rows:
+            k = int(r["spatial_region_idx"])
+            counts[k] = counts.get(k, 0) + 1
+        holdout_regions = sorted(counts)
+        print(f"[probe] regions present in sample: "
+              f"{ {k: counts[k] for k in holdout_regions} }")
+        n_reg = cfg.spatial_region_grid_y * cfg.spatial_region_grid_x
+        if len(holdout_regions) == n_reg:
+            print("[probe] WARNING all "
+                  f"{n_reg} regions are present, so nothing was held out. "
+                  "expected only the resolved holdout regions -- check that "
+                  "spatial_region_mode reached the sampler as 'holdout'.")
+        # purely diagnostic now. the sampler enforced the cap already, so the
+        # code below reports the realised distribution and filters nothing.
+        overlap = training_footprint_overlap(rows, cfg, holdout_regions)
+        report_contamination(overlap, rows)
+        if args.max_contamination is not None:
+            worst = float(overlap.max())
+            if worst > args.max_contamination + 1e-6:
+                print(f"[probe] WARNING realised overlap reached {worst:.3f}, "
+                      f"above the requested cap {args.max_contamination} -- the "
+                      "sampler-side filter did not apply to every crop (check "
+                      "spatial_region_mode reached the sampler as 'holdout')")
+        print()
 
     # --- train/val split ---
     if args.split == "spatial-holdout":
@@ -381,7 +609,6 @@ def main() -> None:
     # --- train probe ---
     print(f"[probe] training linear head (in_dim={cfg.latent_dim}, out_dim={n_datasets})...")
 
-    # Train and save the head
     head = nn.Linear(cfg.latent_dim, n_datasets).to(device)
     opt = torch.optim.AdamW(head.parameters(), lr=args.probe_lr, weight_decay=args.probe_weight_decay)
     ce = nn.CrossEntropyLoss()
@@ -427,18 +654,18 @@ def main() -> None:
     print(f"  train_acc        : {tr_acc*100:6.2f}%")
     print(f"  val_acc          : {va_acc*100:6.2f}%   (chance = {chance_pct:.1f}%)")
     print(f"  val_acc - chance : {(va_acc - 1.0/n_datasets)*100:+6.2f} percentage points")
-    print_confusion_matrix(cm, cfg.zarr_paths)
+    print_confusion_matrix(cm, class_names)
     print()
     print(f"  interpretation: {interpret(va_acc, n_datasets)}")
     print("=" * 70)
 
-    # Save the trained linear head for Grad-CAM
+    # save the trained linear head for grad-cam
     log_dir = Path(log_path).parent
     checkpoint = {
         "head_state_dict": head.cpu().state_dict(),
         "input_dim": cfg.latent_dim,
         "output_dim": n_datasets,
-        "dataset_names": cfg.zarr_paths,
+        "dataset_names": class_names,
         "val_acc": va_acc,
         "args": vars(args),
     }

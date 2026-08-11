@@ -1,9 +1,13 @@
 """linear probe for behavior identity on a frozen WS-DINO encoder.
 
-we freeze the encoder, extract embeddings of t1 global crops over all annotated samples,
-and train a single nn.Linear to predict which behavior each crop came from.
-the intent is for this classifier to SUCCEED: high val accuracy indicates the encoder
-has learned a representation that separates behaviors, which is the desired outcome.
+the probe freezes the encoder, extracts embeddings of t1 global crops over all
+annotated samples, and trains a single nn.Linear. the nn.Linear predicts which
+behavior each crop came from. the intent is that this classifier SUCCEEDS.
+
+warning: read macro_F1 and balanced_acc on --restrict unseen, and do NOT read
+val_acc. this label set is imbalanced, so a high val_acc can sit below the
+majority baseline. crops that the encoder saw during pre-training also inflate
+the full-set score. see README "How to read the metrics".
 
 usage:
     python eval/probe_behavior.py --config configs/train.yaml --checkpoint checkpoints/z_filtering/latest.pt
@@ -20,7 +24,7 @@ from typing import Any, Iterator
 import statistics
 import pandas as pd
 
-# allow running as `python eval/probe_behavior.py` from project root.
+# the path insert lets you run `python eval/probe_behavior.py` from the project root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
@@ -33,9 +37,13 @@ from configs.config import Config
 from data.dataset import MultiZarrDataset
 from models.encoder import HybridEncoder
 
-def setup_logging(checkpoint_path: str) -> Path:
-    """derive a log directory from the checkpoint's parent folder name and
-    tee all stdout to both the terminal and a log file inside it."""
+def setup_logging(checkpoint_path: str, restrict: str = "all") -> Path:
+    """derive a log directory from the name of the parent folder of the checkpoint.
+
+    this function tees all stdout to the terminal and to a log file in that
+    directory. `restrict` goes into the filename, so the "all" run and the
+    "unseen" run of one checkpoint do not give two log files with the same name.
+    """
     run_name = Path(checkpoint_path).parent.name
     candidates = [p for p in Path("latent_space").glob(f"{run_name}_*") if p.is_dir()]
 
@@ -45,7 +53,8 @@ def setup_logging(checkpoint_path: str) -> Path:
         log_dir = Path("latent_space") / f"{run_name}_{time.strftime('%Y%m%d_%H%M%S')}"
         log_dir.mkdir(parents=True, exist_ok=True)
 
-    log_path = log_dir / f"behavior_probe_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    tag = "" if restrict == "all" else f"_{restrict}"
+    log_path = log_dir / f"behavior_probe{tag}_{time.strftime('%Y%m%d_%H%M%S')}.log"
     log_file = open(log_path, "a")
 
     class Tee:
@@ -85,6 +94,17 @@ def parse_args() -> argparse.Namespace:
         help="z-score features using train-fold statistics before fitting the head",
     )
     p.add_argument(
+        "--restrict", choices=("all", "seen", "unseen"), default="all",
+        help="which experiments to evaluate on, relative to the ones the encoder "
+        "was trained on (the zarr_paths in --config). 'unseen' keeps only "
+        "annotations from experiments absent from SSL training, so the encoder "
+        "provably never saw those pixels -- a stronger guarantee than the spatial "
+        "holdout, which partitions crop top-left positions rather than image area "
+        "and therefore leaves held-out crops overlapping training crops at the "
+        "tile boundaries. 'seen' is the complement. comparing the two says whether "
+        "encoder exposure inflates the headline number.",
+    )
+    p.add_argument(
         "--class-weighted", action=argparse.BooleanOptionalAction, default=True,
         help="weight the probe loss by inverse class frequency so rare classes aren't ignored",
     )
@@ -92,29 +112,27 @@ def parse_args() -> argparse.Namespace:
 
 
 def disable_augmentations(cfg: Config) -> None:
-    """turn off stochastic augs so embeddings are deterministic given the
-    sampled (t, z, y, x). per-crop norm stays on since that's how the encoder
-    was trained to receive its input.
+    """turn off the stochastic augs, so the embeddings stay deterministic for a
+    given sampled (t, z, y, x). the per-crop norm stays on, because the encoder
+    received its input in that form during training.
     """
     for name in ("aug_intensity", "aug_gamma", "aug_noise", "aug_blur", "aug_flip", "aug_rotation"):
         getattr(cfg, name).enabled = False
-    # aug_percrop_norm stays enabled; it's the input convention the encoder learned.
 
 
 def load_dataset(cfg: Config) -> MultiZarrDataset:
-    # only fall back to the annotation file when the caller hasn't already
-    # chosen the path list. overwriting it here used to clobber the *filtered*
-    # list main() builds with the unfiltered one, so the extraction loop below
-    # iterated a different set (and a different order) than the labels came from.
+    # warning: never overwrite a path list that the caller chose already. an
+    # overwrite once replaced the filtered list of main() with the unfiltered
+    # list, so the extraction walked a different set, and a different order,
+    # than the source of the labels.
     if not cfg.zarr_paths:
         df = pd.read_json(cfg.annotation_path, lines=True)
         cfg.zarr_paths = list(df['zarr_path'].unique())
     ds = MultiZarrDataset(cfg)
-    # MultiZarrDataset silently drops any zarr whose spreadsheet z_limit is
-    # blank, so children[i] is cfg.zarr_paths[i] only when nothing was dropped.
-    # extract_embeddings indexes children positionally, so a drop would attach
-    # labels from one experiment to crops read from another. same guard as
-    # eval/latent_space.py.
+    # note: MultiZarrDataset drops without a message any zarr with a blank
+    # spreadsheet z_limit, and extract_embeddings indexes the children by
+    # position. therefore a drop would attach the labels of one experiment to
+    # the crops of another experiment. eval/latent_space.py uses the same guard.
     child_paths = [child.cfg.zarr_path or "" for child in ds.children]
     if child_paths != list(cfg.zarr_paths):
         missing = [p for p in cfg.zarr_paths if p not in child_paths]
@@ -134,7 +152,7 @@ def extract_embeddings(
     seed: int,
     annotations_df: pd.DataFrame
 ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
-    """run encoder on the t1 global of many samples; return embeddings, labels, metadata."""
+    """run the encoder on the t1 global of many samples. return embeddings, labels and metadata."""
     cfg.seed = seed
 
     if not cfg.zarr_paths:
@@ -156,7 +174,9 @@ def extract_embeddings(
         zarr_df = annotations_df[annotations_df['zarr_path'] == cfg.zarr_paths[i]]
         src = ds.children[i]
         for row in zarr_df.itertuples():
-            # globals shape: (B, 2, 1, Z, H, W). index 0 is t1.
+            # _annotation_tensor returns an UNBATCHED (2, 1, Z, H, W) stack.
+            # therefore [0] picks the t1 view, and the unsqueeze below adds the
+            # batch axis.
             batch = src._annotation_tensor(row.t1, row.t2, row.z, row.global_x, row.global_y)
             g_t1 = batch["globals"][0].to(device, non_blocking=True).unsqueeze(0)
             label_idx = torch.tensor([label_to_idx[row.label]])
@@ -167,11 +187,10 @@ def extract_embeddings(
             labels.append(label_idx)
             rows.append({
                 "label_idx": label_idx,
-                # group id in X row order. the caller must build fold groups
-                # from this, NOT from the annotation dataframe's row order:
-                # X is filled zarr-by-zarr here, while index.jsonl interleaves
-                # zarrs (500 rows / 18 zarrs / 37 contiguous blocks), so
-                # df['dataset_idx'][i] does not describe X[i].
+                # the group id, in X row order. build the fold groups from this
+                # field and not from df['dataset_idx']. the code fills X zarr by
+                # zarr, although index.jsonl interleaves the zarrs, so the two
+                # orders differ.
                 "dataset_idx": i,
                 "t": int(meta["t1"]),
                 "z": int(meta["z"]),
@@ -218,7 +237,12 @@ def stratified_group_kfold_split(
     for train_index, test_index in sgkf.split(X, y, groups=dataset_idx):
         X_train, X_test = X[train_index], X[test_index]
         y_train, y_test = y[train_index], y[test_index]
-        yield X_train, y_train, X_test, y_test
+        # WARNING: the yield below is a 5-tuple, and knn_behavior.py unpacks it
+        # too. change both files together. the yield includes the held-out
+        # groups, because without them you cannot attribute a per-class 0.00 on
+        # one fold to an experiment.
+        held_out = sorted({dataset_idx[i] for i in test_index}, key=str)
+        yield X_train, y_train, X_test, y_test, held_out
 
 def train_probe(
     X_train: torch.Tensor,
@@ -236,15 +260,17 @@ def train_probe(
     standardize: bool = True,
     verbose: bool = True,
 ) -> tuple[float, float, torch.Tensor, nn.Linear]:
-    """train a single nn.Linear with AdamW + cross-entropy; return train_acc,
-    val_acc, confusion matrix, and the trained head.
+    """train a single nn.Linear with AdamW and cross-entropy.
 
-    `seed` controls both the head init and the minibatch sampler, so repeated
-    calls at different seeds give an honest estimate of probe-restart variance
-    (previously the init came from the unseeded global RNG and the sampler was
-    hardcoded to 42, so runs were neither reproducible nor averageable).
+    returns train_acc, val_acc, the confusion matrix and the trained head.
+
+    `seed` controls the head init and the minibatch sampler, so repeated calls
+    at different seeds estimate the probe-restart variance. warning: the
+    probe-restart variance is NOT the error bar for a comparison of two training
+    runs, because it holds the encoder fixed. see README "Claims that were made
+    and later retracted".
     """
-    # seed before constructing the head so its init is reproducible.
+    # set the seed before the head exists, so the head init is reproducible.
     torch.manual_seed(seed)
     head = nn.Linear(X_train.size(1), n_classes).to(device)
     opt = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=weight_decay)
@@ -255,20 +281,19 @@ def train_probe(
     y_val = y_val.to(device)
 
     if standardize:
-        # standardize with TRAIN-FOLD statistics only. raw encoder features have
-        # per-dimension scales that differ by orders of magnitude, so a single
-        # fixed lr for a fixed step budget conflates "the embedding doesn't
-        # separate behaviors" with "the head never converged". kNN gets this for
-        # free through cosine similarity; the linear probe did not.
+        # use the train-fold statistics only. the raw feature scales differ by
+        # orders of magnitude across the dimensions. without the z-score, a
+        # fixed lr and a fixed step budget mix up "no signal in the embedding"
+        # with "the head never converged". kNN gets the same effect free from
+        # the cosine similarity.
         mu = X_train.mean(dim=0, keepdim=True)
         sd = X_train.std(dim=0, keepdim=True).clamp(min=1e-6)
         X_train = (X_train - mu) / sd
         X_val = (X_val - mu) / sd
 
     if class_weighted:
-        # weight the loss by inverse class frequency (normalized to mean 1) so the
-        # head can't ignore rare classes -- makes the probe a fair test of whether
-        # the minority-class signal is actually in the embedding.
+        # the inverse class frequency, normalized to mean 1, so the head cannot
+        # ignore a rare class.
         counts = torch.bincount(y_train, minlength=n_classes).float()
         class_w = counts.sum() / (counts.clamp(min=1) * n_classes)
         ce = nn.CrossEntropyLoss(weight=class_w)
@@ -307,8 +332,11 @@ def train_probe(
 
 
 def macro_f1_from_cm(cm: torch.Tensor) -> tuple[float, list[float]]:
-    """macro-averaged F1 from a confusion matrix (rows=true, cols=pred). classes
-    absent from val are skipped so they don't drag the mean to 0."""
+    """macro-averaged F1 from a confusion matrix (rows=true, cols=pred).
+
+    this function skips a class that is absent from val, so that class does not
+    drag the mean to 0.
+    """
     per_class: list[float] = []
     present: list[float] = []
     for c in range(cm.size(0)):
@@ -325,7 +353,7 @@ def macro_f1_from_cm(cm: torch.Tensor) -> tuple[float, list[float]]:
 
 
 def balanced_acc_from_cm(cm: torch.Tensor) -> float:
-    """mean per-class recall over classes present in val (a.k.a. balanced accuracy)."""
+    """the mean per-class recall over the classes present in val, that is, the balanced accuracy."""
     recalls: list[float] = []
     for c in range(cm.size(0)):
         total = int(cm[c, :].sum())
@@ -339,7 +367,7 @@ def print_confusion_matrix(cm: torch.Tensor, classes: list[str]) -> None:
     n = cm.size(0)
 
     print()
-    print("  confusion matrix (rows = true dataset, cols = predicted):")
+    print("  confusion matrix (rows = true class, cols = predicted):")
     header = "    " + " ".join(f" pred{c}" for c in range(n))
     print(header)
     for r in range(n):
@@ -352,27 +380,51 @@ def print_confusion_matrix(cm: torch.Tensor, classes: list[str]) -> None:
         total = int(cm[r].sum())
         correct = int(cm[r, r])
         pct = 100.0 * correct / max(total, 1)
-        print(f"    ds{r} ({classes[r]:30s})  {correct:4d}/{total:4d}  ({pct:.1f}%)")
+        print(f"    {r} ({classes[r]:30s})  {correct:4d}/{total:4d}  ({pct:.1f}%)")
 
 
-def interpret(val_acc: float, n_classes: int) -> str:
-    chance = 1.0 / n_classes
-    margin = val_acc - chance
-    relative = margin / chance
+# two-sided 95% t critical values, keyed by the degrees of freedom. a flat 2.0
+# is the large-sample limit and is wrong at 5 folds. see README "How to read the
+# metrics" section 5.
+_T_CRIT_95 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447,
+              7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228, 20: 2.086, 30: 2.042}
+
+
+def _t_crit_95(df: int) -> float:
+    """two-sided 95% t critical value. the value stays conservative between two table entries."""
+    if df < 1:
+        return float("inf")
+    if df >= 60:
+        return 2.000   # never go below the large-sample limit
+    return _T_CRIT_95[max(k for k in _T_CRIT_95 if k <= df)]
+
+
+def interpret(val_acc: float, majority: float) -> str:
+    # the baseline is the majority class rate, and not uniform chance. see
+    # README "How to read the metrics" section 4.
+    baseline = majority
+    margin = val_acc - baseline
+    if margin <= 0.0:
+        return (
+            f"val accuracy ({val_acc*100:.1f}%) is at or BELOW the baseline "
+            f"({baseline*100:.1f}%) — a constant predictor does as well or better. "
+            f"read macro_F1 / balanced_acc instead."
+        )
+    relative = margin / baseline
     if relative < 0.2:
         return (
-            f"val accuracy ({val_acc*100:.1f}%) is near chance ({chance*100:.1f}%) — "
+            f"val accuracy ({val_acc*100:.1f}%) is near the baseline ({baseline*100:.1f}%) — "
             f"encoder does not appear to separate behaviors. the representation may not "
             f"yet be meaningful, or more training steps may be needed."
         )
     if relative < 0.6:
         return (
-            f"val accuracy ({val_acc*100:.1f}%) is moderately above chance ({chance*100:.1f}%) — "
+            f"val accuracy ({val_acc*100:.1f}%) is moderately above the baseline ({baseline*100:.1f}%) — "
             f"encoder is partially separating behaviors. worth tracking across checkpoints "
             f"to see whether it improves with further training."
         )
     return (
-        f"val accuracy ({val_acc*100:.1f}%) is well above chance ({chance*100:.1f}%) — "
+        f"val accuracy ({val_acc*100:.1f}%) is well above the baseline ({baseline*100:.1f}%) — "
         f"encoder has learned a representation that separates behaviors well. "
         f"this is the desired outcome."
     )
@@ -380,22 +432,61 @@ def interpret(val_acc: float, n_classes: int) -> str:
 
 def main() -> None:
     args = parse_args()
-    log_path = setup_logging(args.checkpoint)
+    log_path = setup_logging(args.checkpoint, args.restrict)
     print(f"[probe] logging to  : {log_path}")
 
     cfg = Config.from_yaml(args.config)
+    # snapshot the SSL training set before the probe overwrites cfg.zarr_paths
+    # with the larger path list of the annotation file. this line is the last
+    # point where the two lists are still separate, and --restrict needs the
+    # difference.
+    ssl_train_paths = set(cfg.zarr_paths or [])
+
     df = pd.read_json(cfg.annotation_path, lines=True)
     df = df[df['label'] != 'empty']
     df = df.drop(columns = ['timestamp'])
     df = df[df['label'] != 'slug']
+    # warning: eval/knn_behavior.py hardcodes the same literal path. change both
+    # files together, or the two evals no longer see identical folds. mixin49 is
+    # a bad acquisition and is not part of the data of this project. no run
+    # trains on mixin49. the line below drops its 31 annotations, so they cannot
+    # leak into the --restrict unseen pool.
     df = df[df["zarr_path"] != "/groups/sgro/sgrolab/jennifer/cryolite/cryolite_mixin_test49_2024-02-08/mixin49_wellB2_24hr_ERH Red FarRed.zarr"]
     for col in df.columns:
         try:
             df[col] = pd.to_numeric(df[col])
         except (ValueError, TypeError):
             pass
+
+    # apply the restrict filter before the code derives cfg.zarr_paths and
+    # dataset_idx. then the extraction loop opens only the retained experiments,
+    # and the fold groups stay aligned.
+    if args.restrict != "all":
+        if not ssl_train_paths:
+            raise ValueError(
+                f"--restrict {args.restrict} needs the encoder's training set, but "
+                f"{args.config} has no zarr_paths. pass a run's frozen "
+                "checkpoints/<run>/config.yaml, not a bare config."
+            )
+        was_seen = df["zarr_path"].isin(ssl_train_paths)
+        n_before = len(df)
+        df = df[was_seen] if args.restrict == "seen" else df[~was_seen]
+        if df.empty:
+            raise ValueError(
+                f"--restrict {args.restrict} left no annotations "
+                f"(of {n_before}); check that --config matches this encoder."
+            )
+        print(
+            f"[probe] restrict    : {args.restrict}  "
+            f"({len(df)}/{n_before} annotations, "
+            f"{df['zarr_path'].nunique()} experiments)"
+        )
+        print(f"[probe] label counts: {df['label'].value_counts().to_dict()}")
+        if args.restrict == "unseen":
+            print("[probe] these experiments were absent from SSL training, so the "
+                  "encoder has never seen these pixels in any form.")
+
     cfg.zarr_paths = list(df['zarr_path'].unique())
-    # Create dataset_idx mapping for stratified k-fold splitting
     zarr_path_to_idx = {p: i for i, p in enumerate(cfg.zarr_paths)}
     df['dataset_idx'] = df['zarr_path'].map(zarr_path_to_idx)
 
@@ -444,27 +535,39 @@ def main() -> None:
 
     fold_train_accs, fold_val_accs, fold_cms = [], [], []
     fold_macro_f1s, fold_bal_accs = [], []
-    fold_heads = []  # Store trained heads for later
-    # every (fold, probe restart) pair, for the run-level variance report.
-    all_val_accs, all_macro_f1s = [], []
+    fold_heads = []  # store the trained heads for later
+    # the per-fold spread across the probe restarts. the spread measures the
+    # noise of the head fit on a fixed encoder. the spread is not the encoder
+    # run-to-run variance. see README "Claims that were made and later
+    # retracted".
+    fold_restart_sds = []
 
-    # groups must come from `rows`, which is in X order. df['dataset_idx'] is in
-    # annotation-file row order, which interleaves zarrs, so using it made
-    # StratifiedGroupKFold group on the wrong rows and the "leave-experiment-out"
-    # split degenerated into a near-random one.
+    # warning: the groups must come from `rows`, which is in X order, and not
+    # from df['dataset_idx'], which is in annotation-file order. df once made
+    # StratifiedGroupKFold group the wrong rows, and the leave-experiment-out
+    # split became near-random.
     groups = [r["dataset_idx"] for r in rows]
 
     probe_seeds = [args.seed + s for s in range(max(1, args.probe_seeds))]
     print(f"[probe] probe restarts per fold: {len(probe_seeds)}  (seeds {probe_seeds})")
     print()
 
-    for fold_idx, (X_train, y_train, X_val, y_val) in enumerate(stratified_group_kfold_split(X, y, groups, args.seed, args.n_splits)):
+    class_names_sorted = sorted(df['label'].unique())
+    for fold_idx, (X_train, y_train, X_val, y_val, held_out) in enumerate(stratified_group_kfold_split(X, y, groups, args.seed, args.n_splits)):
+        val_counts = torch.bincount(y_val, minlength=n_classes).tolist()
         print(f"[probe] fold {fold_idx+1}/{args.n_splits}  (grouped by zarr volume, stratified by label)")
         print(f"[probe] train n={X_train.size(0)}  counts={torch.bincount(y_train, minlength=n_classes).tolist()}")
-        print(f"[probe] val   n={X_val.size(0)}  counts={torch.bincount(y_val,   minlength=n_classes).tolist()}")
+        print(f"[probe] val   n={X_val.size(0)}  counts={val_counts}  held out={held_out}")
+        # you cannot interpret a per-class F1 at val n<=2. see README "How to
+        # read the metrics" section 5.
+        thin = [f"{class_names_sorted[c]} n={val_counts[c]}"
+                for c in range(n_classes) if val_counts[c] <= 2]
+        if thin:
+            print(f"[probe]   WARNING thin val support: {', '.join(thin)} "
+                  f"-- per-class F1 not interpretable on this fold")
         print()
 
-        # --- train probe (once per restart seed; metrics averaged) ---
+        # --- train the probe once for each restart seed, then take the mean of the metrics ---
         print(f"[probe] training linear head (in_dim={cfg.latent_dim}, out_dim={n_classes})...")
         seed_tr, seed_va, seed_macro, seed_bal = [], [], [], []
         cm = torch.zeros(n_classes, n_classes, dtype=torch.long)
@@ -489,8 +592,6 @@ def main() -> None:
             seed_va.append(va_s)
             seed_macro.append(macro_s)
             seed_bal.append(bal_s)
-            all_val_accs.append(va_s)
-            all_macro_f1s.append(macro_s)
             cm = cm + cm_s
             if s_i == 0:
                 head = head_s
@@ -513,6 +614,7 @@ def main() -> None:
         fold_heads.append((head.cpu(), va_acc))
         fold_macro_f1s.append(macro)
         fold_bal_accs.append(bal)
+        fold_restart_sds.append(macro_sd)
 
         # --- fold-specific report ---
         print()
@@ -524,10 +626,12 @@ def main() -> None:
         print(f"  val_acc          : {va_acc*100:6.2f}%  ± {va_sd*100:.2f}   (chance = {chance_pct:.1f}%)")
         print(f"  balanced_acc     : {bal*100:6.2f}%   (mean per-class recall)")
         print(f"  macro_F1         : {macro:6.3f}  ± {macro_sd:.3f}")
+        fold_majority = max(val_counts) / max(sum(val_counts), 1)
         print(f"  val_acc - chance : {(va_acc - 1.0/n_classes)*100:+6.2f} percentage points")
+        print(f"  val_acc - majority ({fold_majority*100:.1f}%) : {(va_acc - fold_majority)*100:+6.2f} percentage points")
         print_confusion_matrix(cm, sorted(df['label'].unique()))
         print()
-        print(f"  interpretation: {interpret(va_acc, n_classes)}")
+        print(f"  interpretation: {interpret(va_acc, fold_majority)}")
         print("=" * 70)
         print()
     
@@ -552,34 +656,113 @@ def main() -> None:
     print(f"  val_acc      : {val_mean*100:6.2f}%  ± {val_std*100:.2f}  (per-fold: {[f'{a*100:.1f}' for a in fold_val_accs]})")
     print(f"  balanced_acc : {bal_mean*100:6.2f}%  ± {bal_std*100:.2f}  (mean per-class recall)")
     print(f"  macro_F1     : {macro_mean:6.3f}  ± {macro_std:.3f}  (per-fold: {[f'{m:.3f}' for m in fold_macro_f1s]})")
-    # two baselines, because uniform chance is the wrong one for an imbalanced
-    # set: always predicting the largest class already gets majority_pct.
+    # the probe prints both baselines. read the majority baseline. see README
+    # "How to read the metrics" section 4.
     label_counts = df['label'].value_counts()
     majority_pct = 100.0 * label_counts.max() / label_counts.sum()
     print(f"  val_acc - uniform chance ({chance_pct:.1f}%)   : {(val_mean - 1.0/n_classes)*100:+6.2f} percentage points")
     print(f"  val_acc - majority class ({majority_pct:.1f}%) : {(val_mean*100 - majority_pct):+6.2f} percentage points")
     print(f"    (majority baseline = always predict '{label_counts.idxmax()}'; macro_F1 and")
     print(f"     balanced_acc are the metrics to compare across runs, not val_acc)")
-    if len(all_val_accs) > 1:
-        # spread over every (fold, restart) pair: the floor below which a
-        # run-to-run difference is not distinguishable from probe noise.
-        va_all_sd = statistics.stdev(all_val_accs)
-        mf1_all_sd = statistics.stdev(all_macro_f1s)
+    if any(sd > 0 for sd in fold_restart_sds):
+        # warning: an old version of this block told the reader that a gap
+        # bigger than 2x the restart spread meant that one run was better. that
+        # rule is WRONG, and somebody retracted the conclusions from it. the
+        # restart spread is the noise of a new head fit on a FIXED encoder, so
+        # it says nothing about the difference between two training runs of the
+        # same config. nobody measured the encoder run-to-run variance on this
+        # project. see README "Claims that were made and later retracted".
+        restart_sd = statistics.mean(fold_restart_sds)
         print()
-        print(f"  probe/fold noise ({len(all_val_accs)} fits): val_acc sd={va_all_sd*100:.2f}pp  macro_F1 sd={mf1_all_sd:.3f}")
-        print(f"  -> treat differences below ~{2*va_all_sd*100:.1f}pp val_acc / {2*mf1_all_sd:.3f} macro_F1 as noise")
+        print("  " + "-" * 66)
+        print("  COMPARING THIS RUN TO ANOTHER ONE")
+        print("  " + "-" * 66)
+        print(f"  use macro_F1 ({macro_mean:.3f}) on --restrict unseen, and keep --seed {args.seed}")
+        print("  the same in both runs.")
+        print()
+        print(f"    probe-restart spread on THIS fixed encoder : +- {restart_sd:.3f}")
+        print(f"    fold spread (which experiments are held out): +- {macro_std:.3f}")
+        print()
+        print("  neither is the error bar for a run-vs-run comparison. the restart figure")
+        print("  holds the encoder fixed, and encoder run-to-run variance has never been")
+        print("  measured here -- so a gap between two runs of a few hundredths is NOT")
+        print("  resolvable. train one config twice before trusting any such ranking.")
+        print("  " + "-" * 66)
     print()
     print(f"  pooled confusion matrix (summed across all folds x {len(probe_seeds)} restart(s)):")
     print_confusion_matrix(cm_total, sorted(df['label'].unique()))
     print()
+    # WARNING: the val n column below sums over the restart seeds, so it shows
+    # 3x the true support on a 3-restart run. the README notes this known bug.
+    # the probe reports the per-class F1 with its fold-level spread, because the
+    # pooled figure alone cannot rank the classes at this support. see README
+    # "How to read the metrics" section 6.
+    class_names = sorted(df['label'].unique())
+    per_fold_class_f1: list[list[float]] = [[] for _ in class_names]
+    per_class_support: list[int] = [0] * len(class_names)
+    for fold_cm in fold_cms:
+        _, fold_pc = macro_f1_from_cm(fold_cm)
+        for c in range(len(class_names)):
+            support = int(fold_cm[c, :].sum())
+            per_class_support[c] += support
+            # a class that is absent from the val of this fold has no estimate.
+            # a mean that includes its placeholder 0.0 would invent a low score.
+            if support > 0:
+                per_fold_class_f1[c].append(fold_pc[c])
+
     print(f"  pooled macro-F1: {pooled_macro:.3f}   per-class F1:")
-    for name, f1 in zip(sorted(df['label'].unique()), per_class_f1):
-        print(f"    {name:30s}  F1={f1:.3f}")
+    print(f"    {'class':30s} {'pooled':>7s} {'mean':>7s} {'sd':>7s} {'val n':>7s}   per-fold")
+    for c, (name, f1) in enumerate(zip(class_names, per_class_f1)):
+        vals = per_fold_class_f1[c]
+        mean_f1 = statistics.mean(vals) if vals else float("nan")
+        sd_f1 = statistics.stdev(vals) if len(vals) > 1 else 0.0
+        per_fold = "[" + ", ".join(f"{v:.2f}" for v in vals) + "]"
+        print(f"    {name:30s} {f1:7.3f} {mean_f1:7.3f} {sd_f1:7.3f} "
+              f"{per_class_support[c]:7d}   {per_fold}")
+    # flag a ranking that the data cannot support.
+    ranked = sorted(
+        (c for c in range(len(class_names)) if per_fold_class_f1[c]),
+        key=lambda c: statistics.mean(per_fold_class_f1[c]),
+    )
+    if len(ranked) > 1:
+        lo, hi = ranked[0], ranked[-1]
+        gap = (statistics.mean(per_fold_class_f1[hi])
+               - statistics.mean(per_fold_class_f1[lo]))
+
+        def _se(vals: list[float]) -> float:
+            if len(vals) < 2:
+                return 0.0
+            return statistics.stdev(vals) / (len(vals) ** 0.5)
+
+        # use the se of the DIFFERENCE between the two compared classes, and not
+        # a mean sd across all classes. use a t critical value, and not a flat
+        # 2x. see README "How to read the metrics" section 5.
+        se_diff = (_se(per_fold_class_f1[lo]) ** 2
+                   + _se(per_fold_class_f1[hi]) ** 2) ** 0.5
+        # WARNING: this variable is dof, and not df. `df` is the annotations
+        # DataFrame in this scope, and a shadow of `df` breaks the checkpoint
+        # save below.
+        dof = min(len(per_fold_class_f1[lo]), len(per_fold_class_f1[hi])) - 1
+        t_crit = _t_crit_95(dof)
+        print()
+        print(f"    worst-to-best per-class gap: {gap:.3f} "
+              f"({class_names[lo]} -> {class_names[hi]}), "
+              f"se of the difference {se_diff:.3f}, "
+              f"t(df={dof})={t_crit:.2f}")
+        if se_diff <= 0 or gap < t_crit * se_diff:
+            print(f"    -> within {t_crit:.2f} se: the per-class RANKING is not "
+                  "resolvable at this sample size. do not tune against it, and "
+                  "do not read a story into which class is worst.")
+        else:
+            print(f"    -> exceeds {t_crit:.2f} se, so the ordering of these two "
+                  "is real. adjacent classes may still be indistinguishable.")
+        print("    (folds are grouped by experiment, so these are correlated and "
+              "the se is optimistic; treat it as a floor on the uncertainty.)")
     print()
-    print(f"  interpretation: {interpret(val_mean, n_classes)}")
+    print(f"  interpretation: {interpret(val_mean, majority_pct / 100.0)}")
     print("#" * 70)
 
-    # Save best fold's linear head for Grad-CAM
+    # save the linear head of the best fold for grad-cam
     best_fold_idx = fold_val_accs.index(max(fold_val_accs))
     best_head, best_va_acc = fold_heads[best_fold_idx]
 
@@ -588,13 +771,17 @@ def main() -> None:
         "head_state_dict": best_head.state_dict(),
         "input_dim": cfg.latent_dim,
         "output_dim": n_classes,
-        "class_names": sorted(set(df['label']) if isinstance(df['label'], list) else df['label'].unique()),
+        # the same order that the confusion matrices and the per-class tables use.
+        "class_names": class_names_sorted,
         "val_acc": best_va_acc,
         "fold_idx": best_fold_idx,
         "args": vars(args),
     }
 
-    ckpt_path = log_dir / "behavior_probe.pt"
+    # warning: only the full-set run can own the name "behavior_probe.pt",
+    # because run_gradcam.py and run_eg.py load that name. a --restrict run
+    # writes a file with a suffix.
+    ckpt_path = log_dir / f"behavior_probe{'' if args.restrict == 'all' else '_' + args.restrict}.pt"
     torch.save(checkpoint, ckpt_path)
     print()
     print(f"[probe] saved best fold (fold {best_fold_idx+1}) linear head to {ckpt_path}")

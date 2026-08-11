@@ -1,4 +1,4 @@
-"""model components for the WS-DINO encoder + training scaffolding."""
+"""model components for the WS-DINO encoder and the training code."""
 
 from models.dino import DINOHead, DINOWrapper, StudentNet, dino_loss
 from models.encoder import HybridEncoder

@@ -1,9 +1,10 @@
-"""visualize the masked patches used by the MAE auxiliary loss.
+"""the script visualizes the masked patches that the MAE auxiliary loss uses.
 
-this samples one global crop from the configured dataset, applies the same
-MaskedPatchAutoencoder patch mask used during training, and saves diagnostic
-PNGs showing the original crop, masked crop, and mask layout.
-if --checkpoint is provided, it also visualizes the trained MAE reconstruction.
+the script samples one global crop from the configured dataset. the script
+applies the same MaskedPatchAutoencoder patch mask as the training. the script
+then saves diagnostic PNGs with the original crop, the masked crop and the mask
+layout. if you give --checkpoint, the script also visualizes the trained MAE
+reconstruction.
 
 Usage:
     python eval/visualize_mae_mask.py --config configs/train.yaml
@@ -33,7 +34,7 @@ import torch
 from configs.config import Config
 from data.dataset import MultiZarrDataset, ZarrCellDataset
 from models.encoder import HybridEncoder
-from models.mae import MaskedPatchAutoencoder
+from models.ibot import MaskedPatchAutoencoder
 
 
 MetricValue = float | int | str | None
@@ -81,7 +82,8 @@ def mean_projection(x: np.ndarray) -> np.ndarray:
 
 
 def disable_stochastic_augmentations(cfg: Config) -> None:
-    """keep encoder normalization but make the sampled evaluation crop stable."""
+    """the function keeps the encoder normalization, but it makes the sampled
+    evaluation crop stable."""
     for name in ("aug_intensity", "aug_gamma", "aug_noise", "aug_blur"):
         getattr(cfg, name).enabled = False
     if cfg.aug_percrop_norm.enabled:
@@ -132,7 +134,8 @@ def reconstruction_metrics(
     mask_volume: np.ndarray,
     objective_mse: float,
 ) -> dict[str, MetricValue]:
-    """evaluate only hidden voxels; visible voxels are copied and must be excluded."""
+    """the metrics must exclude the visible voxels, because the code copies
+    them. the function therefore evaluates only the hidden voxels."""
     hidden = mask_volume.astype(bool)
     if original.shape != reconstruction.shape or original.shape != hidden.shape:
         raise ValueError("original, reconstruction, and mask_volume must have equal shapes")

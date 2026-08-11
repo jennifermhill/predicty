@@ -144,6 +144,7 @@ dependencies:
       - pygments==2.20.0
       - pynndescent==0.6.0
       - pyparsing==3.3.2
+      - pytest==8.4.2
       - python-dateutil==2.9.0.post0
       - python-json-logger==4.1.0
       - pytz==2026.2
@@ -187,4 +188,6 @@ dependencies:
       - werkzeug==3.1.8
       - zarr==2.18.3
       - zipp==4.1.0
-prefix: /groups/sgro/home/raoa2/miniconda3/envs/predicty
+# no `prefix:` line on purpose. `conda env export` writes the absolute path of
+# the machine it ran on; conda ignores it on create but it misleads readers into
+# thinking the env must live there. it can go anywhere.

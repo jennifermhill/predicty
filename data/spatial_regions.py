@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import itertools
+import math
+
 
 def region_row_col(region_idx: int, grid_x: int) -> tuple[int, int]:
     return region_idx // grid_x, region_idx % grid_x
@@ -13,7 +16,7 @@ def region_bounds_for_top_left(
     grid_x: int,
     region_idx: int,
 ) -> tuple[int, int, int, int]:
-    """return [y0, y1), [x0, x1) bounds for legal crop top-left positions."""
+    """return the [y0, y1) and [x0, x1) bounds for the legal top-left positions of a crop."""
     if grid_y < 1 or grid_x < 1:
         raise ValueError(f"spatial region grid must be positive; got {grid_y}x{grid_x}")
     n_regions = grid_y * grid_x
@@ -51,7 +54,7 @@ def region_index_for_top_left(
     grid_y: int,
     grid_x: int,
 ) -> int:
-    """map a legal crop top-left position to its row-major spatial region."""
+    """map a legal top-left position of a crop to its row-major spatial region."""
     legal_y = frame_y - crop_size + 1
     legal_x = frame_x - crop_size + 1
     if not 0 <= y < legal_y or not 0 <= x < legal_x:
@@ -78,7 +81,7 @@ def regions_are_adjacent(
     grid_x: int,
     min_gap: int,
 ) -> bool:
-    """return whether two regions are closer than the requested tile gap."""
+    """return True when two regions are closer than the requested tile gap."""
     ar, ac = region_row_col(a, grid_x)
     br, bc = region_row_col(b, grid_x)
     return max(abs(ar - br), abs(ac - bc)) <= min_gap
@@ -91,7 +94,7 @@ def select_nonadjacent_regions(
     min_gap: int,
     min_score: float | None = None,
 ) -> list[int]:
-    """greedily select high-scoring regions that do not touch each other."""
+    """greedily select the regions with high scores that do not touch each other."""
     if count < 1:
         raise ValueError(f"count must be >= 1; got {count}")
     eligible = [
@@ -108,8 +111,8 @@ def select_nonadjacent_regions(
             if len(selected) == count:
                 return selected
 
-    # If the score threshold was too strict, keep the non-adjacent constraint
-    # and fill from the best remaining regions so the caller can still proceed.
+    # if the score threshold was too strict, keep the non-adjacent constraint.
+    # then fill from the best regions that are left, so the caller can continue.
     if min_score is not None and len(selected) < count:
         fallback = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
         for idx, _score in fallback:
@@ -120,8 +123,41 @@ def select_nonadjacent_regions(
                 if len(selected) == count:
                     return selected
 
+    # the greedy loop commits to its first pick and never reconsiders that pick.
+    # therefore the loop can strand itself even when a feasible set exists. for
+    # example, on a 3x3 grid at min_gap=1 the centre tile is adjacent to all
+    # eight other tiles. if the loop picks the centre tile first, the loop keeps
+    # one region only. there, only corner subsets such as {0,2,6,8} are feasible.
+    #
+    # therefore the code falls back to an exhaustive search, which is exact and
+    # cheap at these sizes. the greedy loop still runs first, and the code does
+    # not change it. thus a config that the greedy loop already satisfies selects
+    # the same regions as before.
+    if len(selected) < count:
+        ranked = [idx for idx, _ in sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))]
+        if math.comb(len(ranked), count) <= 200_000:
+            best_combo: tuple[int, ...] | None = None
+            best_key: tuple[float, float] | None = None
+            for combo in itertools.combinations(ranked, count):
+                if any(
+                    regions_are_adjacent(a, b, grid_x, min_gap)
+                    for a, b in itertools.combinations(combo, 2)
+                ):
+                    continue
+                # maximise the score of the weakest region first, then the total.
+                # the greedy loop also prefers the regions with high content.
+                key = (min(scores[i] for i in combo), sum(scores[i] for i in combo))
+                if best_key is None or key > best_key:
+                    best_key, best_combo = key, combo
+            if best_combo is not None:
+                return sorted(best_combo, key=lambda i: (-scores[i], i))
+
     if len(selected) < count:
         raise ValueError(
-            f"could only select {len(selected)} non-adjacent regions; requested {count}"
+            f"could only select {len(selected)} non-adjacent regions; requested "
+            f"{count}. no set of {count} regions in this {len(scores)}-region "
+            f"grid is pairwise more than {min_gap} tile(s) apart -- lower "
+            "spatial_holdout_region_count or spatial_holdout_nonadjacent_gap, "
+            "or use a coarser grid."
         )
     return selected

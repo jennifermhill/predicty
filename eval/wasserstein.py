@@ -1,9 +1,9 @@
 """sliced-Wasserstein batch-effect metric for embedding clouds.
 
-standalone, numpy-only module so it can be reused without pulling in the heavy
-latent-space visualization stack (torch, umap, matplotlib). both
-`latent_space.py` (as part of a full run) and `probe_wasserstein.py` (as a
-standalone probe over cached embeddings) import from here.
+this module is standalone and numpy-only, so another module can reuse it and
+not import the heavy latent-space visualization stack (torch, umap,
+matplotlib). two modules import from here: `latent_space.py` as part of a full
+run, and `probe_wasserstein.py` as a standalone probe over cached embeddings.
 """
 
 from __future__ import annotations
@@ -24,11 +24,12 @@ def sliced_wasserstein_distance(
 ) -> float:
     """sliced Wasserstein-1 distance between two point clouds.
 
-    projects both clouds onto many random 1d directions, computes the exact 1d
-    wasserstein-1 distance on each slice by matching quantiles, and averages. the
-    1d case reduces to sorting, so this approximates the full high-dim optimal
-    transport distance without a solver or extra dependency. quantile matching
-    also handles clouds with different sample counts.
+    this function projects both clouds onto many random 1d directions. the
+    function then computes the exact 1d wasserstein-1 distance on each slice
+    from the gap between the quantiles, and takes the mean. the result
+    approximates the full high-dim optimal transport distance, and it needs no
+    solver and no extra dependency. the two clouds can have different sample
+    counts.
     """
     dim = x_a.shape[1]
     rng = np.random.default_rng(seed)
@@ -41,7 +42,7 @@ def sliced_wasserstein_distance(
     q = np.linspace(0.0, 1.0, n_quantiles)
     qa = np.quantile(proj_a, q, axis=0)  # (n_quantiles, n_projections)
     qb = np.quantile(proj_b, q, axis=0)
-    # mean |Δquantile| per slice IS the 1d wasserstein-1 distance; average slices.
+    # the mean absolute quantile gap per slice is the 1d wasserstein-1 distance.
     return float(np.abs(qa - qb).mean())
 
 
@@ -55,10 +56,11 @@ def _format_wasserstein_report(
     min_per_dataset: int,
     n_top_pairs: int = 8,
 ) -> str:
-    """render the pairwise distance matrix as a human-readable text report.
+    """render the pairwise distance matrix as a text report for a human reader.
 
-    datasets are shown as short [i] tags in the matrix with a legend mapping each
-    tag to its full name, so long zarr filenames don't blow out the column width.
+    the matrix shows each dataset as a short [i] tag, and a legend maps each tag
+    to the full name. therefore a long zarr filename cannot blow out the column
+    width.
     """
     n = len(label_list)
     lines: list[str] = []
@@ -81,13 +83,13 @@ def _format_wasserstein_report(
         lines.append(f"   - {name}  (n={cnt})")
     lines.append("")
 
-    # legend: short tag -> full dataset name + point count.
+    # the legend maps a short tag to the full dataset name and the point count.
     lines.append(" legend:")
     for i, (name, cnt) in enumerate(zip(label_list, counts)):
         lines.append(f"   [{i}]  {name}  (n={cnt})")
     lines.append("")
 
-    # matrix with compact [i] headers; diagonal shown as a dot.
+    # the matrix uses compact [i] headers. the diagonal shows a dot.
     tags = [f"[{i}]" for i in range(n)]
     col_w = max(8, max(len(t) for t in tags) + 2)
     row_label_w = max(len(t) for t in tags) + 2
@@ -110,7 +112,7 @@ def _format_wasserstein_report(
     lines.append(f"   max  = {vals.max():.4f}")
     lines.append("")
 
-    # ranked pairs make the matrix actionable: which datasets are worst / best mixed.
+    # the ranked pairs show which datasets mix worst and which datasets mix best.
     pairs = sorted(
         ((mat[i, j], i, j) for i, j in zip(*iu)), key=lambda p: p[0], reverse=True
     )
@@ -137,14 +139,14 @@ def print_batch_effect_wasserstein(
 ) -> None:
     """pairwise sliced-Wasserstein distance between per-dataset embedding clouds.
 
-    a direct, geometry-aware measure of residual batch effect. if the dataset
-    adversary scrubbed dataset identity, the clouds overlap and distances sit
-    near zero; large distances mean datasets stay separable in latent space.
-    computed on full-dim embeddings, where the encoder actually operates, rather
-    than on a 2d projection. the full matrix is written to a log file under
-    out_dir; only a short summary is printed to the terminal.
+    the distance measures the residual batch effect from the geometry. a value
+    near zero means that the adversary scrubbed dataset identity. a large value
+    means that the datasets stay separable. this function uses the full-dim
+    embeddings, where the encoder operates, and not a 2d projection. the full
+    matrix goes to a log under out_dir, and this function prints only a short
+    summary.
 
-    rows only need `dataset_idx` and (optionally) `dataset_name` per point.
+    rows need only `dataset_idx` and, optionally, `dataset_name` for each point.
     """
     dataset_idx = np.asarray([r["dataset_idx"] for r in rows], dtype=np.int64)
     unique = np.unique(dataset_idx)
@@ -198,7 +200,7 @@ def print_batch_effect_wasserstein(
             f.write(report)
         print(f"[wasserstein] batch-effect report written to {report_path}")
     else:
-        # no target folder; fall back to printing the full report.
+        # there is no target folder, so print the full report instead.
         print(report)
 
     print(

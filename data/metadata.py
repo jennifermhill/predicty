@@ -1,35 +1,34 @@
 """metadata lookup for zarr datasets.
 
-each experiment has one or more rows in training_data_index.xlsx, one per
-strain. callers pass a zarr_path containing a mixin token (e.g.
-".../cryolite_mixin_test65_..."). the spreadsheet `expt` column uses the
-compact form `mixin65`; we normalize between the two.
+each experiment has one or more rows in training_data_index.xlsx, one row per
+strain. a caller gives a zarr_path that contains a mixin token, for example
+".../cryolite_mixin_test65_...". the spreadsheet `expt` column uses the compact
+form `mixin65`. this module normalizes between the two forms.
 
-when a mixin has multiple rows (e.g. mixin65 has strains NC28.1 and WS205),
-we disambiguate by looking for the row's `strain` value as a substring of
-the zarr_path. paths produced by Jennifer's pipeline include the strain name
-in a parent folder and/or the filename (".../NC28.1_overnight_day1/...").
+a mixin can have more than one row. for example, mixin65 has the strains NC28.1
+and WS205. in that case this module looks for the `strain` value of the row as
+a substring of the zarr_path. Jennifer's pipeline writes paths that include the
+strain name in a parent folder, in the filename, or in both, for example
+".../NC28.1_overnight_day1/...".
 
-if a mixin has exactly one row, we don't need to match the strain — the row
-is unambiguous on its own. this is the common case for mixins where only one
-strain was recorded.
+a mixin with exactly one row is not ambiguous on its own, so a strain match is
+not necessary. that is the common case.
 """
 
 from __future__ import annotations
 
 import re
-import xml.etree.ElementTree as et
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-# tolerate any non-digit junk between "mixin" and the digit suffix, so paths
-# like ".../cryolite_mixin_test41_..." resolve to "mixin41".
+# the regex tolerates any non-digit text between "mixin" and the digit suffix.
+# thus a path such as ".../cryolite_mixin_test41_..." resolves to "mixin41".
 _MIXIN_RE = re.compile(r"mixin[^0-9]*?(\d+)", re.IGNORECASE)
 
 
 def extract_mixin_id(zarr_path: str) -> str:
-    """pull the mixin id out of a zarr path and normalize to `mixinNN`."""
+    """extract the mixin id from a zarr path and normalize it to `mixinNN`."""
     match = _MIXIN_RE.search(zarr_path)
     if match is None:
         raise ValueError(
@@ -39,7 +38,7 @@ def extract_mixin_id(zarr_path: str) -> str:
 
 
 def get_interval_minutes(zarr_path: str, index_path: str | Path) -> float:
-    """return interval_minutes for the (mixin, strain) row matching zarr_path."""
+    """return interval_minutes for the (mixin, strain) row that matches zarr_path."""
     row = _resolve_row(zarr_path, str(index_path))
     val = row["interval_minutes"]
     if _is_blank(val):
@@ -51,9 +50,12 @@ def get_interval_minutes(zarr_path: str, index_path: str | Path) -> float:
 
 
 def get_z_limit(zarr_path: str, index_path: str | Path) -> int | None:
-    """return the per-experiment z cap for the (mixin, strain) row matching
-    zarr_path. 1-indexed inclusive max == 0-indexed exclusive upper bound.
-    a blank cell means the row is marked not-for-training; returns None.
+    """return the per-experiment z cap for the (mixin, strain) row that matches
+    zarr_path.
+
+    the 1-indexed inclusive max equals the 0-indexed exclusive upper bound. a
+    blank cell means that the row is not-for-training. then this function
+    returns None.
     """
     row = _resolve_row(zarr_path, str(index_path))
     val = row["z_limit"]
@@ -64,7 +66,7 @@ def get_z_limit(zarr_path: str, index_path: str | Path) -> int | None:
 
 @lru_cache(maxsize=8)
 def _load_index(index_path: str) -> Any:
-    """cached spreadsheet load. one read per (index_path) per process."""
+    """load the spreadsheet and cache it. one read per (index_path) per process."""
     import pandas as pd
 
     if not Path(index_path).exists():
@@ -81,9 +83,11 @@ def _is_blank(val: Any) -> bool:
 
 
 def _resolve_row(zarr_path: str, index_path: str) -> Any:
-    """pick the spreadsheet row matching zarr_path. disambiguates multi-strain
-    mixins by substring-matching the spreadsheet `strain` value against
-    zarr_path. returns a single pandas Series.
+    """pick the spreadsheet row that matches zarr_path.
+
+    for a mixin with more than one strain, this function matches the
+    spreadsheet `strain` value as a substring of zarr_path. this function
+    returns one pandas Series.
     """
     mixin_id = extract_mixin_id(zarr_path)
     df = _load_index(index_path)
@@ -102,7 +106,7 @@ def _resolve_row(zarr_path: str, index_path: str) -> Any:
     if len(rows) == 1:
         return rows.iloc[0]
 
-    # multi-row case: try to match strain against the zarr path.
+    # multi-row case: try to match the strain against the zarr path.
     path_lower = zarr_path.lower()
     strains = rows["strain"].astype(str).str.strip()
     valid = strains[strains.str.lower() != "nan"]
@@ -111,8 +115,8 @@ def _resolve_row(zarr_path: str, index_path: str) -> Any:
     ]
 
     if matches.empty:
-        # strain disambiguation failed; fall back to well column (e.g. "B2"
-        # appears in a path like ".../Field_B2/...").
+        # the strain match failed. fall back to the well column. for example,
+        # "B2" appears in a path such as ".../Field_B2/...".
         if "well" in rows.columns:
             wells = rows["well"].astype(str).str.strip()
             valid_wells = wells[wells.str.lower() != "nan"]
@@ -128,8 +132,9 @@ def _resolve_row(zarr_path: str, index_path: str) -> Any:
     if len(matches) == 1:
         return matches.iloc[0]
 
-    # multiple strains substring-match (e.g. 'NC28' and 'NC28.1' both fit).
-    # prefer the most specific match: longest strain string.
+    # more than one strain matches as a substring. for example, 'NC28' and
+    # 'NC28.1' both fit. prefer the most specific match: the longest strain
+    # string.
     lengths = matches["strain"].astype(str).str.len()
     best = matches[lengths == lengths.max()]
     if len(best) > 1:
@@ -138,29 +143,3 @@ def _resolve_row(zarr_path: str, index_path: str) -> Any:
             f"tied strains: {best['strain'].tolist()}"
         )
     return best.iloc[0]
-
-def get_voxel_dims(zarr_path, res_lvl=0):
-    xml_file = Path(zarr_path) / "OME" / "METADATA.ome.xml"
-    if not xml_file.exists():
-        raise FileNotFoundError(f"OME metadata file not found at {xml_file}")
-    XML_tree = et.parse(xml_file)
-    XML_root = XML_tree.getroot()
-
-    namespaces = {'ome': 'http://www.openmicroscopy.org/Schemas/OME/2016-06'}
-
-    images = XML_root.findall('ome:Image', namespaces)
-    if res_lvl >= len(images):
-        res_lvl = 0
-
-    pixels = images[res_lvl].find('ome:Pixels', namespaces)
-    if pixels is None:
-        raise ValueError(f"OME Pixels element not found at resolution level {res_lvl}")
-
-    pixel_size_x = pixels.get('PhysicalSizeX')
-    pixel_size_y = pixels.get('PhysicalSizeY')
-    pixel_size_z = pixels.get('PhysicalSizeZ')
-
-    if pixel_size_x is None or pixel_size_y is None or pixel_size_z is None:
-        raise ValueError(f"Physical pixel size attributes missing in OME metadata")
-
-    return float(pixel_size_x), float(pixel_size_y), float(pixel_size_z)

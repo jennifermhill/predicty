@@ -1,33 +1,22 @@
-"""interactively inspect the raw crops represented by points in a 2D latent map.
+"""the viewer shows the raw crops for the points in a 2D latent map.
 
-left-click the scatter plot to show the nearest points. right-click and drag to
-lasso a region. the selected points are highlighted in the latent map and their
-exact temporal crops are rendered in a second window.
+a left-click selects the nearest points. a right-click-drag lassos a region. the
+viewer highlights the selection on the map and renders its temporal crops in a
+second window.
 
-if metadata.csv has a "label" column (written by an annotation-aware
-eval/latent_space.py run), annotated points are drawn with a colored ring on
-the map -- colored by their behavior label, layered over the usual per-dataset
-dot color -- and any annotated crop shown in the detail window has its label
-(or "not annotated") printed in the title. because annotated points are
-usually a small minority of everything plotted, a left-click reserves one
-slot for the nearest annotated crop even when it isn't literally one of the
-N closest points to the click -- otherwise clicking near a ring almost always
-surfaces only unlabeled neighbors.
+metadata.csv can have a "label" column, from an annotation-aware
+eval/latent_space.py run. the viewer then draws a colored ring per behavior over
+the dataset dot of each annotated point, and the detail window prints the label
+of each crop. a left-click always reserves one slot for the nearest annotated
+crop. see select_click_indices for the reason. two checkboxes toggle the
+Annotated points and the Unannotated points. a hidden point is absent from the
+drawing and from the selection alike.
 
-two checkboxes in the bottom-right corner ("Annotated" / "Unannotated", both
-on by default) toggle which points are drawn on the map. hidden points are
-also excluded from click and lasso selection, so hiding unannotated crops is
-an easy way to browse only the labeled ones.
-
-if --decoder-checkpoint is given (a latent_decoder.pt from eval/decoder.py), a
-third "Inspect" / "Generate" radio toggle appears. Generate mode lets you
-click *anywhere* on the map, including empty areas with no real point: it
-finds real points within a search radius of the click, blends their real
-embeddings.npz vectors (gaussian-weighted by distance -- never pads out to a
-minimum count with distant, less-relevant points), decodes the blend with the
-trained decoder, and shows the generated crop next to its nearest real
-neighbors for comparison. clicks far from any real data fall back to the
-single nearest point and say so plainly rather than quietly extrapolating.
+--decoder-checkpoint (a latent_decoder.pt from eval/decoder.py) adds an
+Inspect / Generate toggle. Generate mode accepts a click anywhere, and empty map
+areas are included. Generate mode gaussian-blends the real embeddings near the
+click, decodes that blend, and shows the result beside its nearest real
+neighbors. see gaussian_radius_blend for the confidence rules.
 
 Example:
     python eval/interactive_latent_viewer.py \
@@ -123,6 +112,7 @@ def parse_args() -> argparse.Namespace:
             "median nearest-neighbor spacing among plotted points."
         ),
     )
+    add_zarr_remap_args(parser)
     return parser.parse_args()
 
 
@@ -159,7 +149,8 @@ def indices_inside_polygon(coords: np.ndarray, vertices: list[tuple[float, float
 def representative_indices(
     coords: np.ndarray, selected: np.ndarray, max_crops: int
 ) -> np.ndarray:
-    """keep crops nearest the selected region's centroid when it is very large."""
+    """the function keeps the crops that are nearest the centroid of the
+    selected region, when that region is very large."""
     if max_crops < 1:
         raise ValueError("max_crops must be at least 1")
     selected = np.asarray(selected, dtype=np.int64)
@@ -171,14 +162,8 @@ def representative_indices(
 
 
 def nearest_annotated_index(ordered_indices: np.ndarray, rows: list[dict[str, Any]]) -> int | None:
-    """first labeled row in an already distance-sorted, deduplicated index array.
-
-    annotated points are almost always a small minority of the plotted crops,
-    so a click landing near -- but not exactly on -- a ring's data coordinate
-    will usually have several unlabeled points as its literal nearest
-    neighbors. This walks the ranking to find the closest one that actually
-    carries a label, so it can be guaranteed a slot in the click results.
-    """
+    """the function returns the first labeled row in an index array that is
+    already distance-sorted and deduplicated."""
     for idx in ordered_indices:
         if rows[int(idx)].get("label"):
             return int(idx)
@@ -188,7 +173,7 @@ def nearest_annotated_index(ordered_indices: np.ndarray, rows: list[dict[str, An
 def compute_visible_mask(
     rows: list[dict[str, Any]], show_annotated: bool, show_unannotated: bool
 ) -> np.ndarray:
-    """per-row visibility from the two "Annotated"/"Unannotated" checkboxes."""
+    """per-row visibility from the two checkboxes, "Annotated" and "Unannotated"."""
     annotated = np.asarray([bool(row.get("label")) for row in rows])
     return np.where(annotated, show_annotated, show_unannotated)
 
@@ -201,17 +186,16 @@ def select_click_indices(
     nearest: int,
     visible_mask: np.ndarray | None = None,
 ) -> np.ndarray:
-    """nearest crops to a click, with the nearest annotated crop guaranteed a slot.
+    """nearest crops to a click. the nearest annotated crop always gets a slot.
 
-    pure Euclidean "nearest N" can silently exclude the ring you clicked on:
-    annotated points are typically a small fraction of the total, so unless
-    the click lands exactly on the point's coordinate, its nearest neighbors
-    are usually unlabeled. Reserving the last slot for the nearest annotated
-    crop (when one exists) keeps its label visible even when it isn't
-    literally one of the N closest points.
+    a pure euclidean "nearest N" can silently exclude the ring that you clicked
+    on. the annotated points are a small fraction of the total. therefore, if
+    the click does not land exactly on an annotated point, its neighbors are
+    usually all unlabeled. the function reserves the last slot for the nearest
+    annotated crop, if there is one.
 
-    visible_mask restricts candidates to currently-shown points (see the
-    show/hide checkboxes); points hidden by a checkbox are never selected.
+    visible_mask restricts the candidates to the points that the map currently
+    shows. the function never selects a point that a checkbox hides.
     """
     ranked = nearest_indices(coords, target, len(coords))
     if visible_mask is not None:
@@ -231,7 +215,8 @@ def unique_crop_indices(
     rows: list[dict[str, Any]],
     cfg: Config,
 ) -> np.ndarray:
-    """remove duplicate t1/t2 latent points that reload the same crop pair."""
+    """the function removes the duplicate t1 and t2 latent points that reload
+    the same crop pair."""
     unique: list[int] = []
     seen: set[tuple[int, ...]] = set()
     for raw_idx in indices:
@@ -261,6 +246,148 @@ def zarr_paths_from_config(cfg: Config) -> list[str]:
     raise ValueError("config must define zarr_path or zarr_paths")
 
 
+# ---------------------------------------------------------------------------
+# zarr path remapping, shared with the 3D viewer and latent_traversal_video.py.
+# a config freezes absolute cluster paths at training time. a run off a mounted
+# copy therefore needs a rewrite of those prefixes.
+# ---------------------------------------------------------------------------
+
+# the cluster root, and the local path of that root when you mount the share.
+# the value is only the default for --local-mount. --zarr-root-map handles
+# anything else.
+CLUSTER_ZARR_ROOT = "/groups/sgro/sgrolab"
+DEFAULT_LOCAL_ZARR_ROOT = "Z:/"
+
+
+def add_zarr_remap_args(parser: argparse.ArgumentParser) -> None:
+    """the function attaches --zarr-root-map and --local-mount to a parser."""
+    parser.add_argument(
+        "--zarr-root-map",
+        action="append",
+        default=None,
+        metavar="OLD=NEW",
+        help=(
+            "rewrite a prefix of every zarr path from the config, for running "
+            "against a mounted copy of the storage instead of the cluster. "
+            "repeatable; longest matching OLD wins."
+        ),
+    )
+    parser.add_argument(
+        "--local-mount",
+        nargs="?",
+        const=DEFAULT_LOCAL_ZARR_ROOT,
+        default=None,
+        metavar="ROOT",
+        help=(
+            f"shorthand for --zarr-root-map {CLUSTER_ZARR_ROOT}=ROOT, where "
+            f"ROOT defaults to {DEFAULT_LOCAL_ZARR_ROOT}. so a bare "
+            "--local-mount is all that's needed on a machine with the sgrolab "
+            "share mounted there; pass a different root if the drive letter "
+            "differs. explicit --zarr-root-map rules for the same prefix win."
+        ),
+    )
+
+
+def parse_root_map(
+    mappings: list[str] | None, local_mount: str | None = None
+) -> list[tuple[str, str]]:
+    """the function turns OLD=NEW strings into prefix rewrite rules, longest OLD first.
+
+    the longest-first order makes overlapping rules predictable: the most
+    specific prefix applies, whatever the order on the command line. an explicit
+    --zarr-root-map beats the implied rule of --local-mount for the same prefix.
+    """
+    rules: list[tuple[str, str]] = []
+    for mapping in mappings or []:
+        if "=" not in mapping:
+            raise ValueError(
+                f"--zarr-root-map expects OLD=NEW, got {mapping!r} "
+                f"(e.g. --zarr-root-map {CLUSTER_ZARR_ROOT}={DEFAULT_LOCAL_ZARR_ROOT})"
+            )
+        old, new = mapping.split("=", 1)
+        if not old:
+            raise ValueError("--zarr-root-map OLD half must not be empty")
+        rules.append((old, new))
+    if local_mount is not None and not any(old == CLUSTER_ZARR_ROOT for old, _ in rules):
+        rules.append((CLUSTER_ZARR_ROOT, local_mount))
+    return sorted(rules, key=lambda rule: len(rule[0]), reverse=True)
+
+
+def remap_zarr_paths(paths: list[str], rules: list[tuple[str, str]]) -> list[str]:
+    """warning: Windows reads a leading "Z://" as the start of a UNC share name.
+
+    the function applies the first matching prefix rule to each path. the
+    function joins with exactly one separator, so a trailing-slash root ("Z:/")
+    cannot produce "Z://...". the function matches on path *boundaries* only, so
+    a rule for /groups/sgro/sgrolab does not fire on /groups/sgro/sgrolab2. only
+    the prefix changes, so the basename check in validate_dataset_mapping
+    continues to work.
+    """
+    if not rules:
+        return list(paths)
+    out: list[str] = []
+    for path in paths:
+        for old, new in rules:
+            trimmed = old.rstrip("/\\")
+            if path == trimmed:
+                path = new
+                break
+            if path.startswith(trimmed) and path[len(trimmed)] in "/\\":
+                remainder = path[len(trimmed) + 1:]
+                path = new.rstrip("/\\") + "/" + remainder
+                break
+        out.append(path)
+    return out
+
+
+def resolve_zarr_paths(cfg: Config, args: argparse.Namespace) -> list[str]:
+    """the config zarr paths, after the function applies any --zarr-root-map or
+    --local-mount rule."""
+    zarr_paths = zarr_paths_from_config(cfg)
+    rules = parse_root_map(
+        getattr(args, "zarr_root_map", None), getattr(args, "local_mount", None)
+    )
+    if not rules:
+        return zarr_paths
+    remapped = remap_zarr_paths(zarr_paths, rules)
+    for before, after in zip(zarr_paths, remapped):
+        if before != after:
+            print(f"[zarr] remapped {before}\n            -> {after}")
+    unchanged = sum(1 for b, a in zip(zarr_paths, remapped) if b == a)
+    if unchanged:
+        print(
+            f"[zarr] WARNING: {unchanged}/{len(zarr_paths)} zarr paths matched no "
+            "remap rule and were left as-is"
+        )
+    return remapped
+
+
+def require_zarrs_exist(zarr_paths: list[str], rows: list[dict[str, Any]]) -> None:
+    """the function fails before any work if a zarr that these rows need is not readable.
+
+    the function checks only the datasets that are present in rows. an offline
+    unrelated volume therefore does not block a filtered subset. the check
+    happens up front, because otherwise a bad remap appears only in the middle
+    of a render or at the first click.
+    """
+    needed = sorted({int(row["dataset_idx"]) for row in rows})
+    missing = [
+        (i, zarr_paths[i])
+        for i in needed
+        if i < len(zarr_paths) and not Path(zarr_paths[i]).exists()
+    ]
+    if not missing:
+        return
+    lines = "\n".join(f"    dataset_idx={i}: {p}" for i, p in missing)
+    raise FileNotFoundError(
+        f"{len(missing)} of {len(needed)} zarr path(s) needed here do not exist:\n"
+        f"{lines}\n"
+        "if you're running off a mounted copy rather than the cluster, pass "
+        f"--local-mount (or --zarr-root-map OLD=NEW) to rewrite the prefix "
+        "baked into the config."
+    )
+
+
 def temporal_pair(row: dict[str, Any], cfg: Config) -> tuple[int, int]:
     t = int(row["t"])
     gap = int(row["frame_gap"])
@@ -278,7 +405,8 @@ def temporal_pair(row: dict[str, Any], cfg: Config) -> tuple[int, int]:
 
 
 def validate_dataset_mapping(rows: list[dict[str, Any]], zarr_paths: list[str]) -> None:
-    """catch reordered config paths, which would silently show the wrong crops."""
+    """the function catches reordered config paths, which would silently show
+    the wrong crops."""
     expected: dict[int, str] = {}
     for row in rows:
         idx = int(row["dataset_idx"])
@@ -356,19 +484,18 @@ def robust_limits(*images: np.ndarray) -> tuple[float, float]:
 
 
 def default_embeddings_path(metadata_path: Path) -> Path:
-    """embeddings.npz sits one directory above the per-method metadata.csv,
-    e.g. latent_space/<run>/umap/metadata.csv -> latent_space/<run>/embeddings.npz
-    (see eval/latent_space.py's output layout)."""
+    """embeddings.npz sits one directory above the per-method metadata.csv:
+    latent_space/<run>/umap/metadata.csv -> latent_space/<run>/embeddings.npz."""
     return metadata_path.resolve().parent.parent / "embeddings.npz"
 
 
 def load_real_embeddings(embeddings_path: Path, coords: np.ndarray) -> np.ndarray:
-    """load the real high-dim embeddings written alongside metadata.csv.
+    """the function loads the real high-dim embeddings next to metadata.csv.
 
-    confirms it's the same run and row order by checking that whichever
-    projection embeddings.npz saved (coords_umap or coords_pca) matches
-    --metadata's own coordinates -- catches a mismatched embeddings.npz early
-    instead of silently blending nonsense vectors later.
+    the function checks the saved projection (coords_umap or coords_pca) against
+    --metadata's own coordinates. the check confirms the same run and the same
+    row order. without the check, a mismatched npz would silently blend nonsense
+    vectors later.
     """
     if not embeddings_path.exists():
         raise FileNotFoundError(
@@ -397,9 +524,10 @@ def load_real_embeddings(embeddings_path: Path, coords: np.ndarray) -> np.ndarra
 
 def estimate_default_radius(coords: np.ndarray, multiple: float = 3.0) -> float:
     """default Generate-mode search radius: a multiple of the typical nearest-
-    neighbor spacing among plotted points. UMAP's output scale is arbitrary
-    and PCA's depends on the data's variance, so a fixed constant would be
-    wrong for a different run; this adapts to whatever's actually on screen.
+    neighbor spacing among the plotted points.
+
+    the output scale of UMAP is arbitrary, and the scale of PCA depends on the
+    data variance. a fixed constant would therefore be wrong for the next run.
     """
     if len(coords) < 2:
         return 1.0
@@ -419,18 +547,16 @@ def gaussian_radius_blend(
     radius: float,
     visible_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, str]:
-    """indices + normalized weights of real points to blend for a Generate click.
+    """indices and normalized weights of the real points to blend for a Generate click.
 
-    only points within `radius` are considered at all; within that cutoff,
-    weight falls off as a gaussian with radius as its ~2-sigma width, so nearby
-    points dominate the blend. this deliberately never pads out to a minimum
-    neighbor count with distant, less-relevant points -- if nothing real is
-    within radius, it falls back to the single nearest point and returns a
-    confidence string that says so plainly, rather than quietly blending in
-    whatever's closest regardless of how far that actually is.
+    only the points inside `radius` count. a gaussian of about 2-sigma width
+    radius weights them. the function deliberately never pads out to a minimum
+    neighbor count with distant points. if nothing is inside the radius, the
+    function falls back to the single nearest point. the function then says so
+    in the confidence string, rather than a quiet extrapolation.
 
-    returns (indices, weights, confidence); weights sum to 1 and are sorted
-    descending (closest / highest-weight first).
+    the function returns (indices, weights, confidence). the weights sum to 1,
+    and the highest weight comes first.
     """
     distances = np.linalg.norm(coords - np.asarray(target)[None, :], axis=1)
     if visible_mask is not None:
@@ -481,8 +607,7 @@ class LatentCropViewer:
         self.max_crops = max_crops
         self.arrays: dict[int, Any] = {}
 
-        # Generate mode: optional, only wired up when a decoder checkpoint is
-        # given. torch import is lazy so Inspect-only usage never pays for it.
+        # the torch import is lazy, so that inspect-only usage never pays for it.
         self.embeddings = embeddings
         self.gen_radius = gen_radius
         self.mode = "inspect"
@@ -529,11 +654,9 @@ class LatentCropViewer:
             )
             self.dataset_artists.append((artist, mask))
 
-        # annotated points get a colored ring on top of their dataset dot,
-        # colored by behavior label so both dataset and class are visible
-        # at once. "label" is an optional metadata.csv column (written by an
-        # annotation-aware latent_space.py run); older metadata.csv files
-        # without it just skip this overlay entirely.
+        # a ring per behavior label sits over the dataset dot, so that both are
+        # visible at once. "label" is optional in metadata.csv, and older files
+        # do not have the column.
         labels = np.asarray([row.get("label") or "" for row in rows])
         label_values = sorted(v for v in set(labels.tolist()) if v)
         label_cmap = plt.get_cmap("Set1")
@@ -575,8 +698,7 @@ class LatentCropViewer:
         self.clear_button = Button(clear_ax, "Clear")
         self.clear_button.on_clicked(self.clear)
 
-        # show/hide checkboxes, on by default; hidden points are also
-        # excluded from click and lasso selection (see select_click_indices).
+        # the selection also excludes the hidden points. see select_click_indices.
         self.show_annotated = True
         self.show_unannotated = True
         self.visible_mask = compute_visible_mask(rows, True, True)
@@ -586,7 +708,7 @@ class LatentCropViewer:
         )
         self.visibility_check.on_clicked(self._on_visibility_toggle)
 
-        # Inspect/Generate toggle -- only shown when a decoder was loaded.
+        # the inspect/generate toggle appears only when the viewer loaded a decoder.
         self.mode_radio = None
         if self.decoder is not None:
             mode_ax = self.map_fig.add_axes((0.83, 0.19, 0.15, 0.09))
@@ -600,7 +722,8 @@ class LatentCropViewer:
         self.map_fig.canvas.mpl_connect("key_press_event", self.on_key)
 
     def _create_crop_figure(self) -> None:
-        """create the crop window and stop retaining it after its GUI is closed."""
+        """the method creates the crop window. the viewer releases the window
+        after the user closes its GUI."""
         self.crop_fig = plt.figure(figsize=(12, 8))
         self.crop_fig.suptitle("Select points in the latent map")
         self.crop_fig.canvas.mpl_connect("close_event", self._on_crop_figure_closed)
@@ -784,8 +907,8 @@ class LatentCropViewer:
         assert self.crop_fig is not None
         self.crop_fig.clear()
 
-        # show the generated crop plus up to 4 of its highest-weight real
-        # neighbors, for a side-by-side sanity check against real data.
+        # up to 4 real neighbors with the highest weight, as a sanity check
+        # beside the generated crop.
         shown = indices[: min(len(indices), 4)]
         shown_weights = weights[: len(shown)]
         n_cols = 1 + len(shown)
@@ -836,8 +959,9 @@ def main() -> None:
 
     cfg = Config.from_yaml(args.config)
     rows, coords = read_metadata(Path(args.metadata))
-    zarr_paths = zarr_paths_from_config(cfg)
+    zarr_paths = resolve_zarr_paths(cfg, args)
     validate_dataset_mapping(rows, zarr_paths)
+    require_zarrs_exist(zarr_paths, rows)
 
     embeddings = None
     gen_radius = args.gen_radius
@@ -865,8 +989,8 @@ def main() -> None:
         decoder_checkpoint=args.decoder_checkpoint,
         gen_radius=gen_radius,
     )
-    # Keep the viewer and its weakly-referenced Matplotlib callbacks alive until
-    # all GUI windows have closed.
+    # this call keeps the viewer and its weakly-referenced matplotlib callbacks
+    # alive until every window closes.
     plt.show()
     del viewer
 

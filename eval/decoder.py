@@ -1,34 +1,26 @@
-"""post-hoc latent decoder, trained after the fact on a frozen encoder.
+"""post-hoc latent decoder. the training happens after the fact, on a frozen encoder.
 
-context: iBOT's masked-prediction objective (models/dino.py, `masking_head`) has
-no pixel-space decoder -- it distills against the teacher's own prototype
-assignment in an abstract projector_k-dim space, same shape as the main DINO
-loss. MAE's decoder (models/mae.py, `MaskedPatchAutoencoder`) does map a latent
-back to voxels, but it's force-disabled whenever ibot_enabled is also true
-(see train.py), so its weights never trained on any of the current ibot
-checkpoints.
+no current checkpoint can decode a latent to voxels. iBOT's masked-prediction
+head (models/dino.py, `masking_head`) distills in an abstract projector_k-dim
+space with no pixel decoder at all. train.py force-disables MAE's decoder
+(models/ibot.py, `MaskedPatchAutoencoder`) whenever ibot_enabled is set, so its
+weights never trained. this module supplies the missing latent -> voxel mapping.
+the module trains a decoder against a frozen encoder, whatever masking objective
+the encoder itself used. a trained decoder is what makes
+`interpolate_and_decode` possible: the code walks a straight line between two
+real embeddings and decodes the intermediate points, which match no real crop.
 
-this module trains a new decoder against a frozen, already-trained encoder,
-so we get a trained latent -> voxel mapping regardless of which masking
-objective the encoder itself was trained with. that's what makes the
-interpolate-then-decode trick possible: take two real embeddings, walk a
-straight line between them in latent space, and decode every point along the
-way -- including the intermediate points that don't correspond to any real
-crop. see `interpolate_and_decode` below.
+the decoder is deliberately a plain autoencoder, not a re-implementation of MAE.
+there is no masking and no mask token. the decoder therefore behaves on
+arbitrary latent vectors. a masked autoencoder instead specializes in the
+prediction of missing patches.
 
-this is a straightforward autoencoder, not a re-implementation of MAE: no
-masking, no mask token. whatever crop the frozen encoder sees is exactly what
-the decoder is asked to reconstruct from that crop's latent, so it behaves well
-on arbitrary latent vectors rather than specializing in filling missing patches.
-
-crops and their embeddings are cached once up front (like probe_dataset.py's
-extract_embeddings) so training never re-reads zarr per step; the cache is then
-split by spatial_holdout_split, the same geometric rule probe_dataset.py uses,
-so validation crops sit in a coordinate strip that never overlaps or borders
-training crops. see --n-samples and --val-frac.
+the code caches the crops and the embeddings up front, so that the training
+never re-reads zarr. the code then splits them by the same spatial-holdout rule
+that probe_dataset.py uses (see "How to read the metrics" in README.md). see
+--n-samples and --val-frac.
 
 usage:
-    python eval/decoder.py --config configs/train.yaml --checkpoint checkpoints/0713-LongerTrain/latest.pt
     python eval/decoder.py --config configs/train.yaml --checkpoint checkpoints/final/latest.pt --steps 5000
 """
 
@@ -40,7 +32,7 @@ import sys
 import time
 from pathlib import Path
 
-# allow running as `python eval/decoder.py` from project root.
+# this line lets you run `python eval/decoder.py` from the project root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import matplotlib
@@ -61,10 +53,8 @@ from models.ibot import _reconstruction_metrics, _trunc_normal_
 
 
 # ---------------------------------------------------------------------------
-# patchify / unpatchify -- same reshape/permute logic as
-# MaskedPatchAutoencoder's methods in models/mae.py, just as free functions
-# (crop_shape/patch_shape passed explicitly) since LatentDecoder has no mask
-# machinery to hang them off of.
+# patchify / unpatchify -- MaskedPatchAutoencoder's reshape and permute logic as
+# free functions, because LatentDecoder has no mask machinery to hold them.
 # ---------------------------------------------------------------------------
 
 
@@ -98,12 +88,11 @@ def unpatchify(
 
 
 class LatentDecoder(nn.Module):
-    """maps a single global encoder latent back to a full voxel volume.
+    """the decoder maps a single global encoder latent back to a full voxel volume.
 
-    architecturally this is MaskedPatchAutoencoder's decoder half with the
-    masking machinery stripped out (no mask token, no partial masking): every
-    patch is predicted from the same broadcast latent plus its own learned
-    position embedding.
+    the decoder is the decoder half of MaskedPatchAutoencoder without the
+    masking machinery. the decoder predicts every patch from the same broadcast
+    latent plus that patch's own learned position embedding.
     """
 
     def __init__(
@@ -153,17 +142,17 @@ class LatentDecoder(nn.Module):
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """z: (N, latent_dim) -> reconstructed volume (N, 1, Z, H, W).
 
-        this is what interpolate_and_decode calls -- z doesn't have to come
-        from a real crop's encoder output, any (N, latent_dim) tensor works.
+        z does not need to come from a real crop. any (N, latent_dim) tensor
+        works, and interpolate_and_decode relies on that.
         """
         return unpatchify(self._predict_patches(z), self.crop_shape, self.patch_shape)
 
     def reconstruction_loss(self, z: torch.Tensor, target_volume: torch.Tensor) -> dict[str, torch.Tensor]:
-        """training-time loss: z -> predicted patches vs. the real target's patches.
+        """training-time loss: the method compares the patches that z predicts
+        against the patches of the target.
 
-        same per-patch normalization (norm_pix_loss) and reconstruction metrics
-        (_reconstruction_metrics) as MAE's masked loss, just evaluated over
-        every patch instead of only the masked ones.
+        the norm_pix_loss and the metrics are the same as in MAE's masked loss.
+        the method uses every patch, and not only the masked patches.
         """
         pred = self._predict_patches(z)
         target = patchify(target_volume, self.crop_shape, self.patch_shape)
@@ -186,7 +175,7 @@ def interpolate_and_decode(
     z_b: torch.Tensor,
     n_steps: int = 8,
 ) -> np.ndarray:
-    """linearly interpolate between two latent vectors and decode every point. """
+    """the function interpolates linearly between two latent vectors and decodes every point. """
     decoder.eval()
     alphas = torch.linspace(0.0, 1.0, n_steps, device=z_a.device).unsqueeze(1)  # (n_steps, 1)
     z_path = (1 - alphas) * z_a.unsqueeze(0) + alphas * z_b.unsqueeze(0)  # (n_steps, latent_dim)
@@ -199,15 +188,16 @@ def interpolate_and_decode(
 # ---------------------------------------------------------------------------
 
 def disable_augmentations(cfg: Config) -> None:
-    """turn off augs so the decoder sees a deterministic target for
-    each latent. the frozen encoder is invariant to these (including flip and
-    rotation), so with them on one latent maps to many target crops and the
-    decoder just learns a blurred average. per-crop norm stays on since that's
-    how the encoder was trained to receive its input.
+    """the function turns off the augs, so that each latent has one deterministic target crop.
+
+    the frozen encoder is invariant to these augs, and flip and rotation are
+    among them. an enabled aug therefore maps one latent to many targets, and
+    the decoder learns a blurred average.
     """
     for name in ("aug_intensity", "aug_gamma", "aug_noise", "aug_blur", "aug_flip", "aug_rotation"):
         getattr(cfg, name).enabled = False
-    # aug_percrop_norm stays enabled; it's the input convention the encoder learned.
+    # aug_percrop_norm stays enabled. aug_percrop_norm is the input convention
+    # that the encoder learned.
 
 
 def spatial_holdout_split(
@@ -217,9 +207,11 @@ def spatial_holdout_split(
     cfg: Config,
     val_frac: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """split the cached crops/embeddings into train/val by spatial coordinate.
+    """the function splits the cached crops and embeddings into train and val by
+    spatial coordinate.
 
-    same geometric rule as eval/probe_dataset.py's spatial_holdout_split
+    the geometric rule is the same as in eval/probe_dataset.py's
+    spatial_holdout_split
     """
     if not 0.0 < val_frac < 1.0:
         raise ValueError(f"--val-frac must be in (0, 1); got {val_frac}")
@@ -263,10 +255,9 @@ def extract_cache(
     n_samples: int,
     seed: int,
 ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
-    """embed n_samples t1 global crops once, caching both the crops and their
-    embeddings so the decoder trains from memory instead of re-reading zarr
-    every step.
-    """
+    """the function embeds n_samples t1 global crops one time. the function
+    caches the crops and the embeddings, so that the decoder trains from memory
+    and does not re-read zarr at every step."""
     cfg.seed = seed
     disable_augmentations(cfg)
 
@@ -279,8 +270,9 @@ def extract_cache(
         num_workers=cfg.num_workers,
         worker_init_fn=worker_init_fn,
         pin_memory=device.type == "cuda",
-        # spawn (not fork) so workers start fresh. forking after the parent has
-        # initialized cuda + the zarr/blosc threadpool deadlocks on first read.
+        # the context is spawn and not fork, so that the workers start fresh. a
+        # fork after the parent initializes cuda and the zarr/blosc threadpool
+        # deadlocks at the first read.
         multiprocessing_context="spawn" if cfg.num_workers > 0 else None,
     )
 
@@ -294,7 +286,7 @@ def extract_cache(
     iters = 0
 
     for batch in loader:
-        # globals shape: (B, 2, 1, Z, H, W); index 0 is the t1 view.
+        # globals shape: (B, 2, 1, Z, H, W). index 0 is the t1 view.
         g_t1 = batch["globals"][:, 0].to(device, non_blocking=True)
         meta = batch["meta"]
 
@@ -339,16 +331,16 @@ def train_decoder(
     batch_size: int,
     log_every: int,
 ) -> None:
-    """train `decoder` over the cached (crop, embedding) pairs. no encoder or
-    zarr access in the loop: each step samples a minibatch from the train cache,
-    maps its cached embeddings back to voxels, and compares against the cached
-    crops. mirrors eval/probe_dataset.py's cached training loop.
+    """the function trains `decoder` over the cached (crop, embedding) pairs.
+
+    the loop accesses neither the encoder nor zarr. the loop mirrors the cached
+    training loop in eval/probe_dataset.py.
     """
     decoder.train()
     opt = torch.optim.AdamW(decoder.parameters(), lr=lr)
 
-    # embeddings are small, so keep them on device; crops (float16) stay on the
-    # host and a minibatch is moved over each step.
+    # the embeddings are small, so they stay on the device. the crops (float16)
+    # stay on the host, and each step moves one minibatch over.
     z_train = z_train.to(device)
     val_z = z_val[:batch_size].to(device)
     val_crops = crops_val[:batch_size].to(device).float()
@@ -382,8 +374,9 @@ def train_decoder(
 
 
 def setup_logging(checkpoint_path: str) -> Path:
-    """derive a log directory from the checkpoint's parent folder name and
-    tee all stdout to both the terminal and a log file inside it."""
+    """the function derives a log directory from the name of the checkpoint's
+    parent folder. the function then tees all stdout to the terminal and to a
+    log file in that directory."""
     run_name = Path(checkpoint_path).parent.name
     candidates = [p for p in Path("latent_space").glob(f"{run_name}_*") if p.is_dir()]
     if candidates:
@@ -467,9 +460,9 @@ def main() -> None:
     print(f"[decoder] spatial mode: {cfg.spatial_region_mode}")
     print()
 
-    cfg.n_local_crops = 0  # decoder training only uses the global crop, not the local crops
+    cfg.n_local_crops = 0  # the decoder training uses only the global crop, not the local crops
 
-    # --- load frozen encoder, same pattern as every other eval/probe_*.py ---
+    # --- load the frozen encoder, the same pattern as every other eval/probe_*.py ---
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     print(f"[decoder] checkpoint saved at training step {ckpt.get('step', 'unknown')}")
     encoder = HybridEncoder(
@@ -495,7 +488,7 @@ def main() -> None:
     print(f"[decoder] LatentDecoder: crop_shape={crop_shape} patch_shape={patch_shape} params={n_params:,}")
     print()
 
-    # --- cache: embed every crop once so training never re-reads zarr ---
+    # --- cache: one embedding pass per crop, so the training never re-reads zarr ---
     print(f"[decoder] caching {args.n_samples} crops + embeddings (one encoder pass, no augmentations)...")
     t0 = time.time()
     crops, embeddings, rows = extract_cache(cfg, encoder, device, args.n_samples, args.seed)
@@ -509,7 +502,7 @@ def main() -> None:
     print(f"[decoder] train n={crops_train.size(0)}  val n={crops_val.size(0)}")
     print()
 
-    # --- train the decoder over the cache (no encoder or zarr in the loop) ---
+    # --- train the decoder over the cache. the loop uses neither the encoder nor zarr ---
     print(f"[decoder] training for {args.steps} steps (batch={cfg.batch_size})...")
     t0 = time.time()
     train_decoder(
@@ -544,17 +537,17 @@ def main() -> None:
     print(f"[decoder] saved decoder to {decoder_path}")
     decoder.to(device)
 
-    # --- demo: interpolate between two real crops and decode, flanking the
-    # decoded path with the ground-truth crops so both reconstruction fidelity
-    # (real A vs decoded a=0) and the morph between them are visible ---
+    # --- demo: the code decodes a path between two real crops. the ground truth
+    # sits at both ends, so that the reconstruction fidelity and the morph are
+    # both visible ---
     print()
     if crops_train.size(0) < 2:
         print("[decoder] cache too small for a demo pair; skipping")
         return
 
-    # pick an approximately farthest-apart pair so the interpolation traverses
-    # something meaningful rather than two near-identical crops. cheap two-step
-    # diameter heuristic (O(N)), not a full O(N^2) pairwise scan.
+    # cheap O(N) two-step diameter heuristic. the heuristic finds an
+    # approximately farthest-apart pair, so that the interpolation traverses
+    # something and does not connect two near identical crops.
     d0 = torch.cdist(z_train[:1], z_train).squeeze(0)
     idx_a = int(d0.argmax())
     d_a = torch.cdist(z_train[idx_a : idx_a + 1], z_train).squeeze(0)
@@ -567,12 +560,13 @@ def main() -> None:
     z_a = z_train[idx_a].to(device)
     z_b = z_train[idx_b].to(device)
     volumes = interpolate_and_decode(decoder, z_a, z_b, n_steps=args.demo_interp_steps)
-    # z-mean projection of each crop, matching how the decoded volumes are shown.
+    # z-mean projection of each crop. the display of the decoded volumes uses
+    # the same projection.
     real_a = crops_train[idx_a, 0].float().numpy().mean(axis=0)
     real_b = crops_train[idx_b, 0].float().numpy().mean(axis=0)
 
-    # one row: [real A] [decoded a=0 .. a=1] [real B]. decoded a=0 is decode(z_a),
-    # so it lands right next to real A for a direct reconstruction comparison.
+    # one row: [real A] [decoded a=0 .. a=1] [real B]. decode(z_a) therefore
+    # lands next to real A, for a direct comparison of the reconstruction.
     panels = [real_a] + [volumes[i].mean(axis=0) for i in range(args.demo_interp_steps)] + [real_b]
     titles = (
         ["real A"]
